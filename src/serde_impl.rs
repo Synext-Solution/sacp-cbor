@@ -1284,12 +1284,12 @@ fn bignum_from_u128(negative: bool, n: u128) -> Result<CborValue, SerdeError> {
 }
 
 fn u128_to_be_bytes(n: u128) -> Vec<u8> {
+    if n == 0 {
+        return vec![0];
+    }
+    let leading_bytes = (n.leading_zeros() / 8) as usize;
     let bytes = n.to_be_bytes();
-    let first = bytes
-        .iter()
-        .position(|b| *b != 0)
-        .unwrap_or(bytes.len() - 1);
-    bytes[first..].to_vec()
+    bytes[leading_bytes..].to_vec()
 }
 
 fn bigint_to_u128(big: &BigInt) -> Option<u128> {
