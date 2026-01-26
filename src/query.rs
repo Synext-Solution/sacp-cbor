@@ -973,7 +973,7 @@ impl CborMap {
         }
 
         let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
 
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
