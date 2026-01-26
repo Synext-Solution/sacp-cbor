@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Patch release: no-alloc query sorting fix and build hygiene updates.
+
 ## 0.4.0
 
 - Re-architected validation around a single canonical walker; query traversal now shares the same value-end logic.
