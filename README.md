@@ -18,7 +18,7 @@ they are already canonical; therefore, for opaque payloads, **semantic equality 
 
 ## Status
 
-- Version: `0.1.0`
+- Version: `0.3.0`
 - License: MIT
 - MSRV: Rust `1.75`
 
@@ -38,19 +38,19 @@ Note: `serde` currently requires `std` + `alloc`.
 - **Validation-only** (no allocation): disable default features:
 
 ```toml
-sacp-cbor = { version = "0.1", default-features = false }
+sacp-cbor = { version = "0.3", default-features = false }
 ```
 
 - **`no_std` + `alloc`** (owned values + encoding): enable `alloc`:
 
 ```toml
-sacp-cbor = { version = "0.1", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.3", default-features = false, features = ["alloc"] }
 ```
 
 - **`no_std` + `alloc` + `sha2`**:
 
 ```toml
-sacp-cbor = { version = "0.1", default-features = false, features = ["alloc", "sha2"] }
+sacp-cbor = { version = "0.3", default-features = false, features = ["alloc", "sha2"] }
 ```
 
 Note: `alloc` requires an allocator provided by your environment.
@@ -79,6 +79,25 @@ use sacp_cbor::{decode_value, DecodeLimits};
 let bytes = [0xa1, 0x61, 0x61, 0x01]; // {"a":1}
 let v = decode_value(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 assert_eq!(v.encode_canonical()?, bytes);
+# Ok::<(), sacp_cbor::CborError>(())
+```
+
+### Build an owned AST with `cbor!` (requires `alloc`)
+
+```rust
+use sacp_cbor::cbor;
+
+let user_key = "dynamic";
+let v = cbor!({
+    a: 1,
+    (user_key): [true, null, 1.5],
+})?;
+
+assert_eq!(v.encode_canonical()?, vec![
+    0xa2, 0x61, 0x61, 0x01,
+    0x67, 0x64, 0x79, 0x6e, 0x61, 0x6d, 0x69, 0x63,
+    0x83, 0xf5, 0xf6, 0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
 # Ok::<(), sacp_cbor::CborError>(())
 ```
 
@@ -149,6 +168,7 @@ let digest = canon.sha256();
 - `validate(bytes, limits) -> ()`
 - `decode_value(bytes, limits) -> CborValue` *(feature `alloc`)*
 - `CborValue::encode_canonical() -> Vec<u8>` *(feature `alloc`)*
+- `cbor!(...) -> Result<CborValue, CborError>` *(feature `alloc`)*
 - `cbor_equal(a, b) -> bool` *(feature `alloc`)*
 - `CanonicalCborRef::root() -> CborValueRef`
 - `CanonicalCborRef::at(path) -> Option<CborValueRef>`
