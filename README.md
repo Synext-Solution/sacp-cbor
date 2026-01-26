@@ -6,6 +6,7 @@
 It is designed for **hot-path** validation (WebSocket frames, API request bodies) with:
 
 - allocation-free validation on success (`validate_canonical`)
+- allocation-free queries on validated bytes (borrowed views, no decoding)
 - deterministic map ordering enforcement (canonical CBOR key ordering, by encoded key bytes)
 - strict canonical integer/length encoding checks (shortest form)
 - strict numeric rules (safe integers, bignums via tags 2/3, float64-only, canonical NaN, forbid `-0.0`)
@@ -81,6 +82,34 @@ assert_eq!(v.encode_canonical()?, bytes);
 # Ok::<(), sacp_cbor::CborError>(())
 ```
 
+### Query canonical bytes without decoding
+
+```rust
+use sacp_cbor::{validate_canonical, DecodeLimits, PathElem};
+
+// { "user": { "id": 42, "active": true } }
+let bytes = [0xa1, 0x64, 0x75, 0x73, 0x65, 0x72, 0xa2, 0x62, 0x69, 0x64, 0x18, 0x2a, 0x66, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0xf5];
+let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+
+let path = [PathElem::Key("user"), PathElem::Key("id")];
+let v = canon.at(&path)?.unwrap();
+assert_eq!(v.int()?, 42);
+# Ok::<(), sacp_cbor::CborError>(())
+```
+
+```rust
+use sacp_cbor::{validate_canonical, DecodeLimits};
+
+// { "a": 1, "b": 2, "c": 3 }
+let bytes = [0xa3, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02, 0x61, 0x63, 0x03];
+let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+let map = canon.root().map()?;
+
+let out = map.get_many_sorted(["a", "b", "c"])?;
+assert_eq!(out[1].unwrap().int()?, 2);
+# Ok::<(), sacp_cbor::QueryError>(())
+```
+
 ### Serde encode/decode (requires `serde` + `alloc`)
 
 ```rust
@@ -121,6 +150,11 @@ let digest = canon.sha256();
 - `decode_value(bytes, limits) -> CborValue` *(feature `alloc`)*
 - `CborValue::encode_canonical() -> Vec<u8>` *(feature `alloc`)*
 - `cbor_equal(a, b) -> bool` *(feature `alloc`)*
+- `CanonicalCborRef::root() -> CborValueRef`
+- `CanonicalCborRef::at(path) -> Option<CborValueRef>`
+- `CborValueRef::{kind, map, array, get_key, get_index, at}`
+- `MapRef::{get, get_many_sorted, iter}`
+- `MapRef::get_many(keys) -> Vec<Option<CborValueRef>>` *(feature `alloc`)*
 - `to_vec<T: Serialize>(&T) -> Vec<u8>` *(feature `serde` + `alloc`)*
 - `from_slice<T: DeserializeOwned>(bytes, limits) -> T` *(feature `serde` + `alloc`)*
 

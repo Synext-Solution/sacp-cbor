@@ -43,6 +43,7 @@ mod error;
 mod float;
 mod limits;
 mod order;
+mod query;
 mod scanner;
 #[cfg(feature = "serde")]
 mod serde_impl;
@@ -51,6 +52,9 @@ pub use crate::canonical::CanonicalCborRef;
 pub use crate::error::{CborError, CborErrorCode, CborErrorKind};
 pub use crate::limits::{CborLimits, DecodeLimits};
 pub use crate::limits::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
+pub use crate::query::{
+    ArrayRef, BigIntRef, CborKind, CborValueRef, MapRef, PathElem, QueryError, QueryErrorCode,
+};
 pub use crate::scanner::{validate, validate_canonical};
 
 #[cfg(feature = "alloc")]
