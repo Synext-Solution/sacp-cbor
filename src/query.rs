@@ -574,7 +574,7 @@ impl<'a> MapRef<'a> {
         }
 
         let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        sort_key_indices(&mut idxs, keys);
 
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
@@ -1177,6 +1177,7 @@ struct ParsedText<'a> {
     enc_len: u64,
 }
 
+#[cfg(feature = "alloc")]
 fn scan_sorted_iter<'a, I, V>(
     keys: &[&str],
     idxs: &[usize],
@@ -1280,6 +1281,19 @@ fn validate_query_keys(keys: &[&str], err_off: usize) -> Result<(), CborError> {
         checked_text_len(k.len()).map_err(|code| CborError::new(code, err_off))?;
     }
     Ok(())
+}
+
+fn sort_key_indices<const N: usize>(idxs: &mut [usize; N], keys: [&str; N]) {
+    for i in 1..N {
+        let mut j = i;
+        while j > 0
+            && cmp_text_keys_by_canonical_encoding(keys[idxs[j - 1]], keys[idxs[j]])
+                == Ordering::Greater
+        {
+            idxs.swap(j - 1, j);
+            j -= 1;
+        }
+    }
 }
 
 fn ensure_strictly_increasing_keys(keys: &[&str], err_off: usize) -> Result<(), CborError> {

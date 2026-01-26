@@ -45,6 +45,7 @@ pub const fn validate_f64_bits(bits: u64) -> Result<(), ErrorCode> {
 
 /// Validate that an i64 is within the SACP-CBOR/1 safe integer range.
 #[inline]
+#[cfg(feature = "alloc")]
 pub const fn validate_int_safe_i64(v: i64) -> Result<(), ErrorCode> {
     if v < MIN_SAFE_INTEGER || v > MAX_SAFE_INTEGER_I64 {
         return Err(ErrorCode::IntegerOutsideSafeRange);
