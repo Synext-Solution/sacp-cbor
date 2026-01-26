@@ -203,7 +203,7 @@ pub enum CborValue {
     /// Text string (valid UTF-8).
     Text(String),
     /// Array.
-    Array(Vec<CborValue>),
+    Array(Vec<Self>),
     /// Map with text keys in canonical key order.
     Map(CborMap),
     /// Boolean.
