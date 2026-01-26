@@ -662,61 +662,55 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        deserialize_i128(
-            self.value,
-            visitor,
-            i128::from(i8::MIN),
-            i128::from(i8::MAX),
-        )
+        let v = parse_i128(self.value)?;
+        if v < i128::from(i8::MIN) || v > i128::from(i8::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = i8::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_i8(v)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_i128(
-            self.value,
-            visitor,
-            i128::from(i16::MIN),
-            i128::from(i16::MAX),
-        )
+        let v = parse_i128(self.value)?;
+        if v < i128::from(i16::MIN) || v > i128::from(i16::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = i16::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_i16(v)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_i128(
-            self.value,
-            visitor,
-            i128::from(i32::MIN),
-            i128::from(i32::MAX),
-        )
+        let v = parse_i128(self.value)?;
+        if v < i128::from(i32::MIN) || v > i128::from(i32::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = i32::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_i32(v)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_i128(
-            self.value,
-            visitor,
-            i128::from(i64::MIN),
-            i128::from(i64::MAX),
-        )
+        let v = parse_i128(self.value)?;
+        if v < i128::from(i64::MIN) || v > i128::from(i64::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = i64::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_i64(v)
     }
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        let v = match self.value {
-            CborValue::Int(v) => i128::from(*v),
-            CborValue::Bignum(b) => {
-                bigint_to_i128(b).ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))?
-            }
-            _ => return Err(SerdeError::with_code(CborErrorCode::SerdeError)),
-        };
+        let v = parse_i128(self.value)?;
         visitor.visit_i128(v)
     }
 
@@ -724,42 +718,55 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        deserialize_u128(self.value, visitor, u128::from(u8::MAX))
+        let v = parse_u128(self.value)?;
+        if v > u128::from(u8::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = u8::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_u8(v)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_u128(self.value, visitor, u128::from(u16::MAX))
+        let v = parse_u128(self.value)?;
+        if v > u128::from(u16::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = u16::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_u16(v)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_u128(self.value, visitor, u128::from(u32::MAX))
+        let v = parse_u128(self.value)?;
+        if v > u128::from(u32::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = u32::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_u32(v)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        deserialize_u128(self.value, visitor, u128::from(u64::MAX))
+        let v = parse_u128(self.value)?;
+        if v > u128::from(u64::MAX) {
+            return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        }
+        let v = u64::try_from(v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?;
+        visitor.visit_u64(v)
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        let v =
-            match self.value {
-                CborValue::Int(v) if *v >= 0 => u128::try_from(*v)
-                    .map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?,
-                CborValue::Bignum(b) => bigint_to_u128(b)
-                    .ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))?,
-                _ => return Err(SerdeError::with_code(CborErrorCode::SerdeError)),
-            };
+        let v = parse_u128(self.value)?;
         visitor.visit_u128(v)
     }
 
@@ -1335,49 +1342,26 @@ fn magnitude_to_u128(magnitude: &[u8]) -> Option<u128> {
     Some(u128::from_be_bytes(buf))
 }
 
-fn deserialize_i128<'de, V>(
-    value: &'de CborValue,
-    visitor: V,
-    min: i128,
-    max: i128,
-) -> Result<V::Value, SerdeError>
-where
-    V: Visitor<'de>,
-{
-    let v = match value {
-        CborValue::Int(v) => i128::from(*v),
+fn parse_i128(value: &CborValue) -> Result<i128, SerdeError> {
+    match value {
+        CborValue::Int(v) => Ok(i128::from(*v)),
         CborValue::Bignum(b) => {
-            bigint_to_i128(b).ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))?
+            bigint_to_i128(b).ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))
         }
-        _ => return Err(SerdeError::with_code(CborErrorCode::SerdeError)),
-    };
-    if v < min || v > max {
-        return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        _ => Err(SerdeError::with_code(CborErrorCode::SerdeError)),
     }
-    visitor.visit_i128(v)
 }
 
-fn deserialize_u128<'de, V>(
-    value: &'de CborValue,
-    visitor: V,
-    max: u128,
-) -> Result<V::Value, SerdeError>
-where
-    V: Visitor<'de>,
-{
-    let v = match value {
+fn parse_u128(value: &CborValue) -> Result<u128, SerdeError> {
+    match value {
         CborValue::Int(v) if *v >= 0 => {
-            u128::try_from(*v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))?
+            u128::try_from(*v).map_err(|_| SerdeError::with_code(CborErrorCode::SerdeError))
         }
         CborValue::Bignum(b) => {
-            bigint_to_u128(b).ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))?
+            bigint_to_u128(b).ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))
         }
-        _ => return Err(SerdeError::with_code(CborErrorCode::SerdeError)),
-    };
-    if v > max {
-        return Err(SerdeError::with_code(CborErrorCode::SerdeError));
+        _ => Err(SerdeError::with_code(CborErrorCode::SerdeError)),
     }
-    visitor.visit_u128(v)
 }
 
 fn visit_bignum_any<'de, V>(big: &BigInt, visitor: V) -> Result<V::Value, SerdeError>

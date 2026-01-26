@@ -4,11 +4,16 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -35,3 +40,94 @@ jobs:
 
       - name: Docs
         run: cargo doc --no-deps --all-features
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io and tag
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          meta="$(
+            python - <<'PY'
+            import sys, tomllib
+            from pathlib import Path
+            data = tomllib.loads(Path("Cargo.toml").read_text())
+            pkg = data.get("package", {})
+            name = pkg.get("name")
+            version = pkg.get("version")
+            if not name or not version:
+                print("MISSING")
+                sys.exit(0)
+            print(f"{name} {version}")
+            PY
+          )"
+
+          if [ "$meta" = "MISSING" ] || [ -z "${meta:-}" ]; then
+            echo "Failed to parse package name/version from Cargo.toml" >&2
+            exit 1
+          fi
+          crate="${meta%% *}"
+          version="${meta#* }"
+          if [ -z "${crate:-}" ] || [ -z "${version:-}" ] || [ "$crate" = "$version" ]; then
+            echo "Malformed package metadata: '${meta}'" >&2
+            exit 1
+          fi
+
+          tag="v${version}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists."
+            tag_exists=1
+          else
+            tag_exists=0
+          fi
+
+          if python - <<'PY' "$crate" "$version"
+            import json, sys, urllib.request
+            crate, version = sys.argv[1], sys.argv[2]
+            url = f"https://crates.io/api/v1/crates/{crate}"
+            try:
+              with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.load(resp)
+            except Exception as e:
+              print(f"Failed to query crates.io: {e}", file=sys.stderr)
+              sys.exit(2)
+            versions = {v.get("num") for v in data.get("versions", [])}
+            sys.exit(0 if version in versions else 1)
+          PY
+          then
+            published=0
+          else
+            published=$?
+          fi
+          if [ "$published" -eq 2 ]; then
+            exit 1
+          fi
+
+          if [ "$published" -eq 0 ]; then
+            echo "Version ${version} is already on crates.io; skipping publish."
+          else
+            if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+              echo "CARGO_REGISTRY_TOKEN is not set; cannot publish." >&2
+              exit 1
+            fi
+            cargo publish --locked
+          fi
+
+          if [ "$tag_exists" -eq 0 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag "${tag}"
+            git push origin "refs/tags/${tag}"
+          fi

@@ -196,6 +196,7 @@ impl<'a> Scanner<'a> {
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
+        debug_assert!(major <= 7);
         match major {
             0 => {
                 let v = self.read_uint(ai, off)?;
@@ -348,6 +349,10 @@ impl<'a> Scanner<'a> {
                     validate_f64_bits(bits).map_err(|code| CborError::validate(code, off))?;
                     Ok(())
                 }
+                28..=30 => Err(CborError::validate(
+                    CborErrorCode::ReservedAdditionalInfo,
+                    off,
+                )),
                 24 => {
                     // Non-canonical encoding for simple values < 24.
                     let simple = self.read_u8(off)?;
@@ -368,10 +373,7 @@ impl<'a> Scanner<'a> {
                     off,
                 )),
             },
-            _ => Err(CborError::validate(
-                CborErrorCode::UnsupportedMajorType,
-                off,
-            )),
+            _ => unreachable!("major out of range"),
         }
     }
 }
@@ -435,6 +437,7 @@ mod decode {
             let major = ib >> 5;
             let ai = ib & 0x1f;
 
+            debug_assert!(major <= 7);
             match major {
                 0 => {
                     let v = self.read_uint(ai, off)?;
@@ -543,8 +546,7 @@ mod decode {
                         )?;
                         let key_payload = self.read_exact(k_len, k_off)?;
                         let key_str = core::str::from_utf8(key_payload)
-                            .map_err(|_| CborError::validate(CborErrorCode::Utf8Invalid, k_off))?
-                            .to_owned();
+                            .map_err(|_| CborError::validate(CborErrorCode::Utf8Invalid, k_off))?;
                         let k_end = self.pos;
                         let enc_key = &self.data[k_off..k_end];
 
@@ -566,7 +568,7 @@ mod decode {
 
                         // value
                         let val = self.parse_value(depth + 1)?;
-                        entries.push((key_str, val));
+                        entries.push((key_str.to_owned(), val));
                     }
 
                     Ok(CborValue::Map(CborMap::from_sorted_entries(entries)))
@@ -619,6 +621,10 @@ mod decode {
                             .map_err(|code| CborError::validate(code, off))?;
                         Ok(CborValue::Float(F64Bits::new_unchecked(bits)))
                     }
+                    28..=30 => Err(CborError::validate(
+                        CborErrorCode::ReservedAdditionalInfo,
+                        off,
+                    )),
                     24 => {
                         let simple = self.read_u8(off)?;
                         if simple < 24 {
@@ -638,10 +644,7 @@ mod decode {
                         off,
                     )),
                 },
-                _ => Err(CborError::validate(
-                    CborErrorCode::UnsupportedMajorType,
-                    off,
-                )),
+                _ => unreachable!("major out of range"),
             }
         }
     }

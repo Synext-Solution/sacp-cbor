@@ -18,6 +18,23 @@ fn sample_medium() -> Vec<u8> {
     CborValue::Map(map).encode_canonical().unwrap()
 }
 
+fn sample_large_map(len: usize) -> Vec<u8> {
+    let mut entries = Vec::new();
+    for i in 0..len {
+        entries.push((format!("k{i:05}"), CborValue::Int(i as i64)));
+    }
+    let map = CborMap::new(entries).unwrap();
+    CborValue::Map(map).encode_canonical().unwrap()
+}
+
+fn sample_deep(depth: usize) -> Vec<u8> {
+    let mut v = CborValue::Null;
+    for _ in 0..depth {
+        v = CborValue::Array(vec![v]);
+    }
+    v.encode_canonical().unwrap()
+}
+
 fn bench_validate(c: &mut Criterion) {
     let small = sample_small();
     let small_limits = DecodeLimits::for_bytes(small.len());
@@ -37,9 +54,32 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
+    let large = sample_large_map(1024);
+    let large_limits = DecodeLimits::for_bytes(large.len());
+    c.bench_function("validate_canonical_large_map", |b| {
+        b.iter(|| {
+            validate_canonical(black_box(&large), large_limits).unwrap();
+        })
+    });
+
+    let deep = sample_deep(32);
+    let deep_limits = DecodeLimits::for_bytes(deep.len());
+    c.bench_function("validate_canonical_deep", |b| {
+        b.iter(|| {
+            validate_canonical(black_box(&deep), deep_limits).unwrap();
+        })
+    });
+
     c.bench_function("decode_value_medium", |b| {
         b.iter(|| {
             let v = decode_value(black_box(&medium), medium_limits).unwrap();
+            black_box(v);
+        })
+    });
+
+    c.bench_function("decode_value_deep", |b| {
+        b.iter(|| {
+            let v = decode_value(black_box(&deep), deep_limits).unwrap();
             black_box(v);
         })
     });
@@ -49,6 +89,14 @@ fn bench_validate(c: &mut Criterion) {
         b.iter(|| {
             let bytes = decoded.encode_canonical().unwrap();
             black_box(bytes);
+        })
+    });
+
+    #[cfg(feature = "sha2")]
+    c.bench_function("encode_sha256_medium", |b| {
+        b.iter(|| {
+            let digest = decoded.sha256_canonical().unwrap();
+            black_box(digest);
         })
     });
 }

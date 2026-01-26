@@ -201,3 +201,32 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
     sink.write_u8((major << 5) | 27)?;
     sink.write(&value.to_be_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::encode_to_vec;
+    use crate::value::{CborMap, CborValue};
+    use crate::CborErrorCode;
+
+    #[test]
+    fn encode_map_rejects_unsorted_entries_even_if_constructed_unsafely() {
+        let m = CborMap::from_sorted_entries(vec![
+            ("aa".to_string(), CborValue::Int(1)),
+            ("b".to_string(), CborValue::Int(2)),
+        ]);
+        let v = CborValue::Map(m);
+        let err = encode_to_vec(&v).unwrap_err();
+        assert_eq!(err.code, CborErrorCode::NonCanonicalMapOrder);
+    }
+
+    #[test]
+    fn encode_map_rejects_duplicate_keys_if_constructed_unsafely() {
+        let m = CborMap::from_sorted_entries(vec![
+            ("a".to_string(), CborValue::Int(1)),
+            ("a".to_string(), CborValue::Int(2)),
+        ]);
+        let v = CborValue::Map(m);
+        let err = encode_to_vec(&v).unwrap_err();
+        assert_eq!(err.code, CborErrorCode::DuplicateMapKey);
+    }
+}

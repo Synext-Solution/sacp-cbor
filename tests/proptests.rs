@@ -12,14 +12,48 @@ use sacp_cbor::{
 };
 
 fn arb_key() -> impl Strategy<Value = String> {
-    // ASCII keys keep size predictable while still exercising the canonical ordering rules.
-    proptest::collection::vec(proptest::char::range('a', 'z'), 0..32)
-        .prop_map(|chars| chars.into_iter().collect())
+    let ascii = proptest::collection::vec(proptest::char::range('a', 'z'), 0..=64)
+        .prop_map(|chars| chars.into_iter().collect());
+    let ascii_23 = proptest::collection::vec(proptest::char::range('a', 'z'), 23)
+        .prop_map(|chars| chars.into_iter().collect());
+    let ascii_24 = proptest::collection::vec(proptest::char::range('a', 'z'), 24)
+        .prop_map(|chars| chars.into_iter().collect());
+    let ascii_255 = proptest::collection::vec(proptest::char::range('a', 'z'), 255)
+        .prop_map(|chars| chars.into_iter().collect());
+    let ascii_256 = proptest::collection::vec(proptest::char::range('a', 'z'), 256)
+        .prop_map(|chars| chars.into_iter().collect());
+    let unicode = proptest::collection::vec(proptest::char::range('\u{00a1}', '\u{00ff}'), 0..=64)
+        .prop_map(|chars| chars.into_iter().collect());
+
+    prop_oneof![
+        8 => ascii,
+        1 => ascii_23,
+        1 => ascii_24,
+        1 => ascii_255,
+        1 => ascii_256,
+        1 => unicode,
+    ]
+}
+
+fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let any_small = proptest::collection::vec(any::<u8>(), 0..=64);
+    let len_23 = proptest::collection::vec(any::<u8>(), 23);
+    let len_24 = proptest::collection::vec(any::<u8>(), 24);
+    let len_255 = proptest::collection::vec(any::<u8>(), 255);
+    let len_256 = proptest::collection::vec(any::<u8>(), 256);
+
+    prop_oneof![
+        8 => any_small,
+        1 => len_23,
+        1 => len_24,
+        1 => len_255,
+        1 => len_256,
+    ]
 }
 
 fn arb_bigint() -> impl Strategy<Value = BigInt> {
     // Magnitude length >= 8 guarantees it's larger than MAX_SAFE_INTEGER (7 bytes).
-    (
+    let random = (
         any::<bool>(),
         proptest::collection::vec(any::<u8>(), 8..32).prop_map(|mut v| {
             if v[0] == 0 {
@@ -28,7 +62,17 @@ fn arb_bigint() -> impl Strategy<Value = BigInt> {
             v
         }),
     )
-        .prop_map(|(neg, mag)| BigInt::new(neg, mag).expect("bigint must be valid"))
+        .prop_map(|(neg, mag)| BigInt::new(neg, mag).expect("bigint must be valid"));
+
+    let max_safe = vec![0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    let max_safe_plus_one = vec![0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+    prop_oneof![
+        6 => random,
+        1 => Just(BigInt::new(false, max_safe_plus_one.clone()).expect("boundary bigint")),
+        1 => Just(BigInt::new(true, max_safe.clone()).expect("boundary bigint")),
+        1 => Just(BigInt::new(true, max_safe_plus_one).expect("boundary bigint")),
+    ]
 }
 
 fn arb_float() -> impl Strategy<Value = F64Bits> {
@@ -36,20 +80,32 @@ fn arb_float() -> impl Strategy<Value = F64Bits> {
 }
 
 fn arb_leaf() -> impl Strategy<Value = CborValue> {
+    let int_any =
+        (sacp_cbor::MIN_SAFE_INTEGER..=sacp_cbor::MAX_SAFE_INTEGER_I64).prop_map(CborValue::Int);
+    let int_boundaries = prop_oneof![
+        Just(CborValue::Int(sacp_cbor::MIN_SAFE_INTEGER)),
+        Just(CborValue::Int(sacp_cbor::MAX_SAFE_INTEGER_I64)),
+        Just(CborValue::Int(23)),
+        Just(CborValue::Int(24)),
+        Just(CborValue::Int(-24)),
+        Just(CborValue::Int(-25)),
+    ];
+
     prop_oneof![
         // Safe integers
-        (sacp_cbor::MIN_SAFE_INTEGER..=sacp_cbor::MAX_SAFE_INTEGER_I64).prop_map(CborValue::Int),
+        8 => int_any,
+        1 => int_boundaries,
         // Bytes
-        proptest::collection::vec(any::<u8>(), 0..64).prop_map(CborValue::Bytes),
+        6 => arb_bytes().prop_map(CborValue::Bytes),
         // Text
-        arb_key().prop_map(CborValue::Text),
+        6 => arb_key().prop_map(CborValue::Text),
         // Bool / null
-        any::<bool>().prop_map(CborValue::Bool),
-        Just(CborValue::Null),
+        4 => any::<bool>().prop_map(CborValue::Bool),
+        1 => Just(CborValue::Null),
         // Float64
-        arb_float().prop_map(CborValue::Float),
+        4 => arb_float().prop_map(CborValue::Float),
         // Bignum
-        arb_bigint().prop_map(CborValue::Bignum),
+        3 => arb_bigint().prop_map(CborValue::Bignum),
     ]
 }
 
@@ -91,5 +147,10 @@ proptest! {
             let h2 = decoded.sha256_canonical().unwrap();
             prop_assert_eq!(h1, h2);
         }
+    }
+
+    #[test]
+    fn validate_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+        let _ = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len()));
     }
 }

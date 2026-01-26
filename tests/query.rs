@@ -101,3 +101,65 @@ fn utf8_key_lookup() {
     assert_eq!(map.get("e").unwrap().unwrap().int().unwrap(), 1);
     assert_eq!(map.get("é").unwrap().unwrap().int().unwrap(), 2);
 }
+
+#[test]
+fn kind_and_bignum_accessors() {
+    let bytes = [
+        0x89, // array of 9 items
+        0x01, // int 1
+        0x40, // bstr empty
+        0x60, // tstr empty
+        0x80, // array empty
+        0xa0, // map empty
+        0xf4, // false
+        0xf6, // null
+        0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // float 0.0
+        0xc2, 0x47, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // tag2 bignum
+    ];
+
+    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let arr = canon.root().array().unwrap();
+
+    let kinds = [
+        arr.get(0).unwrap().unwrap().kind().unwrap(),
+        arr.get(1).unwrap().unwrap().kind().unwrap(),
+        arr.get(2).unwrap().unwrap().kind().unwrap(),
+        arr.get(3).unwrap().unwrap().kind().unwrap(),
+        arr.get(4).unwrap().unwrap().kind().unwrap(),
+        arr.get(5).unwrap().unwrap().kind().unwrap(),
+        arr.get(6).unwrap().unwrap().kind().unwrap(),
+        arr.get(7).unwrap().unwrap().kind().unwrap(),
+        arr.get(8).unwrap().unwrap().kind().unwrap(),
+    ];
+
+    assert_eq!(
+        kinds,
+        [
+            sacp_cbor::CborKind::Int,
+            sacp_cbor::CborKind::Bytes,
+            sacp_cbor::CborKind::Text,
+            sacp_cbor::CborKind::Array,
+            sacp_cbor::CborKind::Map,
+            sacp_cbor::CborKind::Bool,
+            sacp_cbor::CborKind::Null,
+            sacp_cbor::CborKind::Float,
+            sacp_cbor::CborKind::Bignum,
+        ]
+    );
+
+    let big = arr.get(8).unwrap().unwrap().bignum().unwrap();
+    assert!(!big.is_negative());
+    assert_eq!(big.magnitude(), &[0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn get_many_sorted_requires_canonical_key_order_not_lexicographic() {
+    // { "b": 1, "aa": 2 } (canonical order by encoded length)
+    let bytes = [0xa2, 0x61, 0x62, 0x01, 0x62, 0x61, 0x61, 0x02];
+
+    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let map = canon.root().map().unwrap();
+
+    let err = map.get_many_sorted(["aa", "b"]).unwrap_err();
+    assert_eq!(err.code, QueryErrorCode::KeysNotSorted);
+}

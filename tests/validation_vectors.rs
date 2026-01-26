@@ -97,6 +97,44 @@ fn rejects_non_canonical_length_encoding_for_text() {
 }
 
 #[test]
+fn rejects_non_canonical_nint_encoding() {
+    let bytes = [0x38, 0x17]; // -24, should be 0x37
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+}
+
+#[test]
+fn rejects_non_canonical_tag_encoding() {
+    // tag(2) encoded with ai=24 (non-canonical), followed by bstr magnitude
+    let bytes = [0xd8, 0x02, 0x47, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.offset, 0);
+}
+
+#[test]
+fn rejects_non_canonical_length_encoding_for_bytes() {
+    let mut bytes = vec![0x58, 23];
+    bytes.extend(std::iter::repeat(0u8).take(23));
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+}
+
+#[test]
+fn rejects_non_canonical_length_encoding_for_array_header() {
+    let bytes = [0x98, 0x17]; // array length 23 encoded with ai=24
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+}
+
+#[test]
+fn rejects_non_canonical_length_encoding_for_map_header() {
+    let bytes = [0xb8, 0x17]; // map length 23 encoded with ai=24
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+}
+
+#[test]
 fn rejects_map_key_not_text() {
     // { h'00': 0 }
     let bytes = [0xa1, 0x41, 0x00, 0x00];
@@ -379,6 +417,69 @@ fn rejects_reserved_additional_info() {
         DecodeLimits::for_bytes(bytes.len()),
         CborErrorCode::ReservedAdditionalInfo,
     );
+}
+
+#[test]
+fn rejects_reserved_additional_info_for_text() {
+    let bytes = [0x7c]; // major 3, ai=28
+    assert_invalid(
+        &bytes,
+        DecodeLimits::for_bytes(bytes.len()),
+        CborErrorCode::ReservedAdditionalInfo,
+    );
+}
+
+#[test]
+fn rejects_reserved_additional_info_for_bytes() {
+    let bytes = [0x5c]; // major 2, ai=28
+    assert_invalid(
+        &bytes,
+        DecodeLimits::for_bytes(bytes.len()),
+        CborErrorCode::ReservedAdditionalInfo,
+    );
+}
+
+#[test]
+fn rejects_reserved_additional_info_for_array() {
+    let bytes = [0x9c]; // major 4, ai=28
+    assert_invalid(
+        &bytes,
+        DecodeLimits::for_bytes(bytes.len()),
+        CborErrorCode::ReservedAdditionalInfo,
+    );
+}
+
+#[test]
+fn rejects_reserved_additional_info_for_map() {
+    let bytes = [0xbc]; // major 5, ai=28
+    assert_invalid(
+        &bytes,
+        DecodeLimits::for_bytes(bytes.len()),
+        CborErrorCode::ReservedAdditionalInfo,
+    );
+}
+
+#[test]
+fn rejects_reserved_additional_info_for_simple() {
+    let bytes = [0xfc]; // major 7, ai=28
+    assert_invalid(
+        &bytes,
+        DecodeLimits::for_bytes(bytes.len()),
+        CborErrorCode::ReservedAdditionalInfo,
+    );
+}
+
+#[test]
+fn unexpected_eof_offsets_are_stable() {
+    let bytes = [0x18]; // uint8 additional info but missing byte
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::UnexpectedEof);
+    assert_eq!(err.offset, 0);
+
+    let bytes = [0xfb, 0x00]; // float64 missing 7 bytes
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, CborErrorCode::UnexpectedEof);
+    assert_eq!(err.offset, 0);
 }
 
 #[test]

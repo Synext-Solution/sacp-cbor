@@ -47,8 +47,6 @@ pub enum CborErrorCode {
     /// Text string length exceeds limits.
     TextLenLimitExceeded,
 
-    /// Unsupported CBOR major type.
-    UnsupportedMajorType,
     /// Reserved additional-info value (28..30) was used.
     ReservedAdditionalInfo,
     /// Indefinite-length encoding was used where forbidden.
@@ -159,7 +157,6 @@ impl fmt::Display for CborError {
             CborErrorCode::BytesLenLimitExceeded => "byte string length exceeds decode limits",
             CborErrorCode::TextLenLimitExceeded => "text string length exceeds decode limits",
 
-            CborErrorCode::UnsupportedMajorType => "unsupported CBOR major type",
             CborErrorCode::ReservedAdditionalInfo => "reserved additional info value",
             CborErrorCode::IndefiniteLengthForbidden => "indefinite length forbidden",
             CborErrorCode::NonCanonicalEncoding => "non-canonical integer/length encoding",

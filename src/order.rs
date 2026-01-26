@@ -59,15 +59,22 @@ pub fn cmp_text_keys_by_canonical_encoding(a: &str, b: &str) -> Ordering {
 #[must_use]
 #[cfg(feature = "alloc")]
 pub const fn encoded_text_len(n: usize) -> usize {
+    const fn add_or_max(a: usize, b: usize) -> usize {
+        match a.checked_add(b) {
+            Some(v) => v,
+            None => usize::MAX,
+        }
+    }
+
     if n < 24 {
-        1 + n
+        add_or_max(1, n)
     } else if n <= 0xff {
-        2 + n
+        add_or_max(2, n)
     } else if n <= 0xffff {
-        3 + n
+        add_or_max(3, n)
     } else if n <= 0xffff_ffff {
-        5 + n
+        add_or_max(5, n)
     } else {
-        9 + n
+        add_or_max(9, n)
     }
 }
