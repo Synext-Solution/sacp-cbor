@@ -11,19 +11,17 @@
 use core::cmp::Ordering;
 
 use crate::canonical::CanonicalCborRef;
+use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding, encoded_text_len};
 use crate::stream::CborStream;
-use crate::walk;
 use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
 use crate::canonical::CanonicalCbor;
 
 #[cfg(feature = "alloc")]
-use crate::value::{BigInt, CborInteger, CborMap, CborValue, F64Bits};
+use crate::value::{CborMap, CborValue};
 
-#[cfg(feature = "alloc")]
-use alloc::boxed::Box;
 #[cfg(feature = "alloc")]
 use alloc::vec;
 #[cfg(feature = "alloc")]
@@ -882,37 +880,11 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError` if the value is malformed.
     pub fn to_owned(self) -> Result<CborValue, CborError> {
-        match self.kind()? {
-            CborKind::Integer => match self.integer()? {
-                CborIntegerRef::Safe(v) => CborValue::int(v),
-                CborIntegerRef::Big(b) => {
-                    let big = BigInt::new_unchecked(b.is_negative(), b.magnitude().to_vec());
-                    Ok(CborValue::integer(CborInteger::from_bigint(big)))
-                }
-            },
-            CborKind::Bytes => Ok(CborValue::bytes(self.bytes()?.to_vec())),
-            CborKind::Text => Ok(CborValue::text(self.text()?)),
-            CborKind::Array => {
-                let arr = self.array()?;
-                let mut items = Vec::with_capacity(arr.len());
-                for item in arr.iter() {
-                    items.push(item?.to_owned()?);
-                }
-                Ok(CborValue::array(items))
-            }
-            CborKind::Map => {
-                let map = self.map()?;
-                let mut entries: Vec<(Box<str>, CborValue)> = Vec::with_capacity(map.len());
-                for entry in map.iter() {
-                    let (k, v) = entry?;
-                    entries.push((Box::from(k), v.to_owned()?));
-                }
-                Ok(CborValue::map(CborMap::from_sorted_entries(entries)))
-            }
-            CborKind::Bool => Ok(CborValue::bool(self.bool()?)),
-            CborKind::Null => Ok(CborValue::null()),
-            CborKind::Float => Ok(CborValue::float(F64Bits::try_from_f64(self.float64()?)?)),
+        let (value, end) = parse::decode_value_trusted(self.data, self.start)?;
+        if end != self.end {
+            return Err(malformed(self.start));
         }
+        Ok(value)
     }
 }
 
@@ -1233,7 +1205,7 @@ fn read_text<'a>(s: &mut CborStream<'a>) -> Result<ParsedText<'a>, CborError> {
 }
 
 fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
-    walk::value_end(data, start)
+    parse::value_end_trusted(data, start)
 }
 
 fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {

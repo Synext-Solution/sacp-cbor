@@ -1,5 +1,5 @@
-use crate::walk::validate_canonical;
-use crate::{CborError, DecodeLimits};
+use crate::parse::{decode_value_trusted, validate_canonical};
+use crate::{CborError, DecodeLimits, ErrorCode};
 
 #[cfg(feature = "alloc")]
 use crate::value::CborValue;
@@ -14,5 +14,9 @@ use crate::value::CborValue;
 #[cfg(feature = "alloc")]
 pub fn decode_value(bytes: &[u8], limits: DecodeLimits) -> Result<CborValue, CborError> {
     let canon = validate_canonical(bytes, limits)?;
-    canon.root().to_owned()
+    let (value, end) = decode_value_trusted(canon.as_bytes(), 0)?;
+    if end != canon.as_bytes().len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, end));
+    }
+    Ok(value)
 }

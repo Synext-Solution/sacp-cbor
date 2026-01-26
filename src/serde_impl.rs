@@ -8,7 +8,8 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::profile::{CANONICAL_NAN_BITS, NEGATIVE_ZERO_BITS};
-use crate::value::{BigInt, CborInteger, CborMap, CborValue, F64Bits, ValueRepr};
+use crate::scalar::F64Bits;
+use crate::value::{BigInt, CborInteger, CborMap, CborValue, ValueRepr};
 use crate::{CborError, DecodeLimits, ErrorCode};
 
 impl Serialize for CborValue {
@@ -1509,18 +1510,18 @@ fn uint_to_value(v: u128) -> Result<CborValue, SerdeError> {
 }
 
 fn bignum_from_u128(negative: bool, n: u128) -> Result<CborValue, SerdeError> {
-    let magnitude = u128_to_be_bytes(n);
+    let magnitude = u128_to_be_bytes_nonzero(n)?;
     let bigint = BigInt::new(negative, magnitude).map_err(|err| SerdeError::with_code(err.code))?;
     Ok(CborValue::integer(CborInteger::from_bigint(bigint)))
 }
 
-fn u128_to_be_bytes(n: u128) -> Vec<u8> {
+fn u128_to_be_bytes_nonzero(n: u128) -> Result<Vec<u8>, SerdeError> {
     if n == 0 {
-        return vec![0];
+        return Err(SerdeError::with_code(ErrorCode::SerdeError));
     }
     let leading_bytes = (n.leading_zeros() / 8) as usize;
     let bytes = n.to_be_bytes();
-    bytes[leading_bytes..].to_vec()
+    Ok(bytes[leading_bytes..].to_vec())
 }
 
 fn bigint_to_u128(big: &BigInt) -> Option<u128> {
@@ -1601,6 +1602,13 @@ where
 fn f64_to_f32(v: f64) -> Result<f32, SerdeError> {
     if v.is_nan() {
         return Ok(f32::NAN);
+    }
+    if v.is_infinite() {
+        return Ok(if v.is_sign_negative() {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        });
     }
     if v > f64::from(f32::MAX) || v < f64::from(f32::MIN) {
         return Err(SerdeError::with_code(ErrorCode::SerdeError));

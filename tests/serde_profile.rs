@@ -18,6 +18,18 @@ fn serde_nan_encodes_to_canonical_nan_bits() {
 }
 
 #[test]
+fn serde_f32_accepts_infinities() {
+    let pos_inf = [0xfb, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let neg_inf = [0xfb, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+    let v_pos: f32 = from_slice(&pos_inf, DecodeLimits::for_bytes(pos_inf.len())).unwrap();
+    assert!(v_pos.is_infinite() && v_pos.is_sign_positive());
+
+    let v_neg: f32 = from_slice(&neg_inf, DecodeLimits::for_bytes(neg_inf.len())).unwrap();
+    assert!(v_neg.is_infinite() && v_neg.is_sign_negative());
+}
+
+#[test]
 fn serde_rejects_non_text_map_keys() {
     let mut m = BTreeMap::new();
     m.insert(1u8, 2u8);

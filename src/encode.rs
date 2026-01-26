@@ -3,7 +3,8 @@ use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
 };
 use crate::query::CborValueRef;
-use crate::value::{BigInt, CborInteger, CborValue, F64Bits, ValueRepr};
+use crate::scalar::F64Bits;
+use crate::value::{BigInt, CborInteger, CborValue, ValueRepr};
 use crate::{CborError, ErrorCode};
 use alloc::vec::Vec;
 
@@ -137,7 +138,10 @@ impl<D> HashSink<D> {
 impl<D: sha2::Digest> Sink for HashSink<D> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
         self.hasher.update(bytes);
-        self.len = self.len.saturating_add(bytes.len());
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.len))?;
         Ok(())
     }
 
@@ -317,7 +321,7 @@ impl CanonicalEncoder {
     ///
     /// Returns an error if the integer is outside the safe range or if encoding fails.
     pub fn int(&mut self, v: i64) -> Result<(), CborError> {
-        validate_int_safe_i64(v).map_err(|code| CborError::new(code, 0))?;
+        validate_int_safe_i64(v).map_err(|code| CborError::new(code, self.sink.position()))?;
         encode_int(&mut self.sink, v)
     }
 
@@ -327,7 +331,8 @@ impl CanonicalEncoder {
     ///
     /// Returns an error if the magnitude is not canonical or if encoding fails.
     pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
-        validate_bignum_bytes(negative, magnitude).map_err(|code| CborError::new(code, 0))?;
+        validate_bignum_bytes(negative, magnitude)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
         let tag = if negative { 3u64 } else { 2u64 };
         encode_major_uint(&mut self.sink, 6, tag)?;
         encode_bytes(&mut self.sink, magnitude)
@@ -634,8 +639,12 @@ impl MapEncoder<'_> {
             ));
         }
 
-        let key_start = self.enc.sink.buf.len();
-        encode_text(&mut self.enc.sink, key)?;
+        let entry_start = self.enc.sink.buf.len();
+        encode_text(&mut self.enc.sink, key).map_err(|err| {
+            self.enc.sink.buf.truncate(entry_start);
+            err
+        })?;
+        let key_start = entry_start;
         let key_end = self.enc.sink.buf.len();
 
         if let Some((ps, pe)) = self.prev_key_range {
@@ -643,21 +652,21 @@ impl MapEncoder<'_> {
             let curr = &self.enc.sink.buf[key_start..key_end];
 
             if prev == curr {
-                return Err(CborError::new(
-                    ErrorCode::DuplicateMapKey,
-                    self.enc.sink.position(),
-                ));
+                self.enc.sink.buf.truncate(entry_start);
+                return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
             }
             if !is_strictly_increasing_encoded(prev, curr) {
-                return Err(CborError::new(
-                    ErrorCode::NonCanonicalMapOrder,
-                    self.enc.sink.position(),
-                ));
+                self.enc.sink.buf.truncate(entry_start);
+                return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
             }
         }
 
+        let res = f(self.enc);
+        if let Err(err) = res {
+            self.enc.sink.buf.truncate(entry_start);
+            return Err(err);
+        }
         self.prev_key_range = Some((key_start, key_end));
-        f(self.enc)?;
         self.remaining -= 1;
         Ok(())
     }

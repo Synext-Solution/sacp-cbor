@@ -59,12 +59,13 @@ extern crate alloc;
 mod canonical;
 mod error;
 mod limits;
+mod parse;
 mod profile;
 mod query;
+mod scalar;
 #[cfg(feature = "serde")]
 mod serde_impl;
 mod stream;
-mod walk;
 
 #[cfg(feature = "alloc")]
 mod decode;
@@ -72,11 +73,12 @@ mod decode;
 pub use crate::canonical::CanonicalCborRef;
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
+pub use crate::parse::{validate, validate_canonical};
 pub use crate::profile::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
 pub use crate::query::{
     ArrayRef, BigIntRef, CborIntegerRef, CborKind, CborValueRef, MapRef, PathElem,
 };
-pub use crate::walk::{validate, validate_canonical};
+pub use crate::scalar::F64Bits;
 
 #[cfg(feature = "alloc")]
 mod encode;
@@ -95,7 +97,7 @@ pub use crate::encode::{ArrayEncoder, CanonicalEncoder, MapEncoder};
 #[doc(hidden)]
 pub use crate::macros::__cbor_macro;
 #[cfg(feature = "alloc")]
-pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue, F64Bits};
+pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue};
 
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::serde_value;

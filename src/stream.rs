@@ -11,10 +11,6 @@ impl<'a> CborStream<'a> {
         Self { data, pos }
     }
 
-    pub const fn data(&self) -> &'a [u8] {
-        self.data
-    }
-
     pub const fn position(&self) -> usize {
         self.pos
     }
