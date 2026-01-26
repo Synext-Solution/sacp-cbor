@@ -82,6 +82,9 @@ pub enum CborErrorCode {
     NegativeZeroForbidden,
     /// Float64 NaN encoding is not canonical.
     NonCanonicalNaN,
+
+    /// Serde conversion failed.
+    SerdeError,
 }
 
 /// An SACP-CBOR/1 error with structured classification, a stable code, and a byte offset.
@@ -178,6 +181,7 @@ impl fmt::Display for CborError {
 
             CborErrorCode::NegativeZeroForbidden => "negative zero forbidden",
             CborErrorCode::NonCanonicalNaN => "non-canonical NaN encoding",
+            CborErrorCode::SerdeError => "serde conversion failed",
         };
 
         match self.kind {

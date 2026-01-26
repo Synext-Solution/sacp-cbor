@@ -28,6 +28,9 @@ they are already canonical; therefore, for opaque payloads, **semantic equality 
 | `std`   | yes     | Implements `std::error::Error` for `CborError`.                                           |
 | `alloc` | yes     | Enables owned AST types (`CborValue`, `CborMap`, `CanonicalCbor`) and canonical encoding. |
 | `sha2`  | yes     | Enables SHA-256 helpers for canonical CBOR bytes (`sha256()`).                            |
+| `serde` | no      | Enables serde-based conversions to/from canonical CBOR (`to_vec`, `from_slice`).          |
+
+Note: `serde` currently requires `std` + `alloc`.
 
 ### `no_std` usage
 
@@ -78,6 +81,29 @@ assert_eq!(v.encode_canonical()?, bytes);
 # Ok::<(), sacp_cbor::CborError>(())
 ```
 
+### Serde encode/decode (requires `serde` + `alloc`)
+
+```rust
+use serde::{Deserialize, Serialize};
+use sacp_cbor::{from_slice, to_vec, DecodeLimits};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct Msg {
+    op: String,
+    n: u64,
+}
+
+let msg = Msg {
+    op: "ping".to_string(),
+    n: 42,
+};
+
+let bytes = to_vec(&msg)?;
+let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+assert_eq!(msg, decoded);
+# Ok::<(), sacp_cbor::CborError>(())
+```
+
 ### Hash canonical bytes (requires `sha2`)
 
 ```rust
@@ -95,6 +121,8 @@ let digest = canon.sha256();
 - `decode_value(bytes, limits) -> CborValue` *(feature `alloc`)*
 - `CborValue::encode_canonical() -> Vec<u8>` *(feature `alloc`)*
 - `cbor_equal(a, b) -> bool` *(feature `alloc`)*
+- `to_vec<T: Serialize>(&T) -> Vec<u8>` *(feature `serde` + `alloc`)*
+- `from_slice<T: DeserializeOwned>(bytes, limits) -> T` *(feature `serde` + `alloc`)*
 
 ## Fuzzing
 

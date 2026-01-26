@@ -44,6 +44,8 @@ mod float;
 mod limits;
 mod order;
 mod scanner;
+#[cfg(feature = "serde")]
+mod serde_impl;
 
 pub use crate::canonical::CanonicalCborRef;
 pub use crate::error::{CborError, CborErrorCode, CborErrorKind};
@@ -62,3 +64,6 @@ pub use crate::canonical::CanonicalCbor;
 pub use crate::scanner::decode_value;
 #[cfg(feature = "alloc")]
 pub use crate::value::{cbor_equal, BigInt, CborMap, CborValue, F64Bits};
+
+#[cfg(feature = "serde")]
+pub use crate::serde_impl::{from_slice, from_value_ref, to_value, to_vec};

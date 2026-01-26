@@ -25,11 +25,15 @@ alloc = []
 # Enable SHA-256 hashing helpers for canonical CBOR bytes.
 sha2 = ["dep:sha2"]
 
+# Enable serde-based conversions to/from canonical CBOR.
+serde = ["dep:serde", "alloc", "std"]
+
 [dependencies]
 sha2 = { version = "0.10", default-features = false, optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8.1"
 proptest = "1"
 
 [[bench]]

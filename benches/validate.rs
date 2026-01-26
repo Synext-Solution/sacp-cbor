@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use sacp_cbor::{decode_value, validate_canonical, CborMap, CborValue, DecodeLimits};
 
