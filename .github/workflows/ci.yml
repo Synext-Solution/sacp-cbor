@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+
+      - name: Build (no_std + alloc)
+        run: cargo build --no-default-features --features alloc
+
+      - name: Build (no_std + alloc + sha2)
+        run: cargo build --no-default-features --features alloc,sha2
+
+      - name: Docs
+        run: cargo doc --no-deps --all-features

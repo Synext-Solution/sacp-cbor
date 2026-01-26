@@ -1,0 +1,27 @@
+[package]
+name = "sacp-cbor-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sacp-cbor = { path = "..", default-features = true }
+
+[[bin]]
+name = "validate_only"
+path = "fuzz_targets/validate_only.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "validate_roundtrip"
+path = "fuzz_targets/validate_roundtrip.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

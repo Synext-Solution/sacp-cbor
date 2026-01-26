@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+
+# cargo-fuzz
+fuzz/artifacts
+fuzz/corpus
+fuzz/target
+fuzz/Cargo.lock
+
+# OS/editor
+.DS_Store
+.idea
+.vscode
+*:Zone.Identifier

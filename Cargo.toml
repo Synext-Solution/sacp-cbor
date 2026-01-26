@@ -1,0 +1,41 @@
+[package]
+name = "sacp-cbor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "SACP-CBOR/1: strict deterministic CBOR validation and canonical encoding (hot-path optimized, no_std-capable)."
+readme = "README.md"
+keywords = ["cbor", "canonical", "deterministic", "no_std", "sacp"]
+categories = ["encoding", "no-std"]
+
+# NOTE: Set your repository URL after creating the GitHub repo.
+repository = "https://github.com/synext/sacp-cbor"
+
+[features]
+# Full-featured default for typical server deployments.
+default = ["std", "alloc", "sha2"]
+
+# Enable std integration (implements std::error::Error and enables test/bench friendliness).
+std = []
+
+# Enable allocation-backed APIs (owned AST, canonical encoder, owned canonical bytes).
+alloc = []
+
+# Enable SHA-256 hashing helpers for canonical CBOR bytes.
+sha2 = ["dep:sha2"]
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false, optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "validate"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
