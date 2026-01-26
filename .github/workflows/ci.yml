@@ -15,6 +15,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Shellcheck
+        uses: ludeeus/action-shellcheck@v2
+        with:
+          scandir: scripts
+
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
