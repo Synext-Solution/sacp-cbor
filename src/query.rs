@@ -20,6 +20,8 @@ use crate::canonical::CanonicalCbor;
 use crate::value::{CborMap, CborValue};
 
 #[cfg(feature = "alloc")]
+use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 /// The CBOR data model supported by this crate.
