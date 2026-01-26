@@ -35,6 +35,7 @@ pub fn is_strictly_increasing_encoded(prev: &[u8], curr: &[u8]) -> bool {
 /// ordering reduces to lexicographic ordering of UTF-8 bytes.
 #[inline]
 #[must_use]
+#[cfg(feature = "alloc")]
 pub fn cmp_text_keys_by_canonical_encoding(a: &str, b: &str) -> Ordering {
     let a_len = encoded_text_len(a.len());
     let b_len = encoded_text_len(b.len());
@@ -56,6 +57,7 @@ pub fn cmp_text_keys_by_canonical_encoding(a: &str, b: &str) -> Ordering {
 /// - otherwise => 9-byte header
 #[inline]
 #[must_use]
+#[cfg(feature = "alloc")]
 pub const fn encoded_text_len(n: usize) -> usize {
     if n < 24 {
         1 + n

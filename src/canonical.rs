@@ -1,3 +1,4 @@
+#[cfg(feature = "alloc")]
 use crate::{CborError, DecodeLimits};
 
 /// A validated canonical SACP-CBOR/1 data item borrowed from an input buffer.

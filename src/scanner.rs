@@ -399,6 +399,7 @@ fn validate_bignum_bytes(negative: bool, magnitude: &[u8]) -> Result<(), CborErr
 #[cfg(feature = "alloc")]
 mod decode {
     use super::Scanner;
+    use alloc::borrow::ToOwned;
     use alloc::string::String;
     use alloc::vec::Vec;
 

@@ -46,7 +46,7 @@ impl DecodeLimits {
     /// - `max_total_items = max_message_bytes`
     /// - `max_bytes_len = max_message_bytes`
     /// - `max_text_len = max_message_bytes`
-    /// - `max_array_len` and `max_map_len` are capped by [`DEFAULT_MAX_CONTAINER_LEN`]
+    /// - `max_array_len` and `max_map_len` are capped by `DEFAULT_MAX_CONTAINER_LEN`
     ///
     /// This is a pragmatic baseline. Production deployments should tune these explicitly.
     #[must_use]
