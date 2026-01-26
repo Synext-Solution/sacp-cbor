@@ -60,6 +60,8 @@ pub use crate::scanner::{validate, validate_canonical};
 #[cfg(feature = "alloc")]
 mod encode;
 #[cfg(feature = "alloc")]
+mod macros;
+#[cfg(feature = "alloc")]
 mod value;
 
 #[cfg(feature = "alloc")]
@@ -68,6 +70,9 @@ pub use crate::canonical::CanonicalCbor;
 pub use crate::scanner::decode_value;
 #[cfg(feature = "alloc")]
 pub use crate::value::{cbor_equal, BigInt, CborMap, CborValue, F64Bits};
+#[cfg(feature = "alloc")]
+#[doc(hidden)]
+pub use crate::macros::__cbor_macro;
 
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::{from_slice, from_value_ref, to_value, to_vec};
