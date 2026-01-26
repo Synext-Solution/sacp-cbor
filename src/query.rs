@@ -541,13 +541,10 @@ impl<'a> MapRef<'a> {
         let data = self.data;
         let off = self.map_off;
         let out = core::array::from_fn(|i| {
-            got[i].map_or_else(
-                || {
-                    err = Some(missing_key(off));
-                    CborValueRef::new(data, off, off)
-                },
-                |v| v,
-            )
+            got[i].unwrap_or_else(|| {
+                err = Some(missing_key(off));
+                CborValueRef::new(data, off, off)
+            })
         });
 
         if let Some(e) = err {
