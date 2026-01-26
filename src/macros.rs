@@ -46,17 +46,17 @@
 macro_rules! cbor {
     (null) => {
         ::core::result::Result::<$crate::CborValue, $crate::CborError>::Ok(
-            $crate::CborValue::Null,
+            $crate::CborValue::null(),
         )
     };
     (true) => {
         ::core::result::Result::<$crate::CborValue, $crate::CborError>::Ok(
-            $crate::CborValue::Bool(true),
+            $crate::CborValue::bool(true),
         )
     };
     (false) => {
         ::core::result::Result::<$crate::CborValue, $crate::CborError>::Ok(
-            $crate::CborValue::Bool(false),
+            $crate::CborValue::bool(false),
         )
     };
 
@@ -73,7 +73,7 @@ macro_rules! cbor {
                 items.push($crate::cbor!($elem)?);
             )*
 
-            ::core::result::Result::Ok($crate::CborValue::Array(items))
+            ::core::result::Result::Ok($crate::CborValue::array(items))
         })()
     }};
 
@@ -93,13 +93,82 @@ macro_rules! cbor {
             )*
 
             let map = $crate::CborMap::new(entries)?;
-            ::core::result::Result::Ok($crate::CborValue::Map(map))
+            ::core::result::Result::Ok($crate::CborValue::map(map))
         })()
     }};
 
     // Fallback: convert an expression into CborValue
     ($other:expr) => {{
         $crate::__cbor_macro::IntoCborValue::into_cbor_value($other)
+    }};
+}
+
+/// Construct canonical CBOR bytes directly using a JSON-like literal syntax.
+///
+/// This macro returns `Result<crate::CanonicalCbor, crate::CborError>`.
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[macro_export]
+macro_rules! cbor_bytes {
+    ($($tt:tt)+) => {{
+        (|| -> ::core::result::Result<$crate::CanonicalCbor, $crate::CborError> {
+            let mut __enc = $crate::CanonicalEncoder::new();
+            $crate::__cbor_bytes_into!(&mut __enc, $($tt)+)?;
+            ::core::result::Result::Ok(__enc.into_canonical())
+        })()
+    }};
+}
+
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+#[macro_export]
+macro_rules! __cbor_bytes_into {
+    ($enc:expr, null) => { $enc.null() };
+    ($enc:expr, true) => { $enc.bool(true) };
+    ($enc:expr, false) => { $enc.bool(false) };
+
+    ($enc:expr, [ $($elem:tt),* $(,)? ]) => {{
+        let __len = 0usize $(+ { let _ = stringify!($elem); 1usize })*;
+        $enc.array(__len, |__arr| {
+            $( $crate::__cbor_bytes_into!(__arr, $elem)?; )*
+            ::core::result::Result::Ok(())
+        })
+    }};
+
+    ($enc:expr, { $($key:tt : $value:tt),* $(,)? }) => {{
+        let __len = 0usize $(+ { let _ = stringify!($key); let _ = stringify!($value); 1usize })*;
+        $enc.map(__len, |__map| {
+            $( $crate::__cbor_bytes_map_entry!(__map, $key, $value)?; )*
+            ::core::result::Result::Ok(())
+        })
+    }};
+
+    // fallback: encode arbitrary expression types via IntoCborBytes
+    ($enc:expr, $other:expr) => {{
+        $enc.__encode_any($other)
+    }};
+}
+
+#[doc(hidden)]
+#[cfg(feature = "alloc")]
+#[macro_export]
+macro_rules! __cbor_bytes_map_entry {
+    ($map:expr, $key:ident, $value:tt) => {{
+        $map.entry(::core::stringify!($key), |__enc| {
+            $crate::__cbor_bytes_into!(__enc, $value)
+        })?;
+        ::core::result::Result::Ok(())
+    }};
+    ($map:expr, $key:literal, $value:tt) => {{
+        $map.entry($key, |__enc| $crate::__cbor_bytes_into!(__enc, $value))?;
+        ::core::result::Result::Ok(())
+    }};
+    ($map:expr, (($key:expr)), $value:tt) => {{
+        let __k = $crate::__cbor_macro::IntoCborKey::into_cbor_key($key)?;
+        $map.entry(__k.as_ref(), |__enc| {
+            $crate::__cbor_bytes_into!(__enc, $value)
+        })?;
+        ::core::result::Result::Ok(())
     }};
 }
 
@@ -113,7 +182,7 @@ macro_rules! cbor {
 #[macro_export]
 macro_rules! __cbor_key {
     ($key:ident) => {{
-        $crate::__cbor_macro::string_from_str(::core::stringify!($key))
+        $crate::__cbor_macro::boxed_str_from_str(::core::stringify!($key))
     }};
     (($key:expr)) => {{
         $crate::__cbor_macro::IntoCborKey::into_cbor_key($key)
@@ -121,7 +190,7 @@ macro_rules! __cbor_key {
     ($key:literal) => {{
         // Intentionally requires a string literal type (`&'static str`).
         // Non-string literals will fail to type-check here.
-        $crate::__cbor_macro::string_from_str($key)
+        $crate::__cbor_macro::boxed_str_from_str($key)
     }};
 }
 
@@ -131,24 +200,26 @@ macro_rules! __cbor_key {
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub mod __cbor_macro {
+    use alloc::boxed::Box;
     use alloc::string::String;
     use core::convert::TryFrom;
 
     pub use alloc::vec::Vec;
 
     use crate::{
-        BigInt, CborError, CborErrorCode, CborMap, CborValue, F64Bits, MAX_SAFE_INTEGER,
-        MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER,
+        BigInt, CanonicalCbor, CanonicalCborRef, CanonicalEncoder, CborError, CborInteger, CborMap,
+        CborValue, CborValueRef, ErrorCode, F64Bits, MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64,
+        MIN_SAFE_INTEGER,
     };
 
     #[inline]
     const fn alloc_failed() -> CborError {
-        CborError::encode(CborErrorCode::AllocationFailed)
+        CborError::new(ErrorCode::AllocationFailed, 0)
     }
 
     #[inline]
     const fn overflow() -> CborError {
-        CborError::encode(CborErrorCode::LengthOverflow)
+        CborError::new(ErrorCode::LengthOverflow, 0)
     }
 
     pub fn try_reserve_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<(), CborError> {
@@ -157,11 +228,11 @@ pub mod __cbor_macro {
         Ok(())
     }
 
-    pub fn string_from_str(s: &str) -> Result<String, CborError> {
+    pub fn boxed_str_from_str(s: &str) -> Result<Box<str>, CborError> {
         let mut out = String::new();
         out.try_reserve_exact(s.len()).map_err(|_| alloc_failed())?;
         out.push_str(s);
-        Ok(out)
+        Ok(out.into_boxed_str())
     }
 
     pub fn bytes_from_slice(b: &[u8]) -> Result<Vec<u8>, CborError> {
@@ -183,12 +254,12 @@ pub mod __cbor_macro {
         let safe_max = u128::from(MAX_SAFE_INTEGER);
         if v <= safe_max {
             let i = i64::try_from(v).map_err(|_| overflow())?;
-            return Ok(CborValue::Int(i));
+            return CborValue::int(i);
         }
 
         let magnitude = u128_to_min_be_bytes_nonzero(v)?;
         let big = BigInt::new(false, magnitude)?;
-        Ok(CborValue::Bignum(big))
+        Ok(CborValue::integer(CborInteger::from_bigint(big)))
     }
 
     fn int_from_i128(v: i128) -> Result<CborValue, CborError> {
@@ -197,7 +268,7 @@ pub mod __cbor_macro {
 
         if v >= min && v <= safe_max {
             let i = i64::try_from(v).map_err(|_| overflow())?;
-            return Ok(CborValue::Int(i));
+            return CborValue::int(i);
         }
 
         let negative = v < 0;
@@ -212,37 +283,37 @@ pub mod __cbor_macro {
         // Outside safe range implies n_u128 != 0.
         let magnitude = u128_to_min_be_bytes_nonzero(n_u128)?;
         let big = BigInt::new(negative, magnitude)?;
-        Ok(CborValue::Bignum(big))
+        Ok(CborValue::integer(CborInteger::from_bigint(big)))
     }
 
     pub trait IntoCborKey {
-        fn into_cbor_key(self) -> Result<String, CborError>;
+        fn into_cbor_key(self) -> Result<Box<str>, CborError>;
     }
 
     impl IntoCborKey for String {
-        fn into_cbor_key(self) -> Result<String, CborError> {
-            Ok(self)
+        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
+            Ok(self.into_boxed_str())
         }
     }
 
     impl IntoCborKey for &String {
-        fn into_cbor_key(self) -> Result<String, CborError> {
-            string_from_str(self.as_str())
+        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
+            boxed_str_from_str(self.as_str())
         }
     }
 
     impl IntoCborKey for &str {
-        fn into_cbor_key(self) -> Result<String, CborError> {
-            string_from_str(self)
+        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
+            boxed_str_from_str(self)
         }
     }
 
     impl IntoCborKey for char {
-        fn into_cbor_key(self) -> Result<String, CborError> {
+        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
             let mut out = String::new();
             out.try_reserve_exact(4).map_err(|_| alloc_failed())?;
             out.push(self);
-            Ok(out)
+            Ok(out.into_boxed_str())
         }
     }
 
@@ -264,116 +335,116 @@ pub mod __cbor_macro {
 
     impl IntoCborValue for CborMap {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Map(self))
+            Ok(CborValue::map(self))
         }
     }
 
     impl IntoCborValue for &CborMap {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Map(self.clone()))
+            Ok(CborValue::map(self.clone()))
         }
     }
 
     impl IntoCborValue for BigInt {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bignum(self))
+            Ok(CborValue::integer(CborInteger::from_bigint(self)))
         }
     }
 
     impl IntoCborValue for &BigInt {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bignum(self.clone()))
+            Ok(CborValue::integer(CborInteger::from_bigint(self.clone())))
         }
     }
 
     impl IntoCborValue for F64Bits {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Float(self))
+            Ok(CborValue::float(self))
         }
     }
 
     impl IntoCborValue for bool {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bool(self))
+            Ok(CborValue::bool(self))
         }
     }
 
     impl IntoCborValue for () {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Null)
+            Ok(CborValue::null())
         }
     }
 
     impl<T: IntoCborValue> IntoCborValue for Option<T> {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            self.map_or(Ok(CborValue::Null), IntoCborValue::into_cbor_value)
+            self.map_or(Ok(CborValue::null()), IntoCborValue::into_cbor_value)
         }
     }
 
     impl IntoCborValue for String {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Text(self))
+            Ok(CborValue::text(self))
         }
     }
 
     impl IntoCborValue for &String {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Text(string_from_str(self.as_str())?))
+            Ok(CborValue::text(self.as_str()))
         }
     }
 
     impl IntoCborValue for &str {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Text(string_from_str(self)?))
+            Ok(CborValue::text(self))
         }
     }
 
     impl IntoCborValue for Vec<u8> {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bytes(self))
+            Ok(CborValue::bytes(self))
         }
     }
 
     impl IntoCborValue for &Vec<u8> {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bytes(bytes_from_slice(self.as_slice())?))
+            Ok(CborValue::bytes(bytes_from_slice(self.as_slice())?))
         }
     }
 
     impl IntoCborValue for &[u8] {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bytes(bytes_from_slice(self)?))
+            Ok(CborValue::bytes(bytes_from_slice(self)?))
         }
     }
 
     impl<const N: usize> IntoCborValue for &[u8; N] {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Bytes(bytes_from_slice(&self[..])?))
+            Ok(CborValue::bytes(bytes_from_slice(&self[..])?))
         }
     }
 
     impl IntoCborValue for Vec<CborValue> {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Array(self))
+            Ok(CborValue::array(self))
         }
     }
 
     impl IntoCborValue for &[CborValue] {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
             // Clone into a new Vec (may allocate).
-            Ok(CborValue::Array(self.to_vec()))
+            Ok(CborValue::array(self.to_vec()))
         }
     }
 
     impl IntoCborValue for f64 {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Float(F64Bits::try_from_f64(self)?))
+            Ok(CborValue::float(F64Bits::try_from_f64(self)?))
         }
     }
 
     impl IntoCborValue for f32 {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::Float(F64Bits::try_from_f64(f64::from(self))?))
+            Ok(CborValue::float(F64Bits::try_from_f64(f64::from(self))?))
         }
     }
 
@@ -409,6 +480,190 @@ pub mod __cbor_macro {
     impl IntoCborValue for usize {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
             int_from_u128(u128::try_from(self).map_err(|_| overflow())?)
+        }
+    }
+
+    pub trait IntoCborBytes {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError>;
+    }
+
+    fn encode_u128(enc: &mut CanonicalEncoder, v: u128) -> Result<(), CborError> {
+        let safe_max = u128::from(MAX_SAFE_INTEGER);
+        if v <= safe_max {
+            let i = i64::try_from(v).map_err(|_| overflow())?;
+            return enc.int(i);
+        }
+
+        let raw = v.to_be_bytes();
+        let leading = (v.leading_zeros() / 8) as usize;
+        enc.bignum(false, &raw[leading..])
+    }
+
+    fn encode_i128(enc: &mut CanonicalEncoder, v: i128) -> Result<(), CborError> {
+        let min = i128::from(MIN_SAFE_INTEGER);
+        let max = i128::from(MAX_SAFE_INTEGER_I64);
+
+        if v >= min && v <= max {
+            let i = i64::try_from(v).map_err(|_| overflow())?;
+            return enc.int(i);
+        }
+
+        let negative = v < 0;
+        let n_u128 = if negative {
+            let n_i128 = -1_i128 - v;
+            u128::try_from(n_i128).map_err(|_| overflow())?
+        } else {
+            u128::try_from(v).map_err(|_| overflow())?
+        };
+
+        let raw = n_u128.to_be_bytes();
+        let leading = (n_u128.leading_zeros() / 8) as usize;
+        enc.bignum(negative, &raw[leading..])
+    }
+
+    impl IntoCborBytes for CborValue {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.value(&self)
+        }
+    }
+
+    impl IntoCborBytes for &CborValue {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.value(self)
+        }
+    }
+
+    impl IntoCborBytes for CanonicalCborRef<'_> {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.raw_cbor(self)
+        }
+    }
+
+    impl IntoCborBytes for &CanonicalCbor {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.raw_cbor(CanonicalCborRef::new(self.as_bytes()))
+        }
+    }
+
+    impl IntoCborBytes for CborValueRef<'_> {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.raw_value_ref(self)
+        }
+    }
+
+    impl IntoCborBytes for bool {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.bool(self)
+        }
+    }
+
+    impl IntoCborBytes for () {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.null()
+        }
+    }
+
+    impl<T: IntoCborBytes> IntoCborBytes for Option<T> {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            match self {
+                None => enc.null(),
+                Some(v) => v.into_cbor_bytes(enc),
+            }
+        }
+    }
+
+    impl IntoCborBytes for String {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.text(self.as_str())
+        }
+    }
+
+    impl IntoCborBytes for &String {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.text(self.as_str())
+        }
+    }
+
+    impl IntoCborBytes for &str {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.text(self)
+        }
+    }
+
+    impl IntoCborBytes for Vec<u8> {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.bytes(self.as_slice())
+        }
+    }
+
+    impl IntoCborBytes for &Vec<u8> {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.bytes(self.as_slice())
+        }
+    }
+
+    impl IntoCborBytes for &[u8] {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.bytes(self)
+        }
+    }
+
+    impl<const N: usize> IntoCborBytes for &[u8; N] {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.bytes(&self[..])
+        }
+    }
+
+    impl IntoCborBytes for F64Bits {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.float(self)
+        }
+    }
+
+    impl IntoCborBytes for f64 {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.float(F64Bits::try_from_f64(self)?)
+        }
+    }
+
+    impl IntoCborBytes for f32 {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            enc.float(F64Bits::try_from_f64(f64::from(self))?)
+        }
+    }
+
+    macro_rules! impl_into_int_signed_bytes {
+        ($($t:ty),* $(,)?) => {$(
+            impl IntoCborBytes for $t {
+                fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+                    encode_i128(enc, i128::from(self))
+                }
+            }
+        )*};
+    }
+
+    macro_rules! impl_into_int_unsigned_bytes {
+        ($($t:ty),* $(,)?) => {$(
+            impl IntoCborBytes for $t {
+                fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+                    encode_u128(enc, u128::from(self))
+                }
+            }
+        )*};
+    }
+
+    impl_into_int_signed_bytes!(i8, i16, i32, i64, i128);
+    impl_into_int_unsigned_bytes!(u8, u16, u32, u64, u128);
+
+    impl IntoCborBytes for isize {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            encode_i128(enc, i128::try_from(self).map_err(|_| overflow())?)
+        }
+    }
+
+    impl IntoCborBytes for usize {
+        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+            encode_u128(enc, u128::try_from(self).map_err(|_| overflow())?)
         }
     }
 }

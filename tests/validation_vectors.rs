@@ -1,21 +1,20 @@
 #[cfg(feature = "alloc")]
 use sacp_cbor::decode_value;
-use sacp_cbor::{validate_canonical, CborErrorCode, DecodeLimits};
+use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode};
 
-fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: CborErrorCode) -> usize {
+fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) -> usize {
     let err = validate_canonical(bytes, limits).unwrap_err();
     assert_eq!(err.code, code);
     err.offset
 }
 
 #[cfg(feature = "alloc")]
-fn assert_decode_validate_match(bytes: &[u8], limits: DecodeLimits, code: CborErrorCode) {
+fn assert_decode_validate_match(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) {
     let v_err = validate_canonical(bytes, limits).unwrap_err();
     let d_err = decode_value(bytes, limits).unwrap_err();
     assert_eq!(v_err.code, code);
     assert_eq!(d_err.code, code);
     assert_eq!(v_err.offset, d_err.offset);
-    assert_eq!(v_err.kind, d_err.kind);
 }
 
 fn tstr_encoded(len: usize, fill: u8) -> Vec<u8> {
@@ -67,24 +66,49 @@ fn accepts_minimal_valid_map() {
 }
 
 #[test]
+fn rejects_input_len_over_limit() {
+    let bytes = [0xf6]; // null
+    let limits = DecodeLimits::for_bytes(0);
+    let err = validate_canonical(&bytes, limits).unwrap_err();
+    assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
+
+    #[cfg(feature = "alloc")]
+    {
+        let err = decode_value(&bytes, limits).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
+    }
+}
+
+#[test]
+fn ai_31_is_reserved_for_int_and_tag() {
+    let bytes = [0x1f]; // major 0, ai=31
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ReservedAdditionalInfo);
+
+    let bytes = [0xdf]; // major 6 (tag), ai=31
+    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ReservedAdditionalInfo);
+}
+
+#[test]
 fn rejects_trailing_bytes() {
     let bytes = [0xa0, 0x00]; // {} then trailing 0x00
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::TrailingBytes);
+    assert_eq!(err.code, ErrorCode::TrailingBytes);
 }
 
 #[test]
 fn rejects_indefinite_length_text() {
     let bytes = [0x7f, 0xff]; // indefinite text, immediately break
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::IndefiniteLengthForbidden);
+    assert_eq!(err.code, ErrorCode::IndefiniteLengthForbidden);
 }
 
 #[test]
 fn rejects_non_canonical_uint_encoding() {
     let bytes = [0x18, 0x17]; // 23 encoded with 1-byte length argument (non-canonical)
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
@@ -93,14 +117,14 @@ fn rejects_non_canonical_length_encoding_for_text() {
     let mut bytes = vec![0x78, 23];
     bytes.extend(std::iter::repeat(b'a').take(23));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
 fn rejects_non_canonical_nint_encoding() {
     let bytes = [0x38, 0x17]; // -24, should be 0x37
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
@@ -108,7 +132,7 @@ fn rejects_non_canonical_tag_encoding() {
     // tag(2) encoded with ai=24 (non-canonical), followed by bstr magnitude
     let bytes = [0xd8, 0x02, 0x47, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
     assert_eq!(err.offset, 0);
 }
 
@@ -117,21 +141,21 @@ fn rejects_non_canonical_length_encoding_for_bytes() {
     let mut bytes = vec![0x58, 23];
     bytes.extend(std::iter::repeat(0u8).take(23));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
 fn rejects_non_canonical_length_encoding_for_array_header() {
     let bytes = [0x98, 0x17]; // array length 23 encoded with ai=24
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
 fn rejects_non_canonical_length_encoding_for_map_header() {
     let bytes = [0xb8, 0x17]; // map length 23 encoded with ai=24
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalEncoding);
+    assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
 
 #[test]
@@ -139,7 +163,7 @@ fn rejects_map_key_not_text() {
     // { h'00': 0 }
     let bytes = [0xa1, 0x41, 0x00, 0x00];
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::MapKeyMustBeText);
+    assert_eq!(err.code, ErrorCode::MapKeyMustBeText);
 }
 
 #[test]
@@ -147,7 +171,7 @@ fn rejects_duplicate_map_key() {
     // {"a": 0, "a": 1}
     let bytes = [0xa2, 0x61, 0x61, 0x00, 0x61, 0x61, 0x01];
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::DuplicateMapKey);
+    assert_eq!(err.code, ErrorCode::DuplicateMapKey);
 }
 
 #[test]
@@ -155,7 +179,7 @@ fn rejects_map_out_of_order_same_length() {
     // {"b": 0, "a": 1} (keys same encoded length; should be lexicographically sorted)
     let bytes = [0xa2, 0x61, 0x62, 0x00, 0x61, 0x61, 0x01];
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalMapOrder);
+    assert_eq!(err.code, ErrorCode::NonCanonicalMapOrder);
 }
 
 #[test]
@@ -172,7 +196,7 @@ fn rejects_map_out_of_order_23_24_boundary() {
     bytes.push(0x01);
 
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalMapOrder);
+    assert_eq!(err.code, ErrorCode::NonCanonicalMapOrder);
 }
 
 #[test]
@@ -188,14 +212,14 @@ fn rejects_map_out_of_order_255_256_boundary() {
     bytes.push(0x01);
 
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalMapOrder);
+    assert_eq!(err.code, ErrorCode::NonCanonicalMapOrder);
 }
 
 #[test]
 fn rejects_forbidden_tag() {
     let bytes = [0xc1, 0x00]; // tag(1) 0
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::ForbiddenOrMalformedTag);
+    assert_eq!(err.code, ErrorCode::ForbiddenOrMalformedTag);
 }
 
 #[test]
@@ -204,7 +228,7 @@ fn rejects_bignum_in_safe_range() {
     let mut bytes = vec![0xc2];
     bytes.extend_from_slice(&bstr_encoded(&[0x01]));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::BignumMustBeOutsideSafeRange);
+    assert_eq!(err.code, ErrorCode::BignumMustBeOutsideSafeRange);
 }
 
 #[test]
@@ -213,7 +237,7 @@ fn rejects_bignum_with_leading_zero() {
     let mut bytes = vec![0xc2];
     bytes.extend_from_slice(&bstr_encoded(&[0x00, 0x01]));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::BignumNotCanonical);
+    assert_eq!(err.code, ErrorCode::BignumNotCanonical);
 }
 
 #[test]
@@ -221,7 +245,7 @@ fn rejects_negative_zero_float64() {
     let mut bytes = vec![0xfb];
     bytes.extend_from_slice(&0x8000_0000_0000_0000u64.to_be_bytes());
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NegativeZeroForbidden);
+    assert_eq!(err.code, ErrorCode::NegativeZeroForbidden);
 }
 
 #[test]
@@ -229,7 +253,7 @@ fn rejects_non_canonical_nan_float64() {
     let mut bytes = vec![0xfb];
     bytes.extend_from_slice(&0x7ff9_0000_0000_0000u64.to_be_bytes());
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NonCanonicalNaN);
+    assert_eq!(err.code, ErrorCode::NonCanonicalNaN);
 }
 
 #[test]
@@ -258,7 +282,7 @@ fn rejects_safe_integer_overflow() {
     assert_invalid(
         &too_big,
         DecodeLimits::for_bytes(too_big.len()),
-        CborErrorCode::IntegerOutsideSafeRange,
+        ErrorCode::IntegerOutsideSafeRange,
     );
 
     let mut too_small = vec![0x3b];
@@ -266,7 +290,7 @@ fn rejects_safe_integer_overflow() {
     assert_invalid(
         &too_small,
         DecodeLimits::for_bytes(too_small.len()),
-        CborErrorCode::IntegerOutsideSafeRange,
+        ErrorCode::IntegerOutsideSafeRange,
     );
 }
 
@@ -281,7 +305,7 @@ fn bignum_boundary_cases() {
     assert_invalid(
         &pos_eq_safe,
         DecodeLimits::for_bytes(pos_eq_safe.len()),
-        CborErrorCode::BignumMustBeOutsideSafeRange,
+        ErrorCode::BignumMustBeOutsideSafeRange,
     );
 
     let mut pos_gt_safe = vec![0xc2];
@@ -297,7 +321,7 @@ fn bignum_boundary_cases() {
     assert_invalid(
         &neg_lt_safe,
         DecodeLimits::for_bytes(neg_lt_safe.len()),
-        CborErrorCode::BignumMustBeOutsideSafeRange,
+        ErrorCode::BignumMustBeOutsideSafeRange,
     );
 }
 
@@ -307,7 +331,7 @@ fn rejects_bignum_empty_magnitude() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::BignumNotCanonical,
+        ErrorCode::BignumNotCanonical,
     );
 }
 
@@ -317,7 +341,7 @@ fn rejects_bignum_non_canonical_length_encoding() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::NonCanonicalEncoding,
+        ErrorCode::NonCanonicalEncoding,
     );
 }
 
@@ -327,7 +351,7 @@ fn rejects_malformed_tag_shape() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ForbiddenOrMalformedTag,
+        ErrorCode::ForbiddenOrMalformedTag,
     );
 }
 
@@ -337,7 +361,7 @@ fn rejects_tag_with_indefinite_bstr() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::IndefiniteLengthForbidden,
+        ErrorCode::IndefiniteLengthForbidden,
     );
 }
 
@@ -347,7 +371,7 @@ fn rejects_invalid_utf8_text() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::Utf8Invalid,
+        ErrorCode::Utf8Invalid,
     );
 }
 
@@ -357,7 +381,7 @@ fn rejects_invalid_utf8_map_key() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::Utf8Invalid,
+        ErrorCode::Utf8Invalid,
     );
 }
 
@@ -367,21 +391,21 @@ fn rejects_float16_float32_and_break() {
     assert_invalid(
         &bytes_f16,
         DecodeLimits::for_bytes(bytes_f16.len()),
-        CborErrorCode::UnsupportedSimpleValue,
+        ErrorCode::UnsupportedSimpleValue,
     );
 
     let bytes_f32 = [0xfa, 0x00, 0x00, 0x00, 0x00];
     assert_invalid(
         &bytes_f32,
         DecodeLimits::for_bytes(bytes_f32.len()),
-        CborErrorCode::UnsupportedSimpleValue,
+        ErrorCode::UnsupportedSimpleValue,
     );
 
     let bytes_break = [0xff];
     assert_invalid(
         &bytes_break,
         DecodeLimits::for_bytes(bytes_break.len()),
-        CborErrorCode::UnsupportedSimpleValue,
+        ErrorCode::UnsupportedSimpleValue,
     );
 }
 
@@ -391,21 +415,21 @@ fn rejects_indefinite_lengths() {
     assert_invalid(
         &bytes_bstr,
         DecodeLimits::for_bytes(bytes_bstr.len()),
-        CborErrorCode::IndefiniteLengthForbidden,
+        ErrorCode::IndefiniteLengthForbidden,
     );
 
     let bytes_array = [0x9f, 0xff];
     assert_invalid(
         &bytes_array,
         DecodeLimits::for_bytes(bytes_array.len()),
-        CborErrorCode::IndefiniteLengthForbidden,
+        ErrorCode::IndefiniteLengthForbidden,
     );
 
     let bytes_map = [0xbf, 0xff];
     assert_invalid(
         &bytes_map,
         DecodeLimits::for_bytes(bytes_map.len()),
-        CborErrorCode::IndefiniteLengthForbidden,
+        ErrorCode::IndefiniteLengthForbidden,
     );
 }
 
@@ -415,7 +439,7 @@ fn rejects_reserved_additional_info() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -425,7 +449,7 @@ fn rejects_reserved_additional_info_for_text() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -435,7 +459,7 @@ fn rejects_reserved_additional_info_for_bytes() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -445,7 +469,7 @@ fn rejects_reserved_additional_info_for_array() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -455,7 +479,7 @@ fn rejects_reserved_additional_info_for_map() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -465,7 +489,7 @@ fn rejects_reserved_additional_info_for_simple() {
     assert_invalid(
         &bytes,
         DecodeLimits::for_bytes(bytes.len()),
-        CborErrorCode::ReservedAdditionalInfo,
+        ErrorCode::ReservedAdditionalInfo,
     );
 }
 
@@ -473,13 +497,13 @@ fn rejects_reserved_additional_info_for_simple() {
 fn unexpected_eof_offsets_are_stable() {
     let bytes = [0x18]; // uint8 additional info but missing byte
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::UnexpectedEof);
-    assert_eq!(err.offset, 0);
+    assert_eq!(err.code, ErrorCode::UnexpectedEof);
+    assert_eq!(err.offset, 1);
 
     let bytes = [0xfb, 0x00]; // float64 missing 7 bytes
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::UnexpectedEof);
-    assert_eq!(err.offset, 0);
+    assert_eq!(err.code, ErrorCode::UnexpectedEof);
+    assert_eq!(err.offset, 1);
 }
 
 #[test]
@@ -487,47 +511,47 @@ fn enforces_limits() {
     let bytes_array = [0x81, 0x00];
     let mut limits = DecodeLimits::for_bytes(bytes_array.len());
     limits.max_array_len = 0;
-    assert_invalid(&bytes_array, limits, CborErrorCode::ArrayLenLimitExceeded);
+    assert_invalid(&bytes_array, limits, ErrorCode::ArrayLenLimitExceeded);
 
     let bytes_map = [0xa1, 0x61, 0x61, 0x00];
     let mut limits = DecodeLimits::for_bytes(bytes_map.len());
     limits.max_map_len = 0;
-    assert_invalid(&bytes_map, limits, CborErrorCode::MapLenLimitExceeded);
+    assert_invalid(&bytes_map, limits, ErrorCode::MapLenLimitExceeded);
 
     let bytes_bstr = [0x41, 0x00];
     let mut limits = DecodeLimits::for_bytes(bytes_bstr.len());
     limits.max_bytes_len = 0;
-    assert_invalid(&bytes_bstr, limits, CborErrorCode::BytesLenLimitExceeded);
+    assert_invalid(&bytes_bstr, limits, ErrorCode::BytesLenLimitExceeded);
 
     let bytes_tstr = [0x61, 0x61];
     let mut limits = DecodeLimits::for_bytes(bytes_tstr.len());
     limits.max_text_len = 0;
-    assert_invalid(&bytes_tstr, limits, CborErrorCode::TextLenLimitExceeded);
+    assert_invalid(&bytes_tstr, limits, ErrorCode::TextLenLimitExceeded);
 
     let bytes_depth = [0x80];
     let mut limits = DecodeLimits::for_bytes(bytes_depth.len());
     limits.max_depth = 0;
-    assert_invalid(&bytes_depth, limits, CborErrorCode::DepthLimitExceeded);
+    assert_invalid(&bytes_depth, limits, ErrorCode::DepthLimitExceeded);
 
     let mut limits = DecodeLimits::for_bytes(bytes_array.len());
     limits.max_total_items = 0;
-    assert_invalid(&bytes_array, limits, CborErrorCode::TotalItemsLimitExceeded);
+    assert_invalid(&bytes_array, limits, ErrorCode::TotalItemsLimitExceeded);
 
     let mut limits = DecodeLimits::for_bytes(bytes_map.len());
     limits.max_total_items = 1;
-    assert_invalid(&bytes_map, limits, CborErrorCode::TotalItemsLimitExceeded);
+    assert_invalid(&bytes_map, limits, ErrorCode::TotalItemsLimitExceeded);
 }
 
 #[cfg(feature = "alloc")]
 #[test]
 fn decode_and_validate_error_parity() {
-    let samples: &[(&[u8], CborErrorCode)] = &[
-        (&[0x00, 0x00], CborErrorCode::TrailingBytes),
-        (&[0x18, 0x17], CborErrorCode::NonCanonicalEncoding),
-        (&[0x61, 0xff], CborErrorCode::Utf8Invalid),
-        (&[0xc1, 0x00], CborErrorCode::ForbiddenOrMalformedTag),
-        (&[0xf9, 0x00, 0x00], CborErrorCode::UnsupportedSimpleValue),
-        (&[0xa1, 0x41, 0x00, 0x00], CborErrorCode::MapKeyMustBeText),
+    let samples: &[(&[u8], ErrorCode)] = &[
+        (&[0x00, 0x00], ErrorCode::TrailingBytes),
+        (&[0x18, 0x17], ErrorCode::NonCanonicalEncoding),
+        (&[0x61, 0xff], ErrorCode::Utf8Invalid),
+        (&[0xc1, 0x00], ErrorCode::ForbiddenOrMalformedTag),
+        (&[0xf9, 0x00, 0x00], ErrorCode::UnsupportedSimpleValue),
+        (&[0xa1, 0x41, 0x00, 0x00], ErrorCode::MapKeyMustBeText),
     ];
 
     for (bytes, code) in samples {

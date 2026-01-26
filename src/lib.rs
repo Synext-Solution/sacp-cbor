@@ -13,6 +13,24 @@
 //! - **Owned AST is optional.**
 //!   Enable the `alloc` feature to decode into [`CborValue`] and to construct and encode canonical CBOR.
 //!
+//! ## SACP-CBOR/1 profile (explicit)
+//!
+//! **Allowed data model**
+//!
+//! - Single CBOR item only (no trailing bytes).
+//! - Definite-length items only (no indefinite-length encodings).
+//! - Map keys must be text strings (major 3) and valid UTF-8.
+//! - Only tags 2 and 3 are allowed (bignums), and bignums must be canonical and outside the safe-int range.
+//! - Integers (major 0/1) must be in the safe range `[-(2^53-1), +(2^53-1)]`.
+//! - Floats must be encoded as float64 (major 7, ai=27), forbid `-0.0`, and require the canonical NaN bit pattern.
+//! - Only simple values `false`, `true`, and `null` are allowed.
+//!
+//! **Canonical encoding constraints**
+//!
+//! - Minimal integer/length encoding (no overlong forms).
+//! - Map keys are strictly increasing by canonical CBOR key ordering:
+//!   `(encoded length, then lexicographic encoded bytes)`.
+//!
 //! ## Feature flags
 //!
 //! - `std` *(default)*: implements `std::error::Error` for [`CborError`].
@@ -40,22 +58,25 @@ extern crate alloc;
 
 mod canonical;
 mod error;
-mod float;
 mod limits;
-mod order;
+mod profile;
 mod query;
-mod scanner;
 #[cfg(feature = "serde")]
 mod serde_impl;
+mod stream;
+mod walk;
+
+#[cfg(feature = "alloc")]
+mod decode;
 
 pub use crate::canonical::CanonicalCborRef;
-pub use crate::error::{CborError, CborErrorCode, CborErrorKind};
+pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
-pub use crate::limits::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
+pub use crate::profile::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
 pub use crate::query::{
-    ArrayRef, BigIntRef, CborKind, CborValueRef, MapRef, PathElem, QueryError, QueryErrorCode,
+    ArrayRef, BigIntRef, CborIntegerRef, CborKind, CborValueRef, MapRef, PathElem,
 };
-pub use crate::scanner::{validate, validate_canonical};
+pub use crate::walk::{validate, validate_canonical};
 
 #[cfg(feature = "alloc")]
 mod encode;
@@ -67,12 +88,16 @@ mod value;
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
+pub use crate::decode::decode_value;
+#[cfg(feature = "alloc")]
+pub use crate::encode::{ArrayEncoder, CanonicalEncoder, MapEncoder};
+#[cfg(feature = "alloc")]
 #[doc(hidden)]
 pub use crate::macros::__cbor_macro;
 #[cfg(feature = "alloc")]
-pub use crate::scanner::decode_value;
-#[cfg(feature = "alloc")]
-pub use crate::value::{cbor_equal, BigInt, CborMap, CborValue, F64Bits};
+pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue, F64Bits};
 
+#[cfg(feature = "serde")]
+pub use crate::serde_impl::serde_value;
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::{from_slice, from_value_ref, to_value, to_vec};

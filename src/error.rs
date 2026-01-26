@@ -1,27 +1,11 @@
 use core::fmt;
 
-/// The high-level class of an error.
-///
-/// SACP-CBOR/1 distinguishes:
-/// - **Decode** errors: framing errors such as EOF or trailing bytes.
-/// - **Validate** errors: SACP-CBOR/1 rule violations (canonicality, ordering, etc.).
-/// - **Encode** errors: attempts to encode values that cannot be represented under SACP-CBOR/1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CborErrorKind {
-    /// Decode/framing failure.
-    Decode,
-    /// SACP-CBOR/1 validation failure.
-    Validate,
-    /// Canonical encoding failure.
-    Encode,
-}
-
 /// A structured error code identifying the reason a CBOR item was rejected.
 ///
 /// This enum is intentionally stable and string-free to support `no_std` and to remain hot-path friendly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum CborErrorCode {
+pub enum ErrorCode {
     /// Invalid configured limits.
     InvalidLimits,
 
@@ -33,6 +17,10 @@ pub enum CborErrorCode {
     TrailingBytes,
     /// Memory allocation failed while decoding into owned structures.
     AllocationFailed,
+    /// Array builder length mismatch (encoder).
+    ArrayLenMismatch,
+    /// Map builder length mismatch (encoder).
+    MapLenMismatch,
 
     /// Nesting depth limit exceeded.
     DepthLimitExceeded,
@@ -46,6 +34,8 @@ pub enum CborErrorCode {
     BytesLenLimitExceeded,
     /// Text string length exceeds limits.
     TextLenLimitExceeded,
+    /// Total input length exceeds limits.
+    MessageLenLimitExceeded,
 
     /// Reserved additional-info value (28..30) was used.
     ReservedAdditionalInfo,
@@ -83,18 +73,38 @@ pub enum CborErrorCode {
 
     /// Serde conversion failed.
     SerdeError,
+
+    /// Expected a map at the current location.
+    ExpectedMap,
+    /// Expected an array at the current location.
+    ExpectedArray,
+    /// Expected an integer (safe or bignum) at the current location.
+    ExpectedInteger,
+    /// Expected a text string at the current location.
+    ExpectedText,
+    /// Expected a byte string at the current location.
+    ExpectedBytes,
+    /// Expected a boolean at the current location.
+    ExpectedBool,
+    /// Expected a float64 at the current location.
+    ExpectedFloat,
+
+    /// Invalid query arguments (e.g., output slice length mismatch).
+    InvalidQuery,
+    /// Required key missing from map.
+    MissingKey,
+    /// Malformed canonical CBOR during query traversal.
+    MalformedCanonical,
 }
 
 /// An SACP-CBOR/1 error with structured classification, a stable code, and a byte offset.
 ///
-/// Offsets are meaningful for `Decode` and `Validate` errors. For `Encode` errors, `offset` is `0`.
+/// Offsets refer to the byte position where the error was detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CborError {
-    /// The error kind.
-    pub kind: CborErrorKind,
     /// The error code.
-    pub code: CborErrorCode,
-    /// Byte offset into the input where the error was detected (0 for encode errors).
+    pub code: ErrorCode,
+    /// Byte offset into the input where the error was detected.
     pub offset: usize,
 }
 
@@ -102,92 +112,67 @@ impl CborError {
     /// Construct a decode error at `offset`.
     #[inline]
     #[must_use]
-    pub const fn decode(code: CborErrorCode, offset: usize) -> Self {
-        Self {
-            kind: CborErrorKind::Decode,
-            code,
-            offset,
-        }
-    }
-
-    /// Construct a validation error at `offset`.
-    #[inline]
-    #[must_use]
-    pub const fn validate(code: CborErrorCode, offset: usize) -> Self {
-        Self {
-            kind: CborErrorKind::Validate,
-            code,
-            offset,
-        }
-    }
-
-    /// Construct an encoding error.
-    #[inline]
-    #[must_use]
-    pub const fn encode(code: CborErrorCode) -> Self {
-        Self {
-            kind: CborErrorKind::Encode,
-            code,
-            offset: 0,
-        }
-    }
-
-    /// Returns true iff this error is a validation error.
-    #[inline]
-    #[must_use]
-    pub const fn is_validation(self) -> bool {
-        matches!(self.kind, CborErrorKind::Validate)
+    pub const fn new(code: ErrorCode, offset: usize) -> Self {
+        Self { code, offset }
     }
 }
 
 impl fmt::Display for CborError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self.code {
-            CborErrorCode::InvalidLimits => "invalid CBOR limits",
+            ErrorCode::InvalidLimits => "invalid CBOR limits",
 
-            CborErrorCode::UnexpectedEof => "unexpected end of input",
-            CborErrorCode::LengthOverflow => "length overflow",
-            CborErrorCode::TrailingBytes => "trailing bytes after single CBOR item",
-            CborErrorCode::AllocationFailed => "allocation failed",
+            ErrorCode::UnexpectedEof => "unexpected end of input",
+            ErrorCode::LengthOverflow => "length overflow",
+            ErrorCode::TrailingBytes => "trailing bytes after single CBOR item",
+            ErrorCode::AllocationFailed => "allocation failed",
+            ErrorCode::ArrayLenMismatch => "array length mismatch",
+            ErrorCode::MapLenMismatch => "map length mismatch",
 
-            CborErrorCode::DepthLimitExceeded => "nesting depth limit exceeded",
-            CborErrorCode::TotalItemsLimitExceeded => "total items limit exceeded",
-            CborErrorCode::ArrayLenLimitExceeded => "array length exceeds decode limits",
-            CborErrorCode::MapLenLimitExceeded => "map length exceeds decode limits",
-            CborErrorCode::BytesLenLimitExceeded => "byte string length exceeds decode limits",
-            CborErrorCode::TextLenLimitExceeded => "text string length exceeds decode limits",
+            ErrorCode::DepthLimitExceeded => "nesting depth limit exceeded",
+            ErrorCode::TotalItemsLimitExceeded => "total items limit exceeded",
+            ErrorCode::ArrayLenLimitExceeded => "array length exceeds decode limits",
+            ErrorCode::MapLenLimitExceeded => "map length exceeds decode limits",
+            ErrorCode::BytesLenLimitExceeded => "byte string length exceeds decode limits",
+            ErrorCode::TextLenLimitExceeded => "text string length exceeds decode limits",
+            ErrorCode::MessageLenLimitExceeded => "input length exceeds decode limits",
 
-            CborErrorCode::ReservedAdditionalInfo => "reserved additional info value",
-            CborErrorCode::IndefiniteLengthForbidden => "indefinite length forbidden",
-            CborErrorCode::NonCanonicalEncoding => "non-canonical integer/length encoding",
+            ErrorCode::ReservedAdditionalInfo => "reserved additional info value",
+            ErrorCode::IndefiniteLengthForbidden => "indefinite length forbidden",
+            ErrorCode::NonCanonicalEncoding => "non-canonical integer/length encoding",
 
-            CborErrorCode::MapKeyMustBeText => "map keys must be text strings",
-            CborErrorCode::DuplicateMapKey => "duplicate map key",
-            CborErrorCode::NonCanonicalMapOrder => "non-canonical map key order",
+            ErrorCode::MapKeyMustBeText => "map keys must be text strings",
+            ErrorCode::DuplicateMapKey => "duplicate map key",
+            ErrorCode::NonCanonicalMapOrder => "non-canonical map key order",
 
-            CborErrorCode::ForbiddenOrMalformedTag => "forbidden or malformed CBOR tag",
-            CborErrorCode::BignumNotCanonical => {
+            ErrorCode::ForbiddenOrMalformedTag => "forbidden or malformed CBOR tag",
+            ErrorCode::BignumNotCanonical => {
                 "bignum magnitude must be canonical (non-empty, no leading zero)"
             }
-            CborErrorCode::BignumMustBeOutsideSafeRange => "bignum must be outside int_safe range",
+            ErrorCode::BignumMustBeOutsideSafeRange => "bignum must be outside int_safe range",
 
-            CborErrorCode::UnsupportedSimpleValue => "unsupported CBOR simple value",
-            CborErrorCode::IntegerOutsideSafeRange => "integer outside int_safe range",
+            ErrorCode::UnsupportedSimpleValue => "unsupported CBOR simple value",
+            ErrorCode::IntegerOutsideSafeRange => "integer outside int_safe range",
 
-            CborErrorCode::Utf8Invalid => "text must be valid UTF-8",
+            ErrorCode::Utf8Invalid => "text must be valid UTF-8",
 
-            CborErrorCode::NegativeZeroForbidden => "negative zero forbidden",
-            CborErrorCode::NonCanonicalNaN => "non-canonical NaN encoding",
-            CborErrorCode::SerdeError => "serde conversion failed",
+            ErrorCode::NegativeZeroForbidden => "negative zero forbidden",
+            ErrorCode::NonCanonicalNaN => "non-canonical NaN encoding",
+            ErrorCode::SerdeError => "serde conversion failed",
+
+            ErrorCode::ExpectedMap => "expected CBOR map",
+            ErrorCode::ExpectedArray => "expected CBOR array",
+            ErrorCode::ExpectedInteger => "expected CBOR integer",
+            ErrorCode::ExpectedText => "expected CBOR text string",
+            ErrorCode::ExpectedBytes => "expected CBOR byte string",
+            ErrorCode::ExpectedBool => "expected CBOR bool",
+            ErrorCode::ExpectedFloat => "expected CBOR float64",
+            ErrorCode::InvalidQuery => "invalid query arguments",
+            ErrorCode::MissingKey => "missing required map key",
+            ErrorCode::MalformedCanonical => "malformed canonical CBOR",
         };
 
-        match self.kind {
-            CborErrorKind::Encode => write!(f, "cbor encode failed: {msg}"),
-            CborErrorKind::Decode => write!(f, "cbor decode failed at {}: {msg}", self.offset),
-            CborErrorKind::Validate => {
-                write!(f, "cbor validation failed at {}: {msg}", self.offset)
-            }
-        }
+        write!(f, "cbor error at {}: {msg}", self.offset)
     }
 }
 

@@ -66,6 +66,13 @@ impl<'a> CanonicalCborRef<'a> {
             bytes: self.bytes.to_vec(),
         }
     }
+
+    /// Compare canonical bytes for equality.
+    #[inline]
+    #[must_use]
+    pub fn bytes_eq(self, other: Self) -> bool {
+        self.bytes == other.bytes
+    }
 }
 
 impl AsRef<[u8]> for CanonicalCborRef<'_> {
@@ -89,6 +96,18 @@ pub struct CanonicalCbor {
 
 #[cfg(feature = "alloc")]
 impl CanonicalCbor {
+    #[inline]
+    pub(crate) const fn new_unchecked(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Compare canonical bytes for equality.
+    #[inline]
+    #[must_use]
+    pub fn bytes_eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+
     /// Validate and copy `bytes` into an owned canonical representation.
     ///
     /// # Errors
@@ -126,5 +145,60 @@ impl CanonicalCbor {
 impl AsRef<[u8]> for CanonicalCbor {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+#[cfg(feature = "serde")]
+mod serde_impls {
+    use super::{CanonicalCbor, CanonicalCborRef};
+    use crate::{validate_canonical, DecodeLimits};
+    use serde::de::{Error as DeError, Visitor};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    impl Serialize for CanonicalCborRef<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.as_bytes())
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    impl Serialize for CanonicalCbor {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.as_bytes())
+        }
+    }
+
+    /// Deserializes from a CBOR byte string (or any serde bytes source) into an owned canonical
+    /// wrapper. Validation uses `DecodeLimits::for_bytes(len)`.
+    #[cfg(feature = "alloc")]
+    impl<'de> Deserialize<'de> for CanonicalCbor {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+
+            impl<'de> Visitor<'de> for V {
+                type Value = CanonicalCbor;
+
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(f, "canonical CBOR bytes")
+                }
+
+                fn visit_byte_buf<E: DeError>(
+                    self,
+                    v: alloc::vec::Vec<u8>,
+                ) -> Result<Self::Value, E> {
+                    let limits = DecodeLimits::for_bytes(v.len());
+                    validate_canonical(&v, limits).map_err(E::custom)?;
+                    Ok(CanonicalCbor::new_unchecked(v))
+                }
+
+                fn visit_borrowed_bytes<E: DeError>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+                    let limits = DecodeLimits::for_bytes(v.len());
+                    validate_canonical(v, limits).map_err(E::custom)?;
+                    Ok(CanonicalCbor::new_unchecked(v.to_vec()))
+                }
+            }
+
+            deserializer.deserialize_bytes(V)
+        }
     }
 }

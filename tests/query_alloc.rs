@@ -4,24 +4,24 @@ use sacp_cbor::{decode_value, validate_canonical, CborMap, CborValue, DecodeLimi
 
 #[test]
 fn ref_query_matches_decoded_value_query() {
-    let v = CborValue::Map(
+    let v = CborValue::map(
         CborMap::new(vec![
-            ("active".to_string(), CborValue::Bool(true)),
+            ("active".into(), CborValue::bool(true)),
             (
-                "user".to_string(),
-                CborValue::Map(
+                "user".into(),
+                CborValue::map(
                     CborMap::new(vec![
-                        ("id".to_string(), CborValue::Int(42)),
+                        ("id".into(), CborValue::int(42).unwrap()),
                         (
-                            "profile".to_string(),
-                            CborValue::Map(
+                            "profile".into(),
+                            CborValue::map(
                                 CborMap::new(vec![
-                                    ("name".to_string(), CborValue::Text("Alice".to_string())),
+                                    ("name".into(), CborValue::text("Alice")),
                                     (
-                                        "tags".to_string(),
-                                        CborValue::Array(vec![
-                                            CborValue::Text("a".to_string()),
-                                            CborValue::Text("b".to_string()),
+                                        "tags".into(),
+                                        CborValue::array(vec![
+                                            CborValue::text("a"),
+                                            CborValue::text("b"),
                                         ]),
                                     ),
                                 ])
@@ -75,11 +75,11 @@ fn ref_query_matches_decoded_value_query() {
 
 #[test]
 fn mapref_get_many_unsorted_preserves_input_order() {
-    let v = CborValue::Map(
+    let v = CborValue::map(
         CborMap::new(vec![
-            ("active".to_string(), CborValue::Bool(true)),
-            ("user".to_string(), CborValue::Int(7)),
-            ("z".to_string(), CborValue::Null),
+            ("active".into(), CborValue::bool(true)),
+            ("user".into(), CborValue::int(7).unwrap()),
+            ("z".into(), CborValue::null()),
         ])
         .unwrap(),
     );
@@ -94,17 +94,17 @@ fn mapref_get_many_unsorted_preserves_input_order() {
 
     assert!(out[0].unwrap().is_null());
     assert!(out[1].unwrap().bool().unwrap());
-    assert_eq!(out[2].unwrap().int().unwrap(), 7);
+    assert_eq!(out[2].unwrap().integer().unwrap().as_i64().unwrap(), 7);
     assert!(out[3].is_none());
 }
 
 #[test]
 fn cbormap_get_many_sorted_single_pass() {
-    let v = CborValue::Map(
+    let v = CborValue::map(
         CborMap::new(vec![
-            ("a".to_string(), CborValue::Int(1)),
-            ("b".to_string(), CborValue::Int(2)),
-            ("c".to_string(), CborValue::Int(3)),
+            ("a".into(), CborValue::int(1).unwrap()),
+            ("b".into(), CborValue::int(2).unwrap()),
+            ("c".into(), CborValue::int(3).unwrap()),
         ])
         .unwrap(),
     );
@@ -113,12 +113,10 @@ fn cbormap_get_many_sorted_single_pass() {
     let limits = DecodeLimits::for_bytes(bytes.len());
     let decoded = decode_value(&bytes, limits).unwrap();
 
-    let CborValue::Map(map) = decoded else {
-        panic!("expected map");
-    };
+    let map = decoded.as_map().expect("expected map");
 
     let out = map.get_many_sorted(["a", "b", "c"]).unwrap();
-    assert_eq!(out[0].unwrap(), &CborValue::Int(1));
-    assert_eq!(out[1].unwrap(), &CborValue::Int(2));
-    assert_eq!(out[2].unwrap(), &CborValue::Int(3));
+    assert_eq!(out[0].unwrap(), &CborValue::int(1).unwrap());
+    assert_eq!(out[1].unwrap(), &CborValue::int(2).unwrap());
+    assert_eq!(out[2].unwrap(), &CborValue::int(3).unwrap());
 }

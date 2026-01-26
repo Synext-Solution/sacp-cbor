@@ -1,13 +1,13 @@
 #![cfg(feature = "serde")]
 
-use sacp_cbor::{from_slice, from_value_ref, to_value, to_vec, CborErrorCode, DecodeLimits};
+use sacp_cbor::{from_slice, from_value_ref, to_value, to_vec, DecodeLimits, ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[test]
 fn serde_rejects_negative_zero() {
     let err = to_vec(&(-0.0_f64)).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::NegativeZeroForbidden);
+    assert_eq!(err.code, ErrorCode::NegativeZeroForbidden);
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn serde_rejects_non_text_map_keys() {
     m.insert(1u8, 2u8);
 
     let err = to_vec(&m).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::MapKeyMustBeText);
+    assert_eq!(err.code, ErrorCode::MapKeyMustBeText);
 }
 
 #[test]

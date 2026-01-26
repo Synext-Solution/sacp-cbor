@@ -16,6 +16,24 @@ It is designed for **hot-path** validation (WebSocket frames, API request bodies
 This crate intentionally keeps the core small and uncompromising. If bytes validate under SACP-CBOR/1,
 they are already canonical; therefore, for opaque payloads, **semantic equality reduces to byte equality**.
 
+## SACP-CBOR/1 profile (explicit)
+
+**Allowed data model**
+
+- Single CBOR item only (no trailing bytes).
+- Definite-length items only (no indefinite-length encodings).
+- Map keys must be text strings (major 3) and valid UTF-8.
+- Only tags 2 and 3 are allowed (bignums), and bignums must be canonical and outside the safe-int range.
+- Integers (major 0/1) must be in the safe range `[-(2^53-1), +(2^53-1)]`.
+- Floats must be encoded as float64 (major 7, ai=27), forbid `-0.0`, and require the canonical NaN bit pattern.
+- Only simple values `false`, `true`, and `null` are allowed.
+
+**Canonical encoding constraints**
+
+- Minimal integer/length encoding (no overlong forms).
+- Map keys are strictly increasing by canonical CBOR key ordering:
+  `(encoded length, then lexicographic encoded bytes)`.
+
 ## Status
 
 - Version: `0.3.0`
@@ -112,7 +130,7 @@ let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 
 let path = [PathElem::Key("user"), PathElem::Key("id")];
 let v = canon.at(&path)?.unwrap();
-assert_eq!(v.int()?, 42);
+assert_eq!(v.integer()?.as_i64(), Some(42));
 # Ok::<(), sacp_cbor::CborError>(())
 ```
 
@@ -125,7 +143,7 @@ let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 let map = canon.root().map()?;
 
 let out = map.get_many_sorted(["a", "b", "c"])?;
-assert_eq!(out[1].unwrap().int()?, 2);
+assert_eq!(out[1].unwrap().integer()?.as_i64(), Some(2));
 # Ok::<(), sacp_cbor::QueryError>(())
 ```
 
@@ -152,6 +170,34 @@ assert_eq!(msg, decoded);
 # Ok::<(), sacp_cbor::CborError>(())
 ```
 
+### Serde helper for `CborValue` fields (requires `serde` + `alloc`)
+
+```rust
+use serde::{Deserialize, Serialize};
+use sacp_cbor::{cbor, from_slice, to_vec, DecodeLimits, CborValue};
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct Envelope {
+    #[serde(with = "sacp_cbor::serde_value")]
+    details: CborValue,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct OptionalEnvelope {
+    #[serde(with = "sacp_cbor::serde_value::option")]
+    details: Option<CborValue>,
+}
+
+let msg = Envelope {
+    details: cbor!({"a": 1, "b": [true, null]})?,
+};
+
+let bytes = to_vec(&msg)?;
+let decoded: Envelope = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+assert_eq!(msg, decoded);
+# Ok::<(), sacp_cbor::CborError>(())
+```
+
 ### Hash canonical bytes (requires `sha2`)
 
 ```rust
@@ -172,11 +218,12 @@ let digest = canon.sha256();
 - `cbor_equal(a, b) -> bool` *(feature `alloc`)*
 - `CanonicalCborRef::root() -> CborValueRef`
 - `CanonicalCborRef::at(path) -> Option<CborValueRef>`
-- `CborValueRef::{kind, map, array, get_key, get_index, at}`
+- `CborValueRef::{kind, integer, map, array, get_key, get_index, at}`
 - `MapRef::{get, get_many_sorted, iter}`
 - `MapRef::get_many(keys) -> Vec<Option<CborValueRef>>` *(feature `alloc`)*
 - `to_vec<T: Serialize>(&T) -> Vec<u8>` *(feature `serde` + `alloc`)*
 - `from_slice<T: DeserializeOwned>(bytes, limits) -> T` *(feature `serde` + `alloc`)*
+- `serde_value::{serialize, deserialize}` *(feature `serde`)*
 
 ## Fuzzing
 

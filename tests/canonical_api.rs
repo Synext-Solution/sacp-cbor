@@ -1,6 +1,6 @@
 #![cfg(feature = "alloc")]
 
-use sacp_cbor::{validate_canonical, CanonicalCbor, CborErrorCode, CborValue, DecodeLimits};
+use sacp_cbor::{validate_canonical, CanonicalCbor, CborValue, DecodeLimits, ErrorCode};
 
 #[test]
 fn canonical_from_slice_accepts_and_to_owned_roundtrips() {
@@ -19,13 +19,13 @@ fn canonical_from_slice_accepts_and_to_owned_roundtrips() {
 fn canonical_from_slice_rejects_invalid() {
     let bytes = [0x18];
     let err = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, CborErrorCode::UnexpectedEof);
+    assert_eq!(err.code, ErrorCode::UnexpectedEof);
 }
 
 #[cfg(feature = "sha2")]
 #[test]
 fn canonical_sha256_matches_value_hash() {
-    let v = CborValue::Array(vec![CborValue::Int(1), CborValue::Bool(true)]);
+    let v = CborValue::array(vec![CborValue::int(1).unwrap(), CborValue::bool(true)]);
     let bytes = v.encode_canonical().unwrap();
     let limits = DecodeLimits::for_bytes(bytes.len());
 

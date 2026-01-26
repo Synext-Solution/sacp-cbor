@@ -12,25 +12,31 @@ fn sample_small() -> Vec<u8> {
 fn sample_medium() -> Vec<u8> {
     let mut entries = Vec::new();
     for i in 0..64_i64 {
-        entries.push((format!("k{i:03}"), CborValue::Int(i)));
+        entries.push((
+            format!("k{i:03}").into_boxed_str(),
+            CborValue::int(i).unwrap(),
+        ));
     }
     let map = CborMap::new(entries).unwrap();
-    CborValue::Map(map).encode_canonical().unwrap()
+    CborValue::map(map).encode_canonical().unwrap()
 }
 
 fn sample_large_map(len: usize) -> Vec<u8> {
     let mut entries = Vec::new();
     for i in 0..len {
-        entries.push((format!("k{i:05}"), CborValue::Int(i as i64)));
+        entries.push((
+            format!("k{i:05}").into_boxed_str(),
+            CborValue::int(i as i64).unwrap(),
+        ));
     }
     let map = CborMap::new(entries).unwrap();
-    CborValue::Map(map).encode_canonical().unwrap()
+    CborValue::map(map).encode_canonical().unwrap()
 }
 
 fn sample_deep(depth: usize) -> Vec<u8> {
-    let mut v = CborValue::Null;
+    let mut v = CborValue::null();
     for _ in 0..depth {
-        v = CborValue::Array(vec![v]);
+        v = CborValue::array(vec![v]);
     }
     v.encode_canonical().unwrap()
 }

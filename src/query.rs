@@ -6,19 +6,24 @@
 //!
 //! The query layer assumes the input bytes are already validated as canonical via
 //! [`validate_canonical`](crate::validate_canonical). If invariants are violated,
-//! APIs may return [`QueryErrorCode::MalformedCanonical`].
+//! APIs may return [`ErrorCode::MalformedCanonical`].
 
 use core::cmp::Ordering;
-use core::fmt;
 
 use crate::canonical::CanonicalCborRef;
+use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding, encoded_text_len};
+use crate::stream::CborStream;
+use crate::walk;
+use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
 use crate::canonical::CanonicalCbor;
 
 #[cfg(feature = "alloc")]
-use crate::value::{CborMap, CborValue};
+use crate::value::{BigInt, CborInteger, CborMap, CborValue, F64Bits};
 
+#[cfg(feature = "alloc")]
+use alloc::boxed::Box;
 #[cfg(feature = "alloc")]
 use alloc::vec;
 #[cfg(feature = "alloc")]
@@ -27,8 +32,8 @@ use alloc::vec::Vec;
 /// The CBOR data model supported by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CborKind {
-    /// Major type 0/1 (safe-range integer).
-    Int,
+    /// Major type 0/1 (safe-range) or tag 2/3 bignum.
+    Integer,
     /// Major type 2.
     Bytes,
     /// Major type 3.
@@ -37,8 +42,6 @@ pub enum CborKind {
     Array,
     /// Major type 5 (text keys only).
     Map,
-    /// Major type 6 tag 2/3 + byte string payload.
-    Bignum,
     /// Simple value true/false.
     Bool,
     /// Simple value null.
@@ -47,128 +50,45 @@ pub enum CborKind {
     Float,
 }
 
-/// Query error codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueryErrorCode {
-    /// Expected a map at the current location.
-    ExpectedMap,
-    /// Expected an array at the current location.
-    ExpectedArray,
-    /// Expected an integer at the current location.
-    ExpectedInt,
-    /// Expected a text string at the current location.
-    ExpectedText,
-    /// Expected a byte string at the current location.
-    ExpectedBytes,
-    /// Expected a boolean at the current location.
-    ExpectedBool,
-    /// Expected a float64 at the current location.
-    ExpectedFloat,
-    /// Expected a bignum (tag 2 or 3) at the current location.
-    ExpectedBignum,
-
-    /// Keys passed to `*_sorted*` APIs are not strictly increasing in canonical order.
-    KeysNotSorted,
-    /// The query includes the same key more than once.
-    DuplicateQueryKey,
-    /// Invalid query arguments (e.g., output slice length mismatch).
-    InvalidQuery,
-
-    /// Parsing failed even though the input was expected to be canonical.
-    ///
-    /// This should be unreachable when values originate from
-    /// [`validate_canonical`](crate::validate_canonical).
-    MalformedCanonical,
+const fn err(code: ErrorCode, offset: usize) -> CborError {
+    CborError::new(code, offset)
 }
 
-/// Error returned by the query APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryError {
-    /// The error category.
-    pub code: QueryErrorCode,
-    /// Byte offset within the message where the error was detected.
-    pub offset: usize,
+const fn malformed(offset: usize) -> CborError {
+    err(ErrorCode::MalformedCanonical, offset)
 }
 
-impl QueryError {
-    #[inline]
-    const fn new(code: QueryErrorCode, offset: usize) -> Self {
-        Self { code, offset }
-    }
-
-    #[inline]
-    const fn malformed(offset: usize) -> Self {
-        Self::new(QueryErrorCode::MalformedCanonical, offset)
-    }
-
-    #[inline]
-    const fn expected_map(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedMap, offset)
-    }
-
-    #[inline]
-    const fn expected_array(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedArray, offset)
-    }
-
-    #[inline]
-    const fn expected_int(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedInt, offset)
-    }
-
-    #[inline]
-    const fn expected_text(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedText, offset)
-    }
-
-    #[inline]
-    const fn expected_bytes(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedBytes, offset)
-    }
-
-    #[inline]
-    const fn expected_bool(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedBool, offset)
-    }
-
-    #[inline]
-    const fn expected_float(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedFloat, offset)
-    }
-
-    #[inline]
-    const fn expected_bignum(offset: usize) -> Self {
-        Self::new(QueryErrorCode::ExpectedBignum, offset)
-    }
+const fn expected_map(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedMap, offset)
 }
 
-impl fmt::Display for QueryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self.code {
-            QueryErrorCode::ExpectedMap => "expected CBOR map",
-            QueryErrorCode::ExpectedArray => "expected CBOR array",
-            QueryErrorCode::ExpectedInt => "expected CBOR int",
-            QueryErrorCode::ExpectedText => "expected CBOR text string",
-            QueryErrorCode::ExpectedBytes => "expected CBOR byte string",
-            QueryErrorCode::ExpectedBool => "expected CBOR bool",
-            QueryErrorCode::ExpectedFloat => "expected CBOR float64",
-            QueryErrorCode::ExpectedBignum => "expected CBOR bignum (tag 2/3)",
-
-            QueryErrorCode::KeysNotSorted => {
-                "query keys must be strictly increasing in canonical order"
-            }
-            QueryErrorCode::DuplicateQueryKey => "duplicate query key",
-            QueryErrorCode::InvalidQuery => "invalid query arguments",
-            QueryErrorCode::MalformedCanonical => "malformed canonical CBOR",
-        };
-
-        write!(f, "cbor query failed at {}: {msg}", self.offset)
-    }
+const fn expected_array(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedArray, offset)
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for QueryError {}
+const fn expected_integer(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedInteger, offset)
+}
+
+const fn expected_text(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedText, offset)
+}
+
+const fn expected_bytes(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedBytes, offset)
+}
+
+const fn expected_bool(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedBool, offset)
+}
+
+const fn expected_float(offset: usize) -> CborError {
+    err(ErrorCode::ExpectedFloat, offset)
+}
+
+const fn missing_key(offset: usize) -> CborError {
+    err(ErrorCode::MissingKey, offset)
+}
 
 /// A path element for navigating inside a CBOR value.
 ///
@@ -202,18 +122,48 @@ impl<'a> BigIntRef<'a> {
     }
 }
 
+/// A borrowed view of an integer (safe or bignum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CborIntegerRef<'a> {
+    /// Safe-range integer (major 0/1).
+    Safe(i64),
+    /// Bignum integer (tag 2/3).
+    Big(BigIntRef<'a>),
+}
+
+impl<'a> CborIntegerRef<'a> {
+    /// Return the safe integer value, if present.
+    #[must_use]
+    pub const fn as_i64(self) -> Option<i64> {
+        match self {
+            Self::Safe(v) => Some(v),
+            Self::Big(_) => None,
+        }
+    }
+
+    /// Return the bignum reference, if present.
+    #[must_use]
+    pub const fn as_bigint(self) -> Option<BigIntRef<'a>> {
+        match self {
+            Self::Safe(_) => None,
+            Self::Big(b) => Some(b),
+        }
+    }
+}
+
 /// A borrowed view into a canonical CBOR message.
 ///
 /// The view carries the full message bytes plus a `(start, end)` range for the
 /// current value. All nested values returned from queries keep referencing the
 /// original message bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct CborValueRef<'a> {
     data: &'a [u8],
     start: usize,
     end: usize,
 }
 
+#[allow(clippy::elidable_lifetime_names)]
 impl<'a> CborValueRef<'a> {
     #[inline]
     const fn new(data: &'a [u8], start: usize, end: usize) -> Self {
@@ -249,34 +199,34 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` if the underlying bytes are malformed.
-    pub fn kind(self) -> Result<CborKind, QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
+    /// Returns `CborError` if the underlying bytes are malformed.
+    pub fn kind(self) -> Result<CborKind, CborError> {
+        let mut s = CborStream::new(self.data, self.start);
         let off = self.start;
-        let ib = c.read_u8(off)?;
+        let ib = read_u8(&mut s)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         match major {
-            0 | 1 => Ok(CborKind::Int),
+            0 | 1 => Ok(CborKind::Integer),
             2 => Ok(CborKind::Bytes),
             3 => Ok(CborKind::Text),
             4 => Ok(CborKind::Array),
             5 => Ok(CborKind::Map),
             6 => {
-                let tag = c.read_uint(ai, off)?;
+                let tag = read_uint_arg(&mut s, ai, off)?;
                 match tag {
-                    2 | 3 => Ok(CborKind::Bignum),
-                    _ => Err(QueryError::malformed(off)),
+                    2 | 3 => Ok(CborKind::Integer),
+                    _ => Err(malformed(off)),
                 }
             }
             7 => match ai {
                 20 | 21 => Ok(CborKind::Bool),
                 22 => Ok(CborKind::Null),
                 27 => Ok(CborKind::Float),
-                _ => Err(QueryError::malformed(off)),
+                _ => Err(malformed(off)),
             },
-            _ => Err(QueryError::malformed(off)),
+            _ => Err(malformed(off)),
         }
     }
 
@@ -290,8 +240,8 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedMap` if the value is not a map.
-    pub fn map(self) -> Result<MapRef<'a>, QueryError> {
+    /// Returns `CborError::ExpectedMap` if the value is not a map.
+    pub fn map(self) -> Result<MapRef<'a>, CborError> {
         let (len, entries_start) = parse_map_header(self.data, self.start)?;
         Ok(MapRef {
             data: self.data,
@@ -305,8 +255,8 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedArray` if the value is not an array.
-    pub fn array(self) -> Result<ArrayRef<'a>, QueryError> {
+    /// Returns `CborError::ExpectedArray` if the value is not an array.
+    pub fn array(self) -> Result<ArrayRef<'a>, CborError> {
         let (len, items_start) = parse_array_header(self.data, self.start)?;
         Ok(ArrayRef {
             data: self.data,
@@ -320,8 +270,8 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedMap` if the value is not a map.
-    pub fn get_key(self, key: &str) -> Result<Option<Self>, QueryError> {
+    /// Returns `CborError::ExpectedMap` if the value is not a map.
+    pub fn get_key(self, key: &str) -> Result<Option<Self>, CborError> {
         self.map()?.get(key)
     }
 
@@ -329,8 +279,8 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedArray` if the value is not an array.
-    pub fn get_index(self, index: usize) -> Result<Option<Self>, QueryError> {
+    /// Returns `CborError::ExpectedArray` if the value is not an array.
+    pub fn get_index(self, index: usize) -> Result<Option<Self>, CborError> {
         self.array()?.get(index)
     }
 
@@ -341,8 +291,8 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for type mismatches or malformed canonical input.
-    pub fn at(self, path: &[PathElem<'_>]) -> Result<Option<Self>, QueryError> {
+    /// Returns `CborError` for type mismatches or malformed canonical input.
+    pub fn at(self, path: &[PathElem<'_>]) -> Result<Option<Self>, CborError> {
         let mut cur = self;
         for pe in path {
             match *pe {
@@ -359,30 +309,54 @@ impl<'a> CborValueRef<'a> {
         Ok(Some(cur))
     }
 
-    /// Decodes this value as a safe-range CBOR integer.
+    /// Decodes this value as a CBOR integer (safe or bignum).
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedInt` if the value is not an integer or is malformed.
-    pub fn int(self) -> Result<i64, QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
+    /// Returns `CborError::ExpectedInteger` if the value is not an integer or is malformed.
+    pub fn integer(self) -> Result<CborIntegerRef<'a>, CborError> {
+        let mut s = CborStream::new(self.data, self.start);
         let off = self.start;
-        let ib = c.read_u8(off)?;
+        let ib = read_u8(&mut s)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         match major {
             0 => {
-                let u = c.read_uint(ai, off)?;
-                let i = i64::try_from(u).map_err(|_| QueryError::malformed(off))?;
-                Ok(i)
+                let u = read_uint_arg(&mut s, ai, off)?;
+                let i = i64::try_from(u).map_err(|_| malformed(off))?;
+                Ok(CborIntegerRef::Safe(i))
             }
             1 => {
-                let n = c.read_uint(ai, off)?;
-                let n_i = i64::try_from(n).map_err(|_| QueryError::malformed(off))?;
-                Ok(-1 - n_i)
+                let n = read_uint_arg(&mut s, ai, off)?;
+                let n_i = i64::try_from(n).map_err(|_| malformed(off))?;
+                Ok(CborIntegerRef::Safe(-1 - n_i))
             }
-            _ => Err(QueryError::expected_int(off)),
+            6 => {
+                let tag = read_uint_arg(&mut s, ai, off)?;
+                let negative = match tag {
+                    2 => false,
+                    3 => true,
+                    _ => return Err(expected_integer(off)),
+                };
+
+                let m_off = s.position();
+                let first = read_u8(&mut s)?;
+                let m_major = first >> 5;
+                let m_ai = first & 0x1f;
+                if m_major != 2 {
+                    return Err(malformed(m_off));
+                }
+
+                let m_len = read_len(&mut s, m_ai, m_off)?;
+                let mag = read_exact(&mut s, m_len)?;
+
+                Ok(CborIntegerRef::Big(BigIntRef {
+                    negative,
+                    magnitude: mag,
+                }))
+            }
+            _ => Err(expected_integer(off)),
         }
     }
 
@@ -390,21 +364,21 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedText` if the value is not a text string or is malformed.
-    pub fn text(self) -> Result<&'a str, QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
+    /// Returns `CborError::ExpectedText` if the value is not a text string or is malformed.
+    pub fn text(self) -> Result<&'a str, CborError> {
+        let mut s = CborStream::new(self.data, self.start);
         let off = self.start;
-        let ib = c.read_u8(off)?;
+        let ib = read_u8(&mut s)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         if major != 3 {
-            return Err(QueryError::expected_text(off));
+            return Err(expected_text(off));
         }
 
-        let len = c.read_len(ai, off)?;
-        let bytes = c.read_exact(len, off)?;
-        let s = core::str::from_utf8(bytes).map_err(|_| QueryError::malformed(off))?;
+        let len = read_len(&mut s, ai, off)?;
+        let bytes = read_exact(&mut s, len)?;
+        let s = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
         Ok(s)
     }
 
@@ -412,20 +386,20 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedBytes` if the value is not a byte string or is malformed.
-    pub fn bytes(self) -> Result<&'a [u8], QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
+    /// Returns `CborError::ExpectedBytes` if the value is not a byte string or is malformed.
+    pub fn bytes(self) -> Result<&'a [u8], CborError> {
+        let mut s = CborStream::new(self.data, self.start);
         let off = self.start;
-        let ib = c.read_u8(off)?;
+        let ib = read_u8(&mut s)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         if major != 2 {
-            return Err(QueryError::expected_bytes(off));
+            return Err(expected_bytes(off));
         }
 
-        let len = c.read_len(ai, off)?;
-        let bytes = c.read_exact(len, off)?;
+        let len = read_len(&mut s, ai, off)?;
+        let bytes = read_exact(&mut s, len)?;
         Ok(bytes)
     }
 
@@ -433,18 +407,15 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedBool` if the value is not a boolean or is malformed.
-    pub fn bool(self) -> Result<bool, QueryError> {
+    /// Returns `CborError::ExpectedBool` if the value is not a boolean or is malformed.
+    pub fn bool(self) -> Result<bool, CborError> {
         let off = self.start;
-        let b = *self
-            .data
-            .get(off)
-            .ok_or_else(|| QueryError::malformed(off))?;
+        let b = *self.data.get(off).ok_or_else(|| malformed(off))?;
 
         match b {
             0xf4 => Ok(false),
             0xf5 => Ok(true),
-            _ => Err(QueryError::expected_bool(off)),
+            _ => Err(expected_bool(off)),
         }
     }
 
@@ -452,69 +423,37 @@ impl<'a> CborValueRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError::ExpectedFloat` if the value is not a float64 or is malformed.
-    pub fn float64(self) -> Result<f64, QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
+    /// Returns `CborError::ExpectedFloat` if the value is not a float64 or is malformed.
+    pub fn float64(self) -> Result<f64, CborError> {
+        let mut s = CborStream::new(self.data, self.start);
         let off = self.start;
-        let ib = c.read_u8(off)?;
+        let ib = read_u8(&mut s)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         if major != 7 || ai != 27 {
-            return Err(QueryError::expected_float(off));
+            return Err(expected_float(off));
         }
 
-        let b = c.read_exact(8, off)?;
+        let b = read_exact(&mut s, 8)?;
         let bits = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
         Ok(f64::from_bits(bits))
     }
+}
 
-    /// Decodes this value as a CBOR bignum (tag 2 / tag 3).
-    ///
-    /// # Errors
-    ///
-    /// Returns `QueryError::ExpectedBignum` if the value is not a bignum or is malformed.
-    pub fn bignum(self) -> Result<BigIntRef<'a>, QueryError> {
-        let mut c = Cursor::new(self.data, self.start);
-        let off = self.start;
-        let ib = c.read_u8(off)?;
-        let major = ib >> 5;
-        let ai = ib & 0x1f;
-
-        if major != 6 {
-            return Err(QueryError::expected_bignum(off));
-        }
-
-        let tag = c.read_uint(ai, off)?;
-        let negative = match tag {
-            2 => false,
-            3 => true,
-            _ => return Err(QueryError::malformed(off)),
-        };
-
-        let m_off = c.pos;
-        let first = c.read_u8(m_off)?;
-        let m_major = first >> 5;
-        let m_ai = first & 0x1f;
-        if m_major != 2 {
-            return Err(QueryError::malformed(m_off));
-        }
-
-        let m_len = c.read_len(m_ai, m_off)?;
-        let mag = c.read_exact(m_len, m_off)?;
-
-        Ok(BigIntRef {
-            negative,
-            magnitude: mag,
-        })
+impl PartialEq for CborValueRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
     }
 }
+
+impl Eq for CborValueRef<'_> {}
 
 /// A borrowed view into a canonical CBOR map.
 ///
 /// Map keys are text strings and appear in canonical order (encoded length then
 /// lexicographic byte order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct MapRef<'a> {
     data: &'a [u8],
     map_off: usize,
@@ -541,15 +480,16 @@ impl<'a> MapRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` if the map is malformed.
-    pub fn get(self, key: &str) -> Result<Option<CborValueRef<'a>>, QueryError> {
+    /// Returns `CborError` if the map is malformed.
+    pub fn get(self, key: &str) -> Result<Option<CborValueRef<'a>>, CborError> {
+        checked_text_len(key.len()).map_err(|code| CborError::new(code, self.map_off))?;
         let mut pos = self.entries_start;
 
         for _ in 0..self.len {
             let key_off = pos;
-            let mut c = Cursor::new(self.data, pos);
-            let parsed = read_text(&mut c)?;
-            let value_start = c.pos;
+            let mut s = CborStream::new(self.data, pos);
+            let parsed = read_text(&mut s)?;
+            let value_start = s.position();
 
             let cmp = cmp_text_key_bytes_to_query(parsed.bytes, parsed.enc_len, key);
             match cmp {
@@ -565,27 +505,91 @@ impl<'a> MapRef<'a> {
 
             // Ensure the scan continues from the end of the value we just skipped.
             if pos <= key_off {
-                return Err(QueryError::malformed(key_off));
+                return Err(malformed(key_off));
             }
         }
 
         Ok(None)
     }
 
-    /// Looks up multiple keys in canonical order in a single pass.
-    ///
-    /// `keys` must be strictly increasing under canonical CBOR map key ordering.
-    /// Missing keys yield `None`.
+    /// Looks up a required key in the map.
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs or malformed canonical data.
+    /// Returns `CborError::MissingKey` if the key is not present.
+    pub fn require(self, key: &str) -> Result<CborValueRef<'a>, CborError> {
+        self.get(key)?.ok_or_else(|| missing_key(self.map_off))
+    }
+
+    /// Looks up multiple required keys in a single pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError::MissingKey` if any key is not present.
+    pub fn require_many_sorted<const N: usize>(
+        self,
+        keys: [&str; N],
+    ) -> Result<[CborValueRef<'a>; N], CborError> {
+        let got = self.get_many_sorted(keys)?;
+        for v in &got {
+            if v.is_none() {
+                return Err(missing_key(self.map_off));
+            }
+        }
+
+        let mut err: Option<CborError> = None;
+        let data = self.data;
+        let off = self.map_off;
+        let out = core::array::from_fn(|i| {
+            got[i].map_or_else(
+                || {
+                    err = Some(missing_key(off));
+                    CborValueRef::new(data, off, off)
+                },
+                |v| v,
+            )
+        });
+
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        Ok(out)
+    }
+
+    /// Looks up multiple keys in a single pass.
+    ///
+    /// Keys may be in any order; results preserve the input key order. Missing keys yield `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` for invalid query inputs or malformed canonical data.
     pub fn get_many_sorted<const N: usize>(
         self,
         keys: [&str; N],
-    ) -> Result<[Option<CborValueRef<'a>>; N], QueryError> {
+    ) -> Result<[Option<CborValueRef<'a>>; N], CborError> {
         let mut out: [Option<CborValueRef<'a>>; N] = [None; N];
-        self.get_many_sorted_into(&keys, &mut out)?;
+
+        validate_query_keys(&keys, self.map_off)?;
+
+        if keys.is_empty() || self.len == 0 {
+            return Ok(out);
+        }
+
+        let mut idxs: [usize; N] = core::array::from_fn(|i| i);
+        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+
+        for w in idxs.windows(2) {
+            if keys[w[0]] == keys[w[1]] {
+                return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
+            }
+        }
+
+        let mut state = MapScanState::new(self.data, self.entries_start, self.len);
+        state.scan_sorted(&keys, &idxs, |out_idx, value_start, end| {
+            out[out_idx] = Some(CborValueRef::new(self.data, value_start, end));
+        })?;
+
         Ok(out)
     }
 
@@ -595,59 +599,100 @@ impl<'a> MapRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs or malformed canonical data.
+    /// Returns `CborError` for invalid query inputs or malformed canonical data.
+    #[cfg(feature = "alloc")]
     pub fn get_many_sorted_into(
         self,
         keys: &[&str],
         out: &mut [Option<CborValueRef<'a>>],
-    ) -> Result<(), QueryError> {
-        if keys.len() != out.len() {
-            return Err(QueryError::new(QueryErrorCode::InvalidQuery, self.map_off));
-        }
-
-        for slot in out.iter_mut() {
-            *slot = None;
-        }
-
-        ensure_strictly_increasing_keys(keys, self.map_off)?;
-
-        if keys.is_empty() || self.len == 0 {
-            return Ok(());
-        }
-
-        let mut state = MapScanState::new(self.data, self.entries_start, self.len);
-        let mut q_idx = 0usize;
-
-        while q_idx < keys.len() {
-            if state.map_remaining == 0 {
-                break;
-            }
-
-            state.fill_cache()?;
-
-            let Some(ck) = state.cached else {
-                continue;
-            };
-
-            q_idx = state.handle_query_match(keys[q_idx], q_idx, |end| {
-                out[q_idx] = Some(CborValueRef::new(self.data, ck.value_start, end));
-            })?;
-        }
-
-        Ok(())
+    ) -> Result<(), CborError> {
+        self.get_many_into(keys, out)
     }
 
     /// Iterates over `(key, value)` pairs in canonical order.
     ///
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
-    pub fn iter(
-        self,
-    ) -> impl Iterator<Item = Result<(&'a str, CborValueRef<'a>), QueryError>> + 'a {
+    pub fn iter(self) -> impl Iterator<Item = Result<(&'a str, CborValueRef<'a>), CborError>> + 'a {
         MapIter {
             data: self.data,
             pos: self.entries_start,
             remaining: self.len,
         }
+    }
+
+    /// Iterates over map entries excluding `used_keys` (keys must be sorted canonically).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if `used_keys` are not strictly increasing or if the map is malformed.
+    pub fn extras_sorted<'k>(
+        self,
+        used_keys: &'k [&'k str],
+    ) -> Result<impl Iterator<Item = Result<(&'a str, CborValueRef<'a>), CborError>> + 'k, CborError>
+    where
+        'a: 'k,
+    {
+        validate_query_keys(used_keys, self.map_off)?;
+        ensure_strictly_increasing_keys(used_keys, self.map_off)?;
+
+        let it = MapIter {
+            data: self.data,
+            pos: self.entries_start,
+            remaining: self.len,
+        };
+
+        Ok(ExtrasIter {
+            iter: it,
+            used: used_keys,
+            idx: 0,
+        })
+    }
+
+    /// Collects extras for sorted `used_keys` into a Vec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if `used_keys` are not strictly increasing or if the map is malformed.
+    #[cfg(feature = "alloc")]
+    pub fn extras_sorted_vec<'k>(
+        self,
+        used_keys: &'k [&'k str],
+    ) -> Result<Vec<(&'a str, CborValueRef<'a>)>, CborError>
+    where
+        'a: 'k,
+    {
+        self.extras_sorted(used_keys)?
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Accepts `used_keys` in any order (allocates to sort them), then returns extras.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if `used_keys` contain duplicates or if the map is malformed.
+    #[cfg(feature = "alloc")]
+    pub fn extras_vec<'k>(
+        self,
+        used_keys: &'k [&'k str],
+    ) -> Result<Vec<(&'a str, CborValueRef<'a>)>, CborError>
+    where
+        'a: 'k,
+    {
+        validate_query_keys(used_keys, self.map_off)?;
+        if used_keys.is_empty() {
+            return self.extras_sorted_vec(&[]);
+        }
+
+        let mut idxs: Vec<usize> = (0..used_keys.len()).collect();
+        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(used_keys[i], used_keys[j]));
+        for w in idxs.windows(2) {
+            if used_keys[w[0]] == used_keys[w[1]] {
+                return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
+            }
+        }
+
+        let sorted: Vec<&str> = idxs.into_iter().map(|i| used_keys[i]).collect();
+        self.extras_sorted_vec(&sorted)
     }
 
     /// Looks up multiple keys in one pass (keys may be in any order).
@@ -656,12 +701,34 @@ impl<'a> MapRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs or malformed canonical data.
+    /// Returns `CborError` for invalid query inputs or malformed canonical data.
     #[cfg(feature = "alloc")]
-    pub fn get_many(self, keys: &[&str]) -> Result<Vec<Option<CborValueRef<'a>>>, QueryError> {
+    pub fn get_many(self, keys: &[&str]) -> Result<Vec<Option<CborValueRef<'a>>>, CborError> {
         let mut out: Vec<Option<CborValueRef<'a>>> = vec![None; keys.len()];
         self.get_many_into(keys, &mut out)?;
         Ok(out)
+    }
+
+    /// Looks up multiple required keys in one pass (keys may be in any order).
+    ///
+    /// This API is available with the `alloc` feature. Results preserve the input key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError::MissingKey` if any key is not present.
+    #[cfg(feature = "alloc")]
+    pub fn require_many(self, keys: &[&str]) -> Result<Vec<CborValueRef<'a>>, CborError> {
+        let mut out: Vec<Option<CborValueRef<'a>>> = vec![None; keys.len()];
+        self.get_many_into(keys, &mut out)?;
+
+        let mut req: Vec<CborValueRef<'a>> = Vec::with_capacity(out.len());
+        for slot in out {
+            match slot {
+                Some(v) => req.push(v),
+                None => return Err(missing_key(self.map_off)),
+            }
+        }
+        Ok(req)
     }
 
     /// The slice-based form of [`MapRef::get_many`].
@@ -670,16 +737,18 @@ impl<'a> MapRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs or malformed canonical data.
+    /// Returns `CborError` for invalid query inputs or malformed canonical data.
     #[cfg(feature = "alloc")]
     pub fn get_many_into(
         self,
         keys: &[&str],
         out: &mut [Option<CborValueRef<'a>>],
-    ) -> Result<(), QueryError> {
+    ) -> Result<(), CborError> {
         if keys.len() != out.len() {
-            return Err(QueryError::new(QueryErrorCode::InvalidQuery, self.map_off));
+            return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
         }
+
+        validate_query_keys(keys, self.map_off)?;
 
         for slot in out.iter_mut() {
             *slot = None;
@@ -691,44 +760,27 @@ impl<'a> MapRef<'a> {
 
         // Sort indices by canonical ordering of the corresponding keys.
         let mut idxs: Vec<usize> = (0..keys.len()).collect();
-        idxs.sort_by(|&i, &j| cmp_text_keys_canon(keys[i], keys[j]));
+        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
 
         // Detect duplicate query keys.
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
-                return Err(QueryError::new(
-                    QueryErrorCode::DuplicateQueryKey,
-                    self.map_off,
-                ));
+                return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
             }
         }
 
         // Merge-join scan over the map and the sorted query list.
         let mut state = MapScanState::new(self.data, self.entries_start, self.len);
-        let mut q_pos = 0usize;
-
-        while q_pos < idxs.len() {
-            if state.map_remaining == 0 {
-                break;
-            }
-
-            state.fill_cache()?;
-
-            let Some(ck) = state.cached else {
-                continue;
-            };
-            let out_idx = idxs[q_pos];
-            q_pos = state.handle_query_match(keys[out_idx], q_pos, |end| {
-                out[out_idx] = Some(CborValueRef::new(self.data, ck.value_start, end));
-            })?;
-        }
+        state.scan_sorted(keys, &idxs, |out_idx, value_start, end| {
+            out[out_idx] = Some(CborValueRef::new(self.data, value_start, end));
+        })?;
 
         Ok(())
     }
 }
 
 /// A borrowed view into a canonical CBOR array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ArrayRef<'a> {
     data: &'a [u8],
     array_off: usize,
@@ -753,8 +805,8 @@ impl<'a> ArrayRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` if the array is malformed.
-    pub fn get(self, index: usize) -> Result<Option<CborValueRef<'a>>, QueryError> {
+    /// Returns `CborError` if the array is malformed.
+    pub fn get(self, index: usize) -> Result<Option<CborValueRef<'a>>, CborError> {
         if index >= self.len {
             return Ok(None);
         }
@@ -769,13 +821,13 @@ impl<'a> ArrayRef<'a> {
             pos = end;
         }
 
-        Err(QueryError::malformed(self.array_off))
+        Err(malformed(self.array_off))
     }
 
     /// Iterates over array items in order.
     ///
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
-    pub fn iter(self) -> impl Iterator<Item = Result<CborValueRef<'a>, QueryError>> + 'a {
+    pub fn iter(self) -> impl Iterator<Item = Result<CborValueRef<'a>, CborError>> + 'a {
         ArrayIter {
             data: self.data,
             pos: self.items_start,
@@ -799,8 +851,8 @@ impl<'a> CanonicalCborRef<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for type mismatches or malformed canonical input.
-    pub fn at(self, path: &[PathElem<'_>]) -> Result<Option<CborValueRef<'a>>, QueryError> {
+    /// Returns `CborError` for type mismatches or malformed canonical input.
+    pub fn at(self, path: &[PathElem<'_>]) -> Result<Option<CborValueRef<'a>>, CborError> {
         self.root().at(path)
     }
 }
@@ -818,9 +870,52 @@ impl CanonicalCbor {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for type mismatches or malformed canonical input.
-    pub fn at(&self, path: &[PathElem<'_>]) -> Result<Option<CborValueRef<'_>>, QueryError> {
+    /// Returns `CborError` for type mismatches or malformed canonical input.
+    pub fn at(&self, path: &[PathElem<'_>]) -> Result<Option<CborValueRef<'_>>, CborError> {
         self.root().at(path)
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[allow(clippy::elidable_lifetime_names)]
+impl<'a> CborValueRef<'a> {
+    /// Convert this borrowed value into an owned [`CborValue`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if the value is malformed.
+    pub fn to_owned(self) -> Result<CborValue, CborError> {
+        match self.kind()? {
+            CborKind::Integer => match self.integer()? {
+                CborIntegerRef::Safe(v) => CborValue::int(v),
+                CborIntegerRef::Big(b) => {
+                    let big = BigInt::new_unchecked(b.is_negative(), b.magnitude().to_vec());
+                    Ok(CborValue::integer(CborInteger::from_bigint(big)))
+                }
+            },
+            CborKind::Bytes => Ok(CborValue::bytes(self.bytes()?.to_vec())),
+            CborKind::Text => Ok(CborValue::text(self.text()?)),
+            CborKind::Array => {
+                let arr = self.array()?;
+                let mut items = Vec::with_capacity(arr.len());
+                for item in arr.iter() {
+                    items.push(item?.to_owned()?);
+                }
+                Ok(CborValue::array(items))
+            }
+            CborKind::Map => {
+                let map = self.map()?;
+                let mut entries: Vec<(Box<str>, CborValue)> = Vec::with_capacity(map.len());
+                for entry in map.iter() {
+                    let (k, v) = entry?;
+                    entries.push((Box::from(k), v.to_owned()?));
+                }
+                Ok(CborValue::map(CborMap::from_sorted_entries(entries)))
+            }
+            CborKind::Bool => Ok(CborValue::bool(self.bool()?)),
+            CborKind::Null => Ok(CborValue::null()),
+            CborKind::Float => Ok(CborValue::float(F64Bits::try_from_f64(self.float64()?)?)),
+        }
     }
 }
 
@@ -832,25 +927,21 @@ impl CborValue {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for type mismatches.
-    pub fn at<'a>(&'a self, path: &[PathElem<'_>]) -> Result<Option<&'a Self>, QueryError> {
+    /// Returns `CborError` for type mismatches.
+    pub fn at<'a>(&'a self, path: &[PathElem<'_>]) -> Result<Option<&'a Self>, CborError> {
         let mut cur: &Self = self;
 
         for pe in path {
             match *pe {
                 PathElem::Key(k) => {
-                    let Self::Map(map) = cur else {
-                        return Err(QueryError::expected_map(0));
-                    };
+                    let map = cur.as_map().ok_or_else(|| expected_map(0))?;
                     match map.get(k) {
                         Some(v) => cur = v,
                         None => return Ok(None),
                     }
                 }
                 PathElem::Index(i) => {
-                    let Self::Array(items) = cur else {
-                        return Err(QueryError::expected_array(0));
-                    };
+                    let items = cur.as_array().ok_or_else(|| expected_array(0))?;
                     match items.get(i) {
                         Some(v) => cur = v,
                         None => return Ok(None),
@@ -865,19 +956,39 @@ impl CborValue {
 
 #[cfg(feature = "alloc")]
 impl CborMap {
-    /// Looks up multiple keys in canonical order in a single pass.
+    /// Looks up multiple keys in a single pass.
     ///
-    /// `keys` must be strictly increasing under canonical CBOR map key ordering.
+    /// Keys may be in any order; results preserve the input key order.
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs.
+    /// Returns `CborError` for invalid query inputs.
     pub fn get_many_sorted<'a, const N: usize>(
         &'a self,
         keys: [&str; N],
-    ) -> Result<[Option<&'a CborValue>; N], QueryError> {
+    ) -> Result<[Option<&'a CborValue>; N], CborError> {
         let mut out: [Option<&'a CborValue>; N] = [None; N];
-        self.get_many_sorted_into(&keys, &mut out)?;
+
+        validate_query_keys(&keys, 0)?;
+
+        if keys.is_empty() || self.is_empty() {
+            return Ok(out);
+        }
+
+        let mut idxs: [usize; N] = core::array::from_fn(|i| i);
+        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+
+        for w in idxs.windows(2) {
+            if keys[w[0]] == keys[w[1]] {
+                return Err(CborError::new(ErrorCode::InvalidQuery, 0));
+            }
+        }
+
+        let mut it = self.iter().peekable();
+        scan_sorted_iter(&keys, &idxs, &mut it, |idx, mv| {
+            out[idx] = Some(mv);
+        });
+
         Ok(out)
     }
 
@@ -887,47 +998,39 @@ impl CborMap {
     ///
     /// # Errors
     ///
-    /// Returns `QueryError` for invalid query inputs.
+    /// Returns `CborError` for invalid query inputs.
     pub fn get_many_sorted_into<'a>(
         &'a self,
         keys: &[&str],
         out: &mut [Option<&'a CborValue>],
-    ) -> Result<(), QueryError> {
+    ) -> Result<(), CborError> {
         if keys.len() != out.len() {
-            return Err(QueryError::new(QueryErrorCode::InvalidQuery, 0));
+            return Err(CborError::new(ErrorCode::InvalidQuery, 0));
         }
+
+        validate_query_keys(keys, 0)?;
 
         for slot in out.iter_mut() {
             *slot = None;
         }
 
-        ensure_strictly_increasing_keys(keys, 0)?;
-
         if keys.is_empty() || self.is_empty() {
             return Ok(());
         }
 
-        let mut it = self.iter().peekable();
+        let mut idxs: Vec<usize> = (0..keys.len()).collect();
+        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
 
-        for (i, &qk) in keys.iter().enumerate() {
-            loop {
-                let Some((mk, mv)) = it.peek().copied() else {
-                    break;
-                };
-
-                match cmp_text_keys_canon(mk, qk) {
-                    Ordering::Less => {
-                        it.next();
-                    }
-                    Ordering::Equal => {
-                        out[i] = Some(mv);
-                        it.next();
-                        break;
-                    }
-                    Ordering::Greater => break,
-                }
+        for w in idxs.windows(2) {
+            if keys[w[0]] == keys[w[1]] {
+                return Err(CborError::new(ErrorCode::InvalidQuery, 0));
             }
         }
+
+        let mut it = self.iter().peekable();
+        scan_sorted_iter(keys, &idxs, &mut it, |idx, mv| {
+            out[idx] = Some(mv);
+        });
 
         Ok(())
     }
@@ -937,130 +1040,36 @@ impl CborMap {
  * Internal parsing helpers
  * ========================= */
 
-#[derive(Clone, Copy)]
-struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
+#[inline]
+const fn map_stream_err(cause: CborError) -> CborError {
+    err(ErrorCode::MalformedCanonical, cause.offset)
 }
 
-impl<'a> Cursor<'a> {
-    const fn new(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
-    }
+#[inline]
+fn read_u8(s: &mut CborStream<'_>) -> Result<u8, CborError> {
+    s.read_u8().map_err(map_stream_err)
+}
 
-    fn read_u8(&mut self, off: usize) -> Result<u8, QueryError> {
-        let b = *self
-            .data
-            .get(self.pos)
-            .ok_or_else(|| QueryError::malformed(off))?;
-        self.pos += 1;
-        Ok(b)
-    }
+#[inline]
+fn read_exact<'a>(s: &mut CborStream<'a>, n: usize) -> Result<&'a [u8], CborError> {
+    s.read_exact(n).map_err(map_stream_err)
+}
 
-    fn read_exact(&mut self, n: usize, off: usize) -> Result<&'a [u8], QueryError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or_else(|| QueryError::malformed(off))?;
-        if end > self.data.len() {
-            return Err(QueryError::malformed(off));
-        }
-        let s = &self.data[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
+#[inline]
+fn read_uint_arg(s: &mut CborStream<'_>, ai: u8, off: usize) -> Result<u64, CborError> {
+    s.read_uint_arg(ai, off).map_err(map_stream_err)
+}
 
-    fn read_uint(&mut self, ai: u8, off: usize) -> Result<u64, QueryError> {
-        match ai {
-            0..=23 => Ok(u64::from(ai)),
-            24 => Ok(u64::from(self.read_u8(off)?)),
-            25 => {
-                let s = self.read_exact(2, off)?;
-                Ok(u64::from(u16::from_be_bytes([s[0], s[1]])))
-            }
-            26 => {
-                let s = self.read_exact(4, off)?;
-                Ok(u64::from(u32::from_be_bytes([s[0], s[1], s[2], s[3]])))
-            }
-            27 => {
-                let s = self.read_exact(8, off)?;
-                Ok(u64::from_be_bytes([
-                    s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-                ]))
-            }
-            // Indefinite length and reserved AIs are forbidden in this crate's canonical profile.
-            _ => Err(QueryError::malformed(off)),
-        }
-    }
-
-    fn read_len(&mut self, ai: u8, off: usize) -> Result<usize, QueryError> {
-        let n = self.read_uint(ai, off)?;
-        usize::try_from(n).map_err(|_| QueryError::malformed(off))
-    }
-
-    fn skip_value(&mut self) -> Result<(), QueryError> {
-        let off = self.pos;
-        let ib = self.read_u8(off)?;
-        let major = ib >> 5;
-        let ai = ib & 0x1f;
-
-        match major {
-            0 | 1 => {
-                let _ = self.read_uint(ai, off)?;
-                Ok(())
-            }
-            2 | 3 => {
-                let len = self.read_len(ai, off)?;
-                let _ = self.read_exact(len, off)?;
-                Ok(())
-            }
-            4 => {
-                let len = self.read_len(ai, off)?;
-                for _ in 0..len {
-                    self.skip_value()?;
-                }
-                Ok(())
-            }
-            5 => {
-                let len = self.read_len(ai, off)?;
-                for _ in 0..len {
-                    self.skip_value()?; // key
-                    self.skip_value()?; // value
-                }
-                Ok(())
-            }
-            6 => {
-                // Only tag 2/3 are supported, and they must wrap a byte string.
-                let tag = self.read_uint(ai, off)?;
-                if tag != 2 && tag != 3 {
-                    return Err(QueryError::malformed(off));
-                }
-                let inner_off = self.pos;
-                let first = self.read_u8(inner_off)?;
-                if (first >> 5) != 2 {
-                    return Err(QueryError::malformed(inner_off));
-                }
-                let len = self.read_len(first & 0x1f, inner_off)?;
-                let _ = self.read_exact(len, inner_off)?;
-                Ok(())
-            }
-            7 => match ai {
-                20..=22 => Ok(()),
-                27 => {
-                    let _ = self.read_exact(8, off)?;
-                    Ok(())
-                }
-                _ => Err(QueryError::malformed(off)),
-            },
-            _ => Err(QueryError::malformed(off)),
-        }
-    }
+#[inline]
+fn read_len(s: &mut CborStream<'_>, ai: u8, off: usize) -> Result<usize, CborError> {
+    let n = s.read_len_arg(ai, off).map_err(map_stream_err)?;
+    usize::try_from(n).map_err(|_| malformed(off))
 }
 
 #[derive(Clone, Copy)]
 struct CachedKey<'a> {
     key_bytes: &'a [u8],
-    key_enc_len: usize,
+    key_enc_len: u64,
     value_start: usize,
 }
 
@@ -1081,11 +1090,11 @@ impl<'a> MapScanState<'a> {
         }
     }
 
-    fn fill_cache(&mut self) -> Result<(), QueryError> {
+    fn fill_cache(&mut self) -> Result<(), CborError> {
         if self.cached.is_none() {
-            let mut c = Cursor::new(self.data, self.pos);
-            let parsed = read_text(&mut c)?;
-            let value_start = c.pos;
+            let mut s = CborStream::new(self.data, self.pos);
+            let parsed = read_text(&mut s)?;
+            let value_start = s.position();
             self.pos = value_start;
             self.cached = Some(CachedKey {
                 key_bytes: parsed.bytes,
@@ -1096,7 +1105,7 @@ impl<'a> MapScanState<'a> {
         Ok(())
     }
 
-    fn consume_cached_entry(&mut self, ck: CachedKey<'a>) -> Result<usize, QueryError> {
+    fn consume_cached_entry(&mut self, ck: CachedKey<'a>) -> Result<usize, CborError> {
         let end = value_end(self.data, ck.value_start)?;
         self.pos = end;
         self.cached = None;
@@ -1109,7 +1118,7 @@ impl<'a> MapScanState<'a> {
         query: &str,
         q_idx: usize,
         on_match: F,
-    ) -> Result<usize, QueryError>
+    ) -> Result<usize, CborError>
     where
         F: FnOnce(usize),
     {
@@ -1130,101 +1139,136 @@ impl<'a> MapScanState<'a> {
             Ordering::Greater => Ok(q_idx + 1),
         }
     }
+
+    fn scan_sorted<F>(
+        &mut self,
+        keys: &[&str],
+        idxs: &[usize],
+        mut on_match: F,
+    ) -> Result<(), CborError>
+    where
+        F: FnMut(usize, usize, usize),
+    {
+        let mut q_pos = 0usize;
+
+        while q_pos < idxs.len() {
+            if self.map_remaining == 0 {
+                break;
+            }
+
+            self.fill_cache()?;
+
+            let Some(ck) = self.cached else {
+                continue;
+            };
+
+            let out_idx = idxs[q_pos];
+            let value_start = ck.value_start;
+            q_pos = self.handle_query_match(keys[out_idx], q_pos, |end| {
+                on_match(out_idx, value_start, end);
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
 struct ParsedText<'a> {
     s: &'a str,
     bytes: &'a [u8],
-    enc_len: usize,
+    enc_len: u64,
 }
 
-fn read_text<'a>(c: &mut Cursor<'a>) -> Result<ParsedText<'a>, QueryError> {
-    let off = c.pos;
-    let ib = c.read_u8(off)?;
+fn scan_sorted_iter<'a, I, V>(
+    keys: &[&str],
+    idxs: &[usize],
+    iter: &mut core::iter::Peekable<I>,
+    mut on_match: impl FnMut(usize, V),
+) where
+    I: Iterator<Item = (&'a str, V)>,
+    V: Copy,
+{
+    for &idx in idxs {
+        let qk = keys[idx];
+        loop {
+            let Some((mk, mv)) = iter.peek().copied() else {
+                break;
+            };
+
+            match cmp_text_keys_by_canonical_encoding(mk, qk) {
+                Ordering::Less => {
+                    iter.next();
+                }
+                Ordering::Equal => {
+                    on_match(idx, mv);
+                    iter.next();
+                    break;
+                }
+                Ordering::Greater => break,
+            }
+        }
+    }
+}
+
+fn read_text<'a>(s: &mut CborStream<'a>) -> Result<ParsedText<'a>, CborError> {
+    let off = s.position();
+    let ib = read_u8(s)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
     if major != 3 {
-        return Err(QueryError::malformed(off));
+        return Err(malformed(off));
     }
 
-    let len = c.read_len(ai, off)?;
-    let bytes = c.read_exact(len, off)?;
-    let s = core::str::from_utf8(bytes).map_err(|_| QueryError::malformed(off))?;
-    let enc_len = c.pos - off;
+    let len = read_len(s, ai, off)?;
+    let bytes = read_exact(s, len)?;
+    let text = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
+    let enc_len = u64::try_from(s.position() - off)
+        .map_err(|_| CborError::new(ErrorCode::LengthOverflow, off))?;
 
-    Ok(ParsedText { s, bytes, enc_len })
+    Ok(ParsedText {
+        s: text,
+        bytes,
+        enc_len,
+    })
 }
 
-fn value_end(data: &[u8], start: usize) -> Result<usize, QueryError> {
-    let mut c = Cursor::new(data, start);
-    c.skip_value()?;
-    Ok(c.pos)
+fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
+    walk::value_end(data, start)
 }
 
-fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), QueryError> {
-    let mut c = Cursor::new(data, start);
+fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
+    let mut s = CborStream::new(data, start);
     let off = start;
-    let ib = c.read_u8(off)?;
+    let ib = read_u8(&mut s)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
     if major != 5 {
-        return Err(QueryError::expected_map(off));
+        return Err(expected_map(off));
     }
 
-    let len = c.read_len(ai, off)?;
-    Ok((len, c.pos))
+    let len = read_len(&mut s, ai, off)?;
+    Ok((len, s.position()))
 }
 
-fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), QueryError> {
-    let mut c = Cursor::new(data, start);
+fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
+    let mut s = CborStream::new(data, start);
     let off = start;
-    let ib = c.read_u8(off)?;
+    let ib = read_u8(&mut s)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
     if major != 4 {
-        return Err(QueryError::expected_array(off));
+        return Err(expected_array(off));
     }
 
-    let len = c.read_len(ai, off)?;
-    Ok((len, c.pos))
+    let len = read_len(&mut s, ai, off)?;
+    Ok((len, s.position()))
 }
 
-const fn add_or_max(a: usize, b: usize) -> usize {
-    match a.checked_add(b) {
-        Some(v) => v,
-        None => usize::MAX,
-    }
-}
-
-const fn encoded_text_len(n: usize) -> usize {
-    if n < 24 {
-        add_or_max(1, n)
-    } else if n <= 0xff {
-        add_or_max(2, n)
-    } else if n <= 0xffff {
-        add_or_max(3, n)
-    } else if n <= 0xffff_ffff {
-        add_or_max(5, n)
-    } else {
-        add_or_max(9, n)
-    }
-}
-
-fn cmp_text_keys_canon(a: &str, b: &str) -> Ordering {
-    let a_len = encoded_text_len(a.len());
-    let b_len = encoded_text_len(b.len());
-
-    match a_len.cmp(&b_len) {
-        Ordering::Equal => a.as_bytes().cmp(b.as_bytes()),
-        other => other,
-    }
-}
-
-fn cmp_text_key_bytes_to_query(key_payload: &[u8], key_enc_len: usize, query: &str) -> Ordering {
+fn cmp_text_key_bytes_to_query(key_payload: &[u8], key_enc_len: u64, query: &str) -> Ordering {
     let q_bytes = query.as_bytes();
     let q_enc_len = encoded_text_len(q_bytes.len());
 
@@ -1234,18 +1278,22 @@ fn cmp_text_key_bytes_to_query(key_payload: &[u8], key_enc_len: usize, query: &s
     }
 }
 
-fn ensure_strictly_increasing_keys(keys: &[&str], err_off: usize) -> Result<(), QueryError> {
+fn validate_query_keys(keys: &[&str], err_off: usize) -> Result<(), CborError> {
+    for &k in keys {
+        checked_text_len(k.len()).map_err(|code| CborError::new(code, err_off))?;
+    }
+    Ok(())
+}
+
+fn ensure_strictly_increasing_keys(keys: &[&str], err_off: usize) -> Result<(), CborError> {
     let mut prev: Option<&str> = None;
 
     for &k in keys {
         if let Some(p) = prev {
-            match cmp_text_keys_canon(p, k) {
+            match cmp_text_keys_by_canonical_encoding(p, k) {
                 Ordering::Less => {}
-                Ordering::Equal => {
-                    return Err(QueryError::new(QueryErrorCode::DuplicateQueryKey, err_off));
-                }
-                Ordering::Greater => {
-                    return Err(QueryError::new(QueryErrorCode::KeysNotSorted, err_off));
+                Ordering::Equal | Ordering::Greater => {
+                    return Err(CborError::new(ErrorCode::InvalidQuery, err_off));
                 }
             }
         }
@@ -1255,6 +1303,41 @@ fn ensure_strictly_increasing_keys(keys: &[&str], err_off: usize) -> Result<(), 
     Ok(())
 }
 
+struct ExtrasIter<'a, 'k> {
+    iter: MapIter<'a>,
+    used: &'k [&'k str],
+    idx: usize,
+}
+
+impl<'a> Iterator for ExtrasIter<'a, '_> {
+    type Item = Result<(&'a str, CborValueRef<'a>), CborError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let next = self.iter.next()?;
+            return match next {
+                Err(e) => Some(Err(e)),
+                Ok((k, v)) => {
+                    while self.idx < self.used.len()
+                        && cmp_text_keys_by_canonical_encoding(self.used[self.idx], k)
+                            == Ordering::Less
+                    {
+                        self.idx += 1;
+                    }
+                    if self.idx < self.used.len()
+                        && cmp_text_keys_by_canonical_encoding(self.used[self.idx], k)
+                            == Ordering::Equal
+                    {
+                        self.idx += 1;
+                        continue;
+                    }
+                    Some(Ok((k, v)))
+                }
+            };
+        }
+    }
+}
+
 struct MapIter<'a> {
     data: &'a [u8],
     pos: usize,
@@ -1262,15 +1345,15 @@ struct MapIter<'a> {
 }
 
 impl<'a> Iterator for MapIter<'a> {
-    type Item = Result<(&'a str, CborValueRef<'a>), QueryError>;
+    type Item = Result<(&'a str, CborValueRef<'a>), CborError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
 
-        let mut c = Cursor::new(self.data, self.pos);
-        let parsed = match read_text(&mut c) {
+        let mut s = CborStream::new(self.data, self.pos);
+        let parsed = match read_text(&mut s) {
             Ok(v) => v,
             Err(e) => {
                 self.remaining = 0;
@@ -1278,7 +1361,7 @@ impl<'a> Iterator for MapIter<'a> {
             }
         };
 
-        let value_start = c.pos;
+        let value_start = s.position();
         let end = match value_end(self.data, value_start) {
             Ok(e) => e,
             Err(e) => {
@@ -1304,7 +1387,7 @@ struct ArrayIter<'a> {
 }
 
 impl<'a> Iterator for ArrayIter<'a> {
-    type Item = Result<CborValueRef<'a>, QueryError>;
+    type Item = Result<CborValueRef<'a>, CborError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {

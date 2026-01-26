@@ -8,22 +8,23 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use sacp_cbor::{
-    cbor_equal, decode_value, validate_canonical, BigInt, CborMap, CborValue, DecodeLimits, F64Bits,
+    cbor_equal, decode_value, validate_canonical, BigInt, CborInteger, CborMap, CborValue,
+    DecodeLimits, F64Bits,
 };
 
-fn arb_key() -> impl Strategy<Value = String> {
+fn arb_key() -> impl Strategy<Value = Box<str>> {
     let ascii = proptest::collection::vec(proptest::char::range('a', 'z'), 0..=64)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
     let ascii_23 = proptest::collection::vec(proptest::char::range('a', 'z'), 23)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
     let ascii_24 = proptest::collection::vec(proptest::char::range('a', 'z'), 24)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
     let ascii_255 = proptest::collection::vec(proptest::char::range('a', 'z'), 255)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
     let ascii_256 = proptest::collection::vec(proptest::char::range('a', 'z'), 256)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
     let unicode = proptest::collection::vec(proptest::char::range('\u{00a1}', '\u{00ff}'), 0..=64)
-        .prop_map(|chars| chars.into_iter().collect());
+        .prop_map(|chars| chars.into_iter().collect::<String>().into_boxed_str());
 
     prop_oneof![
         8 => ascii,
@@ -80,15 +81,15 @@ fn arb_float() -> impl Strategy<Value = F64Bits> {
 }
 
 fn arb_leaf() -> impl Strategy<Value = CborValue> {
-    let int_any =
-        (sacp_cbor::MIN_SAFE_INTEGER..=sacp_cbor::MAX_SAFE_INTEGER_I64).prop_map(CborValue::Int);
+    let int_any = (sacp_cbor::MIN_SAFE_INTEGER..=sacp_cbor::MAX_SAFE_INTEGER_I64)
+        .prop_map(|v| CborValue::int(v).unwrap());
     let int_boundaries = prop_oneof![
-        Just(CborValue::Int(sacp_cbor::MIN_SAFE_INTEGER)),
-        Just(CborValue::Int(sacp_cbor::MAX_SAFE_INTEGER_I64)),
-        Just(CborValue::Int(23)),
-        Just(CborValue::Int(24)),
-        Just(CborValue::Int(-24)),
-        Just(CborValue::Int(-25)),
+        Just(CborValue::int(sacp_cbor::MIN_SAFE_INTEGER).unwrap()),
+        Just(CborValue::int(sacp_cbor::MAX_SAFE_INTEGER_I64).unwrap()),
+        Just(CborValue::int(23).unwrap()),
+        Just(CborValue::int(24).unwrap()),
+        Just(CborValue::int(-24).unwrap()),
+        Just(CborValue::int(-25).unwrap()),
     ];
 
     prop_oneof![
@@ -96,30 +97,30 @@ fn arb_leaf() -> impl Strategy<Value = CborValue> {
         8 => int_any,
         1 => int_boundaries,
         // Bytes
-        6 => arb_bytes().prop_map(CborValue::Bytes),
+        6 => arb_bytes().prop_map(CborValue::bytes),
         // Text
-        6 => arb_key().prop_map(CborValue::Text),
+        6 => arb_key().prop_map(CborValue::text),
         // Bool / null
-        4 => any::<bool>().prop_map(CborValue::Bool),
-        1 => Just(CborValue::Null),
+        4 => any::<bool>().prop_map(CborValue::bool),
+        1 => Just(CborValue::null()),
         // Float64
-        4 => arb_float().prop_map(CborValue::Float),
+        4 => arb_float().prop_map(CborValue::float),
         // Bignum
-        3 => arb_bigint().prop_map(CborValue::Bignum),
+        3 => arb_bigint().prop_map(|b| CborValue::integer(CborInteger::from_bigint(b))),
     ]
 }
 
 fn arb_value() -> impl Strategy<Value = CborValue> {
     arb_leaf().prop_recursive(4, 256, 10, |inner| {
         prop_oneof![
-            proptest::collection::vec(inner.clone(), 0..16).prop_map(CborValue::Array),
+            proptest::collection::vec(inner.clone(), 0..16).prop_map(CborValue::array),
             proptest::collection::vec((arb_key(), inner), 0..16).prop_map(|pairs| {
-                let mut m: BTreeMap<String, CborValue> = BTreeMap::new();
+                let mut m: BTreeMap<Box<str>, CborValue> = BTreeMap::new();
                 for (k, v) in pairs {
                     m.insert(k, v);
                 }
                 let entries = m.into_iter().collect::<Vec<_>>();
-                CborValue::Map(CborMap::new(entries).expect("unique keys"))
+                CborValue::map(CborMap::new(entries).expect("unique keys"))
             }),
         ]
     })

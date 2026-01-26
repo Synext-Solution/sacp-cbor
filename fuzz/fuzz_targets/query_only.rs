@@ -7,6 +7,7 @@ use sacp_cbor::{validate_canonical, DecodeLimits};
 fn fuzz_limits(input_len: usize) -> DecodeLimits {
     let max = input_len.min(1 << 20);
     DecodeLimits {
+        max_input_bytes: max,
         max_depth: 64,
         max_total_items: 1 << 16,
         max_array_len: 1 << 12,
@@ -22,12 +23,12 @@ fuzz_target!(|data: &[u8]| {
         let root = canon.root();
 
         let _ = root.kind();
-        let _ = root.int();
+        let _ = root.integer();
         let _ = root.text();
         let _ = root.bytes();
         let _ = root.bool();
-        let _ = root.float();
-        let _ = root.bignum();
+        let _ = root.float64();
+        let _ = root.integer().map(|i| i.as_bigint());
 
         if let Ok(arr) = root.array() {
             let _ = arr.len();

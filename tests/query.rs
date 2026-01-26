@@ -1,4 +1,4 @@
-use sacp_cbor::{validate_canonical, DecodeLimits, PathElem, QueryErrorCode};
+use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode, PathElem};
 
 #[test]
 fn map_get_single_int() {
@@ -9,7 +9,7 @@ fn map_get_single_int() {
     let root = canon.root();
 
     let v = root.map().unwrap().get("a").unwrap().unwrap();
-    assert_eq!(v.int().unwrap(), 1);
+    assert_eq!(v.integer().unwrap().as_i64().unwrap(), 1);
 
     assert!(root.map().unwrap().get("missing").unwrap().is_none());
 }
@@ -41,8 +41,26 @@ fn array_out_of_bounds() {
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let arr = canon.root().array().unwrap();
 
-    assert_eq!(arr.get(0).unwrap().unwrap().int().unwrap(), 1);
-    assert_eq!(arr.get(1).unwrap().unwrap().int().unwrap(), 2);
+    assert_eq!(
+        arr.get(0)
+            .unwrap()
+            .unwrap()
+            .integer()
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        arr.get(1)
+            .unwrap()
+            .unwrap()
+            .integer()
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        2
+    );
     assert!(arr.get(2).unwrap().is_none());
     assert!(canon.root().get_index(999).unwrap().is_none());
 }
@@ -54,7 +72,7 @@ fn type_mismatch_errors() {
 
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let err = canon.root().get_key("x").unwrap_err();
-    assert_eq!(err.code, QueryErrorCode::ExpectedMap);
+    assert_eq!(err.code, ErrorCode::ExpectedMap);
 }
 
 #[test]
@@ -66,27 +84,28 @@ fn get_many_sorted_basic() {
     let map = canon.root().map().unwrap();
 
     let out = map.get_many_sorted(["a", "b", "c"]).unwrap();
-    assert_eq!(out[0].unwrap().int().unwrap(), 1);
-    assert_eq!(out[1].unwrap().int().unwrap(), 2);
-    assert_eq!(out[2].unwrap().int().unwrap(), 3);
+    assert_eq!(out[0].unwrap().integer().unwrap().as_i64().unwrap(), 1);
+    assert_eq!(out[1].unwrap().integer().unwrap().as_i64().unwrap(), 2);
+    assert_eq!(out[2].unwrap().integer().unwrap().as_i64().unwrap(), 3);
 
     let out2 = map.get_many_sorted(["a", "c", "bb"]).unwrap();
     assert!(out2[2].is_none());
 }
 
 #[test]
-fn get_many_sorted_rejects_unsorted_or_duplicates() {
+fn get_many_sorted_accepts_unsorted_and_rejects_duplicates() {
     // { "a": 1, "b": 2 }
     let bytes = [0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02];
 
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let map = canon.root().map().unwrap();
 
-    let err = map.get_many_sorted(["b", "a"]).unwrap_err();
-    assert_eq!(err.code, QueryErrorCode::KeysNotSorted);
+    let out = map.get_many_sorted(["b", "a"]).unwrap();
+    assert_eq!(out[0].unwrap().integer().unwrap().as_i64().unwrap(), 2);
+    assert_eq!(out[1].unwrap().integer().unwrap().as_i64().unwrap(), 1);
 
     let err = map.get_many_sorted(["a", "a"]).unwrap_err();
-    assert_eq!(err.code, QueryErrorCode::DuplicateQueryKey);
+    assert_eq!(err.code, ErrorCode::InvalidQuery);
 }
 
 #[test]
@@ -98,8 +117,26 @@ fn utf8_key_lookup() {
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let map = canon.root().map().unwrap();
 
-    assert_eq!(map.get("e").unwrap().unwrap().int().unwrap(), 1);
-    assert_eq!(map.get("é").unwrap().unwrap().int().unwrap(), 2);
+    assert_eq!(
+        map.get("e")
+            .unwrap()
+            .unwrap()
+            .integer()
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        map.get("é")
+            .unwrap()
+            .unwrap()
+            .integer()
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
@@ -135,7 +172,7 @@ fn kind_and_bignum_accessors() {
     assert_eq!(
         kinds,
         [
-            sacp_cbor::CborKind::Int,
+            sacp_cbor::CborKind::Integer,
             sacp_cbor::CborKind::Bytes,
             sacp_cbor::CborKind::Text,
             sacp_cbor::CborKind::Array,
@@ -143,23 +180,31 @@ fn kind_and_bignum_accessors() {
             sacp_cbor::CborKind::Bool,
             sacp_cbor::CborKind::Null,
             sacp_cbor::CborKind::Float,
-            sacp_cbor::CborKind::Bignum,
+            sacp_cbor::CborKind::Integer,
         ]
     );
 
-    let big = arr.get(8).unwrap().unwrap().bignum().unwrap();
+    let big = arr
+        .get(8)
+        .unwrap()
+        .unwrap()
+        .integer()
+        .unwrap()
+        .as_bigint()
+        .unwrap();
     assert!(!big.is_negative());
     assert_eq!(big.magnitude(), &[0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
 }
 
 #[test]
-fn get_many_sorted_requires_canonical_key_order_not_lexicographic() {
+fn get_many_sorted_respects_input_order_not_canonical_order() {
     // { "b": 1, "aa": 2 } (canonical order by encoded length)
     let bytes = [0xa2, 0x61, 0x62, 0x01, 0x62, 0x61, 0x61, 0x02];
 
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let map = canon.root().map().unwrap();
 
-    let err = map.get_many_sorted(["aa", "b"]).unwrap_err();
-    assert_eq!(err.code, QueryErrorCode::KeysNotSorted);
+    let out = map.get_many_sorted(["aa", "b"]).unwrap();
+    assert_eq!(out[0].unwrap().integer().unwrap().as_i64().unwrap(), 2);
+    assert_eq!(out[1].unwrap().integer().unwrap().as_i64().unwrap(), 1);
 }

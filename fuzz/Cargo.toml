@@ -23,5 +23,11 @@ path = "fuzz_targets/validate_roundtrip.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "query_only"
+path = "fuzz_targets/query_only.rs"
+test = false
+doc = false
+
 [workspace]
 members = ["."]
