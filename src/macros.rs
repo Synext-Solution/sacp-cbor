@@ -152,7 +152,8 @@ pub mod __cbor_macro {
     }
 
     pub fn try_reserve_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<(), CborError> {
-        v.try_reserve_exact(additional).map_err(|_| alloc_failed())?;
+        v.try_reserve_exact(additional)
+            .map_err(|_| alloc_failed())?;
         Ok(())
     }
 

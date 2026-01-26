@@ -51,13 +51,17 @@ fn cbor_macro_key_ident_vs_expr() {
 
     // `key:` becomes literal "key"
     let v = sacp_cbor::cbor!({ key: 1 }).unwrap();
-    let CborValue::Map(map) = v else { panic!("expected map") };
+    let CborValue::Map(map) = v else {
+        panic!("expected map")
+    };
     assert!(map.get("key").is_some());
     assert!(map.get(key).is_none());
 
     // `(key):` uses the expression value
     let v = sacp_cbor::cbor!({ (key): 1 }).unwrap();
-    let CborValue::Map(map) = v else { panic!("expected map") };
+    let CborValue::Map(map) = v else {
+        panic!("expected map")
+    };
     assert!(map.get("dynamic").is_some());
     assert!(map.get("key").is_none());
 }
@@ -70,7 +74,9 @@ fn cbor_macro_safe_int_boundary_becomes_bignum() {
 
     // MAX_SAFE_INTEGER + 1 becomes a positive bignum (tag 2)
     let v = sacp_cbor::cbor!(sacp_cbor::MAX_SAFE_INTEGER + 1).unwrap();
-    let CborValue::Bignum(big) = v else { panic!("expected bignum") };
+    let CborValue::Bignum(big) = v else {
+        panic!("expected bignum")
+    };
     assert!(!big.is_negative());
     assert_eq!(big.magnitude(), &[0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
@@ -86,7 +92,9 @@ fn cbor_macro_safe_int_boundary_becomes_bignum() {
 
     // MIN_SAFE_INTEGER - 1 becomes a negative bignum (tag 3)
     let v = sacp_cbor::cbor!(sacp_cbor::MIN_SAFE_INTEGER - 1).unwrap();
-    let CborValue::Bignum(big) = v else { panic!("expected bignum") };
+    let CborValue::Bignum(big) = v else {
+        panic!("expected bignum")
+    };
     assert!(big.is_negative());
     // magnitude is n = -1 - v = MAX_SAFE_INTEGER
     assert_eq!(big.magnitude(), &[0x1f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
