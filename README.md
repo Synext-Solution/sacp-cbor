@@ -192,6 +192,23 @@ Run:
 cargo bench
 ```
 
+## Coverage (llvm-cov + grcov)
+
+Prerequisites:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install grcov
+```
+
+Run the coverage script:
+
+```bash
+./scripts/coverage.sh
+```
+
+The HTML report is generated at `./coverage/index.html`.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
