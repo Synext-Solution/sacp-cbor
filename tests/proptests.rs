@@ -1,3 +1,4 @@
+#![cfg(feature = "alloc")]
 // Property-based tests for SACP-CBOR/1 canonical roundtrips.
 //
 // These tests are intentionally conservative in size/depth to keep CI fast.
@@ -73,7 +74,7 @@ proptest! {
     fn canonical_roundtrip(v in arb_value()) {
         let bytes = v.encode_canonical().unwrap();
         let limits = DecodeLimits::for_bytes(bytes.len());
-        let canon = validate_canonical(&bytes, limits).unwrap();
+        let _canon = validate_canonical(&bytes, limits).unwrap();
 
         let decoded = decode_value(&bytes, limits).unwrap();
         prop_assert!(cbor_equal(&v, &decoded));
@@ -83,7 +84,7 @@ proptest! {
 
         #[cfg(feature = "sha2")]
         {
-            let h1 = canon.sha256();
+            let h1 = _canon.sha256();
             let h2 = decoded.sha256_canonical().unwrap();
             prop_assert_eq!(h1, h2);
         }

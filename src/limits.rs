@@ -27,7 +27,8 @@ pub struct DecodeLimits {
     /// Maximum nesting depth.
     pub max_depth: usize,
     /// Maximum total count of container items:
-    /// `sum(array_len) + sum(map_pairs)` across the entire decoded item.
+    /// `sum(array_len) + sum(2 * map_pairs)` across the entire decoded item
+    /// (maps count both keys and values).
     pub max_total_items: usize,
     /// Maximum array length.
     pub max_array_len: usize,

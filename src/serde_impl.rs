@@ -643,7 +643,7 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
             CborValue::Bytes(b) => visitor.visit_bytes(b),
             CborValue::Text(s) => visitor.visit_str(s),
             CborValue::Array(items) => visitor.visit_seq(SeqAccess { items, idx: 0 }),
-            CborValue::Map(map) => visitor.visit_map(MapAccess::new(map)),
+            CborValue::Map(map) => visitor.visit_map(MapAccess::new(map.iter())),
             CborValue::Bignum(b) => visit_bignum_any(b, visitor),
         }
     }
@@ -920,7 +920,7 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         V: Visitor<'de>,
     {
         match self.value {
-            CborValue::Map(map) => visitor.visit_map(MapAccess::new(map)),
+            CborValue::Map(map) => visitor.visit_map(MapAccess::new(map.iter())),
             _ => Err(SerdeError::with_code(CborErrorCode::SerdeError)),
         }
     }
@@ -989,38 +989,51 @@ impl<'de> serde::de::SeqAccess<'de> for SeqAccess<'de> {
     }
 }
 
-struct MapAccess<'de> {
-    entries: Vec<(&'de str, &'de CborValue)>,
-    idx: usize,
+struct MapAccess<'de, I>
+where
+    I: Iterator<Item = (&'de str, &'de CborValue)>,
+{
+    iter: I,
+    pending: Option<(&'de str, &'de CborValue)>,
 }
 
-impl<'de> MapAccess<'de> {
-    fn new(map: &'de CborMap) -> Self {
-        let entries = map.iter().collect::<Vec<_>>();
-        Self { entries, idx: 0 }
+impl<'de, I> MapAccess<'de, I>
+where
+    I: Iterator<Item = (&'de str, &'de CborValue)>,
+{
+    const fn new(iter: I) -> Self {
+        Self {
+            iter,
+            pending: None,
+        }
     }
 }
 
-impl<'de> serde::de::MapAccess<'de> for MapAccess<'de> {
+impl<'de, I> serde::de::MapAccess<'de> for MapAccess<'de, I>
+where
+    I: Iterator<Item = (&'de str, &'de CborValue)>,
+{
     type Error = SerdeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
     where
         K: serde::de::DeserializeSeed<'de>,
     {
-        if self.idx >= self.entries.len() {
-            return Ok(None);
+        self.pending = self.iter.next();
+        match self.pending {
+            None => Ok(None),
+            Some((key, _)) => seed.deserialize(key.into_deserializer()).map(Some),
         }
-        let key = self.entries[self.idx].0;
-        seed.deserialize(key.into_deserializer()).map(Some)
     }
 
     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::DeserializeSeed<'de>,
     {
-        let value = self.entries[self.idx].1;
-        self.idx += 1;
+        let (_, value) = self
+            .pending
+            .take()
+            .ok_or_else(|| SerdeError::with_code(CborErrorCode::SerdeError))?;
         seed.deserialize(CborDeserializer::new(value))
     }
 }
@@ -1109,7 +1122,7 @@ impl<'de> serde::de::VariantAccess<'de> for VariantAccess<'de> {
         V: Visitor<'de>,
     {
         match self.value {
-            Some(CborValue::Map(map)) => visitor.visit_map(MapAccess::new(map)),
+            Some(CborValue::Map(map)) => visitor.visit_map(MapAccess::new(map.iter())),
             _ => Err(SerdeError::with_code(CborErrorCode::SerdeError)),
         }
     }

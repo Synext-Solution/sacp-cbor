@@ -260,7 +260,10 @@ impl<'a> Scanner<'a> {
                     self.limits.max_map_len,
                     CborErrorCode::MapLenLimitExceeded,
                 )?;
-                self.bump_items(len, off)?;
+                let items = len
+                    .checked_mul(2)
+                    .ok_or_else(|| CborError::decode(CborErrorCode::LengthOverflow, off))?;
+                self.bump_items(items, off)?;
                 self.ensure_depth(depth + 1, off)?;
 
                 let mut prev_key: Option<&[u8]> = None;
@@ -507,7 +510,10 @@ mod decode {
                         self.limits.max_map_len,
                         CborErrorCode::MapLenLimitExceeded,
                     )?;
-                    self.bump_items(len, off)?;
+                    let items = len
+                        .checked_mul(2)
+                        .ok_or_else(|| CborError::decode(CborErrorCode::LengthOverflow, off))?;
+                    self.bump_items(items, off)?;
                     self.ensure_depth(depth + 1, off)?;
 
                     let mut entries: Vec<(String, CborValue)> = Vec::new();
