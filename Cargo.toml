@@ -10,7 +10,7 @@ keywords = ["cbor", "canonical", "deterministic", "no_std", "sacp"]
 categories = ["encoding", "no-std"]
 
 # NOTE: Set your repository URL after creating the GitHub repo.
-repository = "https://github.com/synext/sacp-cbor"
+repository = "https://github.com/Synext-Solution/sacp-cbor"
 
 [features]
 # Full-featured default for typical server deployments.
