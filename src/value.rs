@@ -208,6 +208,7 @@ impl CborInteger {
         }
     }
 
+    #[cfg(feature = "serde")]
     #[inline]
     pub(crate) const fn new_safe_unchecked(value: i64) -> Self {
         Self(IntegerRepr::Safe(value))

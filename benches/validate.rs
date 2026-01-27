@@ -3,13 +3,16 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-use sacp_cbor::{from_slice, validate_canonical, CborMap, CborValue, DecodeLimits};
+use sacp_cbor::{validate_canonical, CborMap, CborValue, DecodeLimits};
+
+#[cfg(feature = "serde")]
+use sacp_cbor::from_slice;
 
 fn sample_small() -> Vec<u8> {
     vec![0xa1, 0x61, 0x61, 0x01] // {"a":1}
 }
 
-fn sample_medium() -> Vec<u8> {
+fn sample_medium_value() -> CborValue {
     let mut entries = Vec::new();
     for i in 0..64_i64 {
         entries.push((
@@ -18,7 +21,11 @@ fn sample_medium() -> Vec<u8> {
         ));
     }
     let map = CborMap::new(entries).unwrap();
-    CborValue::map(map).encode_canonical().unwrap()
+    CborValue::map(map)
+}
+
+fn sample_medium() -> Vec<u8> {
+    sample_medium_value().encode_canonical().unwrap()
 }
 
 fn sample_large_map(len: usize) -> Vec<u8> {
@@ -76,6 +83,7 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
+    #[cfg(feature = "serde")]
     c.bench_function("from_slice_medium", |b| {
         b.iter(|| {
             let v: CborValue = from_slice(black_box(&medium), medium_limits).unwrap();
@@ -83,6 +91,7 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
+    #[cfg(feature = "serde")]
     c.bench_function("from_slice_deep", |b| {
         b.iter(|| {
             let v: CborValue = from_slice(black_box(&deep), deep_limits).unwrap();
@@ -90,7 +99,7 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
-    let decoded: CborValue = from_slice(&medium, medium_limits).unwrap();
+    let decoded = sample_medium_value();
     c.bench_function("encode_canonical_medium", |b| {
         b.iter(|| {
             let bytes = decoded.encode_canonical().unwrap();

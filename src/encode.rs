@@ -502,10 +502,12 @@ impl Encoder {
         &self.sink.buf
     }
 
+    #[cfg(feature = "serde")]
     pub(crate) fn buf_len(&self) -> usize {
         self.sink.buf.len()
     }
 
+    #[cfg(feature = "serde")]
     pub(crate) fn truncate(&mut self, len: usize) {
         self.sink.buf.truncate(len);
     }
@@ -683,6 +685,7 @@ impl Encoder {
         Ok(())
     }
 
+    #[cfg(feature = "serde")]
     pub(crate) fn array_header(&mut self, len: usize) -> Result<(), CborError> {
         encode_major_len(&mut self.sink, 4, len)
     }
@@ -718,6 +721,7 @@ impl Encoder {
         Ok(())
     }
 
+    #[cfg(feature = "serde")]
     pub(crate) fn map_header(&mut self, len: usize) -> Result<(), CborError> {
         encode_major_len(&mut self.sink, 5, len)
     }
