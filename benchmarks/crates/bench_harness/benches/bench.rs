@@ -243,7 +243,7 @@ fn bench_decode_canonical_trusted(c: &mut Criterion) {
     group.bench_function("appendix_a_canonical", |b| {
         b.iter(|| {
             for item in appendix {
-                let out: sacp_cbor::CborValue =
+                let out: crate::value::BenchValue =
                     sacp_cbor::from_canonical_bytes_ref(item.as_ref()).unwrap();
                 black_box(out);
             }
@@ -335,7 +335,7 @@ fn bench_synthetic_decode_canonical_trusted(c: &mut Criterion) {
     for (name, item) in bytes {
         group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
             b.iter(|| {
-                let out: sacp_cbor::CborValue =
+                let out: crate::value::BenchValue =
                     sacp_cbor::from_canonical_bytes_ref(v.as_ref()).unwrap();
                 black_box(out);
             })

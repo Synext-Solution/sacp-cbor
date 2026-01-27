@@ -46,37 +46,6 @@ jobs:
       - name: Docs
         run: cargo doc --no-deps --all-features
 
-      - name: Check version change
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          if git rev-parse -q --verify "HEAD^" >/dev/null; then
-            if git diff --name-only HEAD^..HEAD | grep -q "^Cargo.toml$"; then
-              old_version="$(git show HEAD^:Cargo.toml | python3 -c 'import tomllib, sys; data=tomllib.loads(sys.stdin.read()); print(data["package"]["version"])')"
-              new_version="$(python3 -c 'import tomllib, pathlib; data=tomllib.loads(pathlib.Path("Cargo.toml").read_text()); print(data["package"]["version"])')"
-              if [ "$old_version" != "$new_version" ]; then
-                echo "changed=1" >> "$GITHUB_OUTPUT"
-              else
-                echo "changed=0" >> "$GITHUB_OUTPUT"
-              fi
-            else
-              echo "changed=0" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "changed=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Benchmarks (version change only)
-        if: steps.version.outputs.changed == '1'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd benchmarks
-          ./scripts/fetch_datasets.sh
-          cargo bench
-          cargo run -p bench_harness --bin report
-
   release:
     needs: test
     runs-on: ubuntu-latest

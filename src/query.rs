@@ -23,9 +23,6 @@ use crate::canonical::CborBytes;
 use crate::canonical::EncodedTextKey;
 
 #[cfg(feature = "alloc")]
-use crate::value::{CborMap, CborValue};
-
-#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 /// The CBOR data model supported by this crate.
@@ -909,126 +906,6 @@ impl CborBytes {
     }
 }
 
-#[cfg(feature = "alloc")]
-impl CborValue {
-    /// Traverses a nested path inside a decoded `CborValue`.
-    ///
-    /// Returns `Ok(None)` if any key/index is missing. Returns `Err(_)` on type mismatches.
-    ///
-    /// # Errors
-    ///
-    /// Returns `CborError` for type mismatches.
-    pub fn at<'a>(&'a self, path: &[PathElem<'_>]) -> Result<Option<&'a Self>, CborError> {
-        let mut cur: &Self = self;
-
-        for pe in path {
-            match *pe {
-                PathElem::Key(k) => {
-                    let map = cur.as_map().ok_or_else(|| expected_map(0))?;
-                    match map.get(k) {
-                        Some(v) => cur = v,
-                        None => return Ok(None),
-                    }
-                }
-                PathElem::Index(i) => {
-                    let items = cur.as_array().ok_or_else(|| expected_array(0))?;
-                    match items.get(i) {
-                        Some(v) => cur = v,
-                        None => return Ok(None),
-                    }
-                }
-            }
-        }
-
-        Ok(Some(cur))
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl CborMap {
-    /// Looks up multiple keys in a single pass.
-    ///
-    /// Keys may be in any order; results preserve the input key order.
-    ///
-    /// # Errors
-    ///
-    /// Returns `CborError` for invalid query inputs.
-    pub fn get_many_sorted<'a, const N: usize>(
-        &'a self,
-        keys: [&str; N],
-    ) -> Result<[Option<&'a CborValue>; N], CborError> {
-        let mut out: [Option<&'a CborValue>; N] = [None; N];
-
-        validate_query_keys(&keys, 0)?;
-
-        if keys.is_empty() || self.is_empty() {
-            return Ok(out);
-        }
-
-        let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
-
-        for w in idxs.windows(2) {
-            if keys[w[0]] == keys[w[1]] {
-                return Err(CborError::new(ErrorCode::InvalidQuery, 0));
-            }
-        }
-
-        let mut it = self.iter().peekable();
-        scan_sorted_iter(&keys, &idxs, &mut it, |idx, mv| {
-            out[idx] = Some(mv);
-        });
-
-        Ok(out)
-    }
-
-    /// The slice-based form of [`CborMap::get_many_sorted`].
-    ///
-    /// `out` is cleared to `None` for all entries before results are written.
-    ///
-    /// # Errors
-    ///
-    /// Returns `CborError` for invalid query inputs.
-    pub fn get_many_sorted_into<'a>(
-        &'a self,
-        keys: &[&str],
-        out: &mut [Option<&'a CborValue>],
-    ) -> Result<(), CborError> {
-        if keys.len() != out.len() {
-            return Err(CborError::new(ErrorCode::InvalidQuery, 0));
-        }
-
-        validate_query_keys(keys, 0)?;
-
-        for slot in out.iter_mut() {
-            *slot = None;
-        }
-
-        if keys.is_empty() || self.is_empty() {
-            return Ok(());
-        }
-
-        let mut idxs = crate::alloc_util::try_vec_with_capacity(keys.len(), 0)?;
-        for i in 0..keys.len() {
-            idxs.push(i);
-        }
-        idxs.sort_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
-
-        for w in idxs.windows(2) {
-            if keys[w[0]] == keys[w[1]] {
-                return Err(CborError::new(ErrorCode::InvalidQuery, 0));
-            }
-        }
-
-        let mut it = self.iter().peekable();
-        scan_sorted_iter(keys, &idxs, &mut it, |idx, mv| {
-            out[idx] = Some(mv);
-        });
-
-        Ok(())
-    }
-}
-
 /* =========================
  * Internal parsing helpers
  * ========================= */
@@ -1172,38 +1049,6 @@ impl<'a> MapScanState<'a> {
 struct ParsedText<'a> {
     s: &'a str,
     bytes: &'a [u8],
-}
-
-#[cfg(feature = "alloc")]
-fn scan_sorted_iter<'a, I, V>(
-    keys: &[&str],
-    idxs: &[usize],
-    iter: &mut core::iter::Peekable<I>,
-    mut on_match: impl FnMut(usize, V),
-) where
-    I: Iterator<Item = (&'a str, V)>,
-    V: Copy,
-{
-    for &idx in idxs {
-        let qk = keys[idx];
-        loop {
-            let Some((mk, mv)) = iter.peek().copied() else {
-                break;
-            };
-
-            match cmp_text_keys_canonical(mk, qk) {
-                Ordering::Less => {
-                    iter.next();
-                }
-                Ordering::Equal => {
-                    on_match(idx, mv);
-                    iter.next();
-                    break;
-                }
-                Ordering::Greater => break,
-            }
-        }
-    }
 }
 
 fn read_text<'a>(data: &'a [u8], pos: &mut usize) -> Result<ParsedText<'a>, CborError> {

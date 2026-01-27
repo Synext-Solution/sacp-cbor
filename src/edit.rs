@@ -10,7 +10,6 @@ use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::query::{CborValueRef, PathElem};
 use crate::scalar::F64Bits;
-use crate::value::CborValue;
 use crate::{CborError, Encoder, ErrorCode};
 
 const fn err(code: ErrorCode, offset: usize) -> CborError {
@@ -379,8 +378,6 @@ impl sealed::Sealed for i64 {}
 impl sealed::Sealed for u64 {}
 impl sealed::Sealed for i128 {}
 impl sealed::Sealed for u128 {}
-impl sealed::Sealed for CborValue {}
-impl sealed::Sealed for &CborValue {}
 impl sealed::Sealed for CborBytesRef<'_> {}
 impl sealed::Sealed for CborBytes {}
 impl sealed::Sealed for &CborBytes {}
@@ -460,18 +457,6 @@ impl<'a> EditEncode<'a> for i128 {
 impl<'a> EditEncode<'a> for u128 {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
         encode_to_vec(|enc| enc.int_u128(self))
-    }
-}
-
-impl<'a> EditEncode<'a> for CborValue {
-    fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        encode_to_vec(|enc| enc.value(&self))
-    }
-}
-
-impl<'a> EditEncode<'a> for &CborValue {
-    fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        encode_to_vec(|enc| enc.value(self))
     }
 }
 

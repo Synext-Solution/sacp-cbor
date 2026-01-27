@@ -1,79 +1,41 @@
 #![cfg(feature = "alloc")]
 
-use sacp_cbor::{
-    CborValue, ErrorCode, F64Bits, MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER,
-};
+use sacp_cbor::{CborError, Encoder, ErrorCode, F64Bits, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
+
+fn encode_one(f: impl FnOnce(&mut Encoder) -> Result<(), CborError>) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    f(&mut enc).unwrap();
+    enc.into_vec()
+}
 
 #[test]
 fn encode_uint_boundaries() {
+    assert_eq!(encode_one(|e| e.int(0)), vec![0x00]);
+    assert_eq!(encode_one(|e| e.int(23)), vec![0x17]);
+    assert_eq!(encode_one(|e| e.int(24)), vec![0x18, 0x18]);
+    assert_eq!(encode_one(|e| e.int(255)), vec![0x18, 0xff]);
+    assert_eq!(encode_one(|e| e.int(256)), vec![0x19, 0x01, 0x00]);
+    assert_eq!(encode_one(|e| e.int(65_535)), vec![0x19, 0xff, 0xff]);
     assert_eq!(
-        CborValue::int(0).unwrap().encode_canonical().unwrap(),
-        vec![0x00]
-    );
-    assert_eq!(
-        CborValue::int(23).unwrap().encode_canonical().unwrap(),
-        vec![0x17]
-    );
-    assert_eq!(
-        CborValue::int(24).unwrap().encode_canonical().unwrap(),
-        vec![0x18, 0x18]
-    );
-    assert_eq!(
-        CborValue::int(255).unwrap().encode_canonical().unwrap(),
-        vec![0x18, 0xff]
-    );
-    assert_eq!(
-        CborValue::int(256).unwrap().encode_canonical().unwrap(),
-        vec![0x19, 0x01, 0x00]
-    );
-    assert_eq!(
-        CborValue::int(65_535).unwrap().encode_canonical().unwrap(),
-        vec![0x19, 0xff, 0xff]
-    );
-    assert_eq!(
-        CborValue::int(65_536).unwrap().encode_canonical().unwrap(),
+        encode_one(|e| e.int(65_536)),
         vec![0x1a, 0x00, 0x01, 0x00, 0x00]
     );
 
     let mut expected = vec![0x1b];
-    expected.extend_from_slice(&MAX_SAFE_INTEGER.to_be_bytes());
-    assert_eq!(
-        CborValue::int(MAX_SAFE_INTEGER_I64)
-            .unwrap()
-            .encode_canonical()
-            .unwrap(),
-        expected
-    );
+    expected.extend_from_slice(&u64::try_from(MAX_SAFE_INTEGER_I64).unwrap().to_be_bytes());
+    assert_eq!(encode_one(|e| e.int(MAX_SAFE_INTEGER_I64)), expected);
 }
 
 #[test]
 fn encode_nint_boundaries() {
+    assert_eq!(encode_one(|e| e.int(-1)), vec![0x20]);
+    assert_eq!(encode_one(|e| e.int(-24)), vec![0x37]);
+    assert_eq!(encode_one(|e| e.int(-25)), vec![0x38, 0x18]);
+    assert_eq!(encode_one(|e| e.int(-256)), vec![0x38, 0xff]);
+    assert_eq!(encode_one(|e| e.int(-257)), vec![0x39, 0x01, 0x00]);
+    assert_eq!(encode_one(|e| e.int(-65_536)), vec![0x39, 0xff, 0xff]);
     assert_eq!(
-        CborValue::int(-1).unwrap().encode_canonical().unwrap(),
-        vec![0x20]
-    );
-    assert_eq!(
-        CborValue::int(-24).unwrap().encode_canonical().unwrap(),
-        vec![0x37]
-    );
-    assert_eq!(
-        CborValue::int(-25).unwrap().encode_canonical().unwrap(),
-        vec![0x38, 0x18]
-    );
-    assert_eq!(
-        CborValue::int(-256).unwrap().encode_canonical().unwrap(),
-        vec![0x38, 0xff]
-    );
-    assert_eq!(
-        CborValue::int(-257).unwrap().encode_canonical().unwrap(),
-        vec![0x39, 0x01, 0x00]
-    );
-    assert_eq!(
-        CborValue::int(-65_536).unwrap().encode_canonical().unwrap(),
-        vec![0x39, 0xff, 0xff]
-    );
-    assert_eq!(
-        CborValue::int(-65_537).unwrap().encode_canonical().unwrap(),
+        encode_one(|e| e.int(-65_537)),
         vec![0x3a, 0x00, 0x01, 0x00, 0x00]
     );
 }
@@ -81,11 +43,11 @@ fn encode_nint_boundaries() {
 #[test]
 fn encode_rejects_int_outside_safe_range() {
     let too_big = MAX_SAFE_INTEGER_I64 + 1;
-    let err = CborValue::int(too_big).unwrap_err();
+    let err = Encoder::new().int(too_big).unwrap_err();
     assert_eq!(err.code, ErrorCode::IntegerOutsideSafeRange);
 
     let too_small = MIN_SAFE_INTEGER - 1;
-    let err = CborValue::int(too_small).unwrap_err();
+    let err = Encoder::new().int(too_small).unwrap_err();
     assert_eq!(err.code, ErrorCode::IntegerOutsideSafeRange);
 }
 
@@ -104,7 +66,7 @@ fn encode_text_len_boundaries() {
             expected.extend_from_slice(&(len as u16).to_be_bytes());
         }
         expected.extend_from_slice(s.as_bytes());
-        assert_eq!(CborValue::text(s).encode_canonical().unwrap(), expected);
+        assert_eq!(encode_one(|e| e.text(&s)), expected);
     }
 }
 
@@ -123,14 +85,14 @@ fn encode_bytes_len_boundaries() {
             expected.extend_from_slice(&(len as u16).to_be_bytes());
         }
         expected.extend_from_slice(&b);
-        assert_eq!(CborValue::bytes(b).encode_canonical().unwrap(), expected);
+        assert_eq!(encode_one(|e| e.bytes(&b)), expected);
     }
 }
 
 #[test]
 fn encode_float_nan_is_canonical() {
     let bits = F64Bits::try_from_f64(f64::NAN).unwrap();
-    let bytes = CborValue::float(bits).encode_canonical().unwrap();
+    let bytes = encode_one(|e| e.float(bits));
 
     let mut expected = vec![0xfb];
     expected.extend_from_slice(&0x7ff8_0000_0000_0000u64.to_be_bytes());

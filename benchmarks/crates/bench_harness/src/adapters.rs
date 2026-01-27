@@ -32,7 +32,7 @@ impl Adapter for SacpCbor {
     }
 
     fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
-        let _v: sacp_cbor::CborValue =
+        let _v: BenchValue =
             sacp_cbor::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
                 .map_err(|e| format!("{e}"))?;
         Ok(())
@@ -47,8 +47,7 @@ impl Adapter for SacpCbor {
     }
 
     fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
-        let v = from_bench_value(value)?;
-        v.encode_canonical().map_err(|e| format!("{e}"))
+        encode_sacp_stream(value)
     }
 
     fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
@@ -351,27 +350,4 @@ fn encode_bench_value_in_array(
     }
 }
 
-fn from_bench_value(v: &BenchValue) -> Result<sacp_cbor::CborValue, String> {
-    match v {
-        BenchValue::Null => Ok(sacp_cbor::CborValue::null()),
-        BenchValue::Bool(b) => Ok(sacp_cbor::CborValue::bool(*b)),
-        BenchValue::Int(i) => sacp_cbor::CborValue::int(*i).map_err(|e| format!("{e}")),
-        BenchValue::Bytes(b) => Ok(sacp_cbor::CborValue::bytes(b.clone())),
-        BenchValue::Text(s) => Ok(sacp_cbor::CborValue::text(s.clone())),
-        BenchValue::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(from_bench_value(item)?);
-            }
-            Ok(sacp_cbor::CborValue::array(out))
-        }
-        BenchValue::Map(entries) => {
-            let mut out = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
-                out.push((k.clone().into_boxed_str(), from_bench_value(v)?));
-            }
-            let map = sacp_cbor::CborMap::new(out).map_err(|e| format!("{e}"))?;
-            Ok(sacp_cbor::CborValue::map(map))
-        }
-    }
-}
+// (owned value encoding removed)

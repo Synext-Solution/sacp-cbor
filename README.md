@@ -12,9 +12,9 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 
 - **Validate** that an input is a *single, canonical* CBOR item under a strict profile (`validate_canonical`).
 - Wrap validated bytes as `CborBytesRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
-- Optionally **decode** into owned Rust types (including `CborValue`) via serde `from_slice` (`serde` + `alloc`).
+- Optionally **decode** into Rust types via serde `from_slice` (`serde` + `alloc`).
 - **Encode canonical CBOR** directly (`Encoder`, `MapEncoder`, `ArrayEncoder`) (`alloc`).
-- Build values with the **fallible** `cbor!` macro (`alloc`) and build canonical bytes with `cbor_bytes!` (`alloc`).
+- Build canonical bytes with the **fallible** `cbor_bytes!` macro (`alloc`).
 - **Patch/edit** canonical bytes without decoding the whole structure (`Editor`) (`alloc`).
 - Optional:
   - **serde** conversion utilities (`serde`).
@@ -52,7 +52,7 @@ This crate is `no_std` by default unless `std` is enabled.
 | Feature | Enables | Notes |
 |---|---|---|
 | `std` | `std::error::Error` for `CborError` | Otherwise `no_std` |
-| `alloc` | Owned types + encoding + editor + macros | Required for `CborBytes`, `CborValue`, `Encoder`, `Editor`, `cbor!`, `cbor_bytes!` |
+| `alloc` | Owned types + encoding + editor + macros | Required for `CborBytes`, `Encoder`, `Editor`, `cbor_bytes!` |
 | `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice; enables owned decoding via `from_slice` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
 | `simdutf8` | Faster UTF-8 validation | Optional SIMD validation, same semantics |
@@ -195,31 +195,6 @@ fn main() -> Result<(), sacp_cbor::CborError> {
   - Worst-case: `O(bytes scanned)`, often close to `O(n)` for pathological paths
   - Typical: shallow maps with early exits are much smaller
 - Space: `O(1)`
-
-### 3) Decode into an owned `CborValue` (requires `serde` + `alloc`)
-
-```rust
-use sacp_cbor::{from_slice, CborValue, DecodeLimits};
-
-fn main() -> Result<(), sacp_cbor::CborError> {
-  let bytes: &[u8] = /* canonical bytes */;
-  let limits = DecodeLimits::for_bytes(bytes.len());
-
-  let v: CborValue = from_slice(bytes, limits)?;
-
-  if let Some(user) = v.at(sacp_cbor::path!("user"))? {
-    println!("user is null? {}", user.is_null());
-  }
-
-  Ok(())
-}
-```
-
-**Complexity**
-
-- Time: `O(n)`
-- Allocations: proportional to the decoded structure (arrays/maps/strings/bytes)
-- Space: `O(size of decoded content)`
 
 ---
 
@@ -375,13 +350,6 @@ Scalar decoding (zero-copy where possible):
 - `bool() -> Result<bool, CborError>` — `O(1)`
 - `float64() -> Result<f64, CborError>` — `O(1)`
 
-Owned conversion (`alloc`):
-
-- `to_owned() -> Result<CborValue, CborError>`
-
-  - Time: `O(value_len)`
-  - Allocations: proportional to decoded subtree
-
 ### `MapRef<'a>`
 
 Obtain via `CborValueRef::map()?`.
@@ -472,95 +440,6 @@ Obtain via `CborValueRef::array()?`.
   - Full iteration: `O(bytes in array)`
 
 ---
-
-## Owned value API (`alloc`)
-
-If you want an owned DOM tree (and canonical encoding from it), use `CborValue` + friends.
-
-### `CborValue`
-
-Construction (all fallible where appropriate):
-
-- `CborValue::null()`
-- `CborValue::bool(bool)`
-- `CborValue::float(F64Bits)`
-- `CborValue::float64(f64) -> Result<Self, CborError>` (rejects -0.0, canonicalizes NaN)
-- `CborValue::bytes(Vec<u8>)`
-- `CborValue::text(S: Into<Box<str>>)`
-- `CborValue::array(items: impl Into<Box<[CborValue]>>)`
-- `CborValue::map(CborMap)`
-
-Integers:
-
-- `CborValue::int(i64) -> Result<Self, CborError>` (safe range enforced)
-- `CborValue::bigint(negative, magnitude: Vec<u8>) -> Result<Self, CborError>`
-- `CborValue::integer(CborInteger)` (already validated by constructors)
-
-Accessors:
-
-- `as_i64() -> Option<i64>`
-- `as_bigint() -> Option<&BigInt>`
-- `as_bytes() -> Option<&[u8]>`
-- `as_text() -> Option<&str>`
-- `as_array() -> Option<&[CborValue]>`
-- `as_map() -> Option<&CborMap>`
-- `as_bool() -> Option<bool>`
-- `is_null() -> bool`
-- `as_float() -> Option<F64Bits>`
-
-Path traversal (owned):
-
-- `CborValue::at(path) -> Result<Option<&CborValue>, CborError>`
-
-  - Time: depends on map/array lookups; maps use binary search on sorted keys
-  - For maps: `O(log m * compare_cost)`
-  - For arrays: `O(1)` index
-  - Space: `O(1)`
-
-Encoding:
-
-- `encode_canonical() -> Result<Vec<u8>, CborError>`
-
-  - Time: `O(size of value)`
-  - Space: `O(depth)` stack (small inline + possible overflow)
-
-Hashing (optional):
-
-- `sha256_canonical() -> Result<[u8; 32], CborError>` (`sha2`)
-
-  - Time: `O(size of canonical encoding)`
-
-### `CborMap`
-
-Create canonical maps:
-
-- `CborMap::new(Vec<(Box<str>, CborValue)>) -> Result<CborMap, CborError>`
-
-  - Validates key size
-  - Sorts keys into canonical order
-  - Rejects duplicates
-
-**Complexity**
-
-- Time: `O(m log m * L)` (sort + comparisons)
-- Space: `O(m)`
-
-Lookup:
-
-- `get(&str) -> Option<&CborValue>`
-
-  - Time: `O(log m * L)`
-  - Uses binary search by canonical key encoding
-
-Multi-key lookups:
-
-- `get_many_sorted<const N: usize>(keys: [&str; N]) -> Result<[Option<&CborValue>; N], CborError>`
-- `get_many_sorted_into(keys: &[&str], out: &mut [Option<&CborValue>]) -> Result<(), CborError>`
-
-**Complexity**
-
-- Time: `O(k log k * L + m * merge_scan_cost)` in worst-case (it uses a merge scan over the already-sorted map iterator)
-- Space: `O(k)`
 
 ### `CborInteger` / `BigInt` / `F64Bits`
 
@@ -666,33 +545,6 @@ You must write exactly `len` items; otherwise:
 ---
 
 ## Macros (`alloc`)
-
-### `cbor!` — build an owned `CborValue` (fallible)
-
-- Produces `Result<CborValue, CborError>`
-- Sorts map keys for you (because it builds a `CborMap::new(...)`)
-
-Example:
-
-```rust
-use sacp_cbor::cbor;
-
-let v = cbor!({
-    "a": 1,
-    "b": [true, null, 1.5],
-})?;
-```
-
-Map keys can be:
-
-- identifiers: `{ foo: 1 }` (becomes `"foo"`)
-- string literals: `{ "foo": 1 }`
-- dynamic expressions: `{ ((some_string)): 1 }`
-
-**Complexity**
-
-- Arrays: `O(#elements)`
-- Maps: `O(m log m * L)` due to sorting + duplicate check
 
 ### `cbor_bytes!` — build canonical bytes directly (fallible)
 
@@ -822,7 +674,6 @@ Implemented out of the box:
 - `&[u8]`, `Vec<u8>`
 - `f32`, `f64`, `F64Bits`
 - `i64`, `u64`, `i128`, `u128` (bignum encoding when outside safe range)
-- `CborValue`, `&CborValue`
 - `CborBytesRef`, `CborBytes`, `&CborBytes`
 
 **Complexity**
@@ -903,37 +754,11 @@ assert_eq!(decoded, msg);
 
 - `from_slice_borrowed<T: Deserialize>(bytes, limits) -> Result<T, CborError>`
 
-### `serde_value` helper module
-
-Use when you want a struct field to be encoded/decoded as a `CborValue` itself:
-
-```rust
-use serde::{Serialize, Deserialize};
-use sacp_cbor::CborValue;
-
-#[derive(Serialize, Deserialize)]
-struct Wrapper {
-  #[serde(with = "sacp_cbor::serde_value")]
-  inner: CborValue,
-}
-```
-
-Optional variant:
-
-```rust
-#[derive(Serialize, Deserialize)]
-struct Wrapper2 {
-  #[serde(with = "sacp_cbor::serde_value::option")]
-  inner: Option<CborValue>,
-}
-```
-
 ### Serde limitations (important)
 
 - Map keys must serialize as **text** (`&str`/`String`/`char` etc). Non-string keys fail with `MapKeyMustBeText`.
 - Integer support via serde is limited to what serde exposes:
 
-  - Serialization of `CborValue` bignums only succeeds if they fit into `i128` or `u128`.
   - Very large bignums (more than 128 bits) cannot be losslessly represented through serde numeric primitives.
 - Schema mismatches return `ErrorCode::SerdeError` (offset 0); structural parse errors preserve offsets when available.
 
@@ -943,11 +768,10 @@ struct Wrapper2 {
 
 - `CborBytesRef::sha256() -> [u8; 32]`
 - `CborBytes::sha256() -> [u8; 32]`
-- `CborValue::sha256_canonical() -> Result<[u8; 32], CborError>`
 
 **Complexity**
 
-- Time: `O(n)` for bytes, `O(size of canonical encoding)` for values
+- Time: `O(n)` for bytes
 - Space: `O(1)`
 
 ---
@@ -1088,9 +912,6 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Macros (`alloc`)
 
-- `cbor!` → `Result<CborValue, CborError>`
-
-  - maps sorted for you (`O(m log m)`)
 - `cbor_bytes!` → `Result<CborBytes, CborError>`
 
   - no sorting; order must already be canonical
@@ -1099,7 +920,6 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 - `to_vec`, `from_slice`, `from_slice_borrowed`
 - `from_canonical_bytes_ref`, `from_canonical_bytes` (for already-validated canonical bytes)
-- `serde_value` helpers for struct fields
 - numeric bignums are limited to `i128/u128` roundtrips through serde
 
 ---
@@ -1108,9 +928,6 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 - **You already have CBOR bytes and need fast reads:**
   `validate_canonical` → `CborBytesRef` → `at/get/iter`
-
-- **You need an owned representation or want to manipulate values in memory:**
-  `from_slice::<CborValue>` → `CborValue` (+ `CborMap`, `CborInteger`)
 
 - **You need to *emit* canonical CBOR efficiently:**
   `Encoder` / `cbor_bytes!`

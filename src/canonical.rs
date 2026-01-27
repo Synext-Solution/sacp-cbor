@@ -94,6 +94,7 @@ pub struct EncodedTextKey<'a> {
 }
 
 impl<'a> EncodedTextKey<'a> {
+    #[cfg(feature = "alloc")]
     #[inline]
     pub(crate) const fn new_unchecked(bytes: &'a [u8]) -> Self {
         Self { bytes }

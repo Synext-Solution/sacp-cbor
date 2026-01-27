@@ -10,8 +10,8 @@
 //!   payloads reduces to **byte equality**.
 //! - **Hot-path validation is allocation-free.**
 //!   Use [`validate_canonical`] to validate a single CBOR data item with strict SACP-CBOR/1 rules.
-//! - **Owned AST is optional.**
-//!   Enable the `alloc` feature to decode into [`CborValue`] and to construct and encode canonical CBOR.
+//! - **Encoding is streaming-first.**
+//!   Use [`Encoder`] or [`cbor_bytes!`] to emit canonical bytes without building an owned tree.
 //!
 //! ## SACP-CBOR/1 profile (explicit)
 //!
@@ -34,7 +34,7 @@
 //! ## Feature flags
 //!
 //! - `std` *(default)*: implements `std::error::Error` for [`CborError`].
-//! - `alloc` *(default)*: enables owned types (`CborValue`, `CborMap`, `CborBytes`) and encoding.
+//! - `alloc` *(default)*: enables owned canonical bytes (`CborBytes`), editing, and encoding helpers.
 //! - `sha2` *(default)*: enables SHA-256 hashing helpers for canonical bytes.
 //! - `simdutf8`: enables SIMD-accelerated UTF-8 validation where supported.
 //! - `unsafe-utf8`: allows unchecked UTF-8 for canonical-trusted inputs.
@@ -48,7 +48,7 @@
 //!
 //! The crate is `no_std` compatible.
 //! - Validation-only usage works without `alloc`.
-//! - Owned APIs require `alloc` and therefore an allocator provided by your environment.
+//! - Owned APIs (canonical bytes + editor) require `alloc` and therefore an allocator provided by your environment.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -94,7 +94,6 @@ mod encode;
 mod macros;
 #[cfg(feature = "alloc")]
 mod value;
-
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CborBytes;
 #[cfg(feature = "alloc")]
@@ -102,15 +101,13 @@ pub use crate::edit::{
     ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
 };
 #[cfg(feature = "alloc")]
-pub use crate::encode::{encode_into, ArrayEncoder, Encoder, MapEncoder};
+pub use crate::encode::{ArrayEncoder, Encoder, MapEncoder};
 #[cfg(feature = "alloc")]
 #[doc(hidden)]
 pub use crate::macros::__cbor_macro;
 #[cfg(feature = "alloc")]
-pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue};
+pub use crate::value::{BigInt, CborInteger};
 
-#[cfg(feature = "serde")]
-pub use crate::serde_impl::serde_value;
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::{
     from_canonical_bytes, from_canonical_bytes_ref, from_slice, from_slice_borrowed, to_vec,

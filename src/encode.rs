@@ -5,101 +5,8 @@ use crate::profile::{
 };
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
-use crate::value::{BigInt, CborInteger, CborValue, ValueRepr};
 use crate::{CborError, ErrorCode};
-use alloc::boxed::Box;
 use alloc::vec::Vec;
-
-#[derive(Clone, Copy)]
-enum Frame<'a> {
-    Array {
-        items: &'a [CborValue],
-        idx: usize,
-    },
-    Map {
-        entries: &'a [(Box<str>, CborValue)],
-        idx: usize,
-    },
-}
-
-struct SmallStack<'a, const N: usize> {
-    inline: [Option<Frame<'a>>; N],
-    len: usize,
-    overflow: Vec<Frame<'a>>,
-}
-
-impl<'a, const N: usize> SmallStack<'a, N> {
-    const fn new() -> Self {
-        Self {
-            inline: [None; N],
-            len: 0,
-            overflow: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, frame: Frame<'a>, offset: usize) -> Result<(), CborError> {
-        if !self.overflow.is_empty() {
-            try_reserve(&mut self.overflow, 1, offset)?;
-            self.overflow.push(frame);
-            return Ok(());
-        }
-        if self.len < N {
-            self.inline[self.len] = Some(frame);
-            self.len += 1;
-            return Ok(());
-        }
-        try_reserve(&mut self.overflow, 1, offset)?;
-        self.overflow.push(frame);
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Option<Frame<'a>> {
-        if let Some(frame) = self.overflow.pop() {
-            return Some(frame);
-        }
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        self.inline[self.len].take()
-    }
-}
-
-pub fn encode_to_vec(value: &CborValue) -> Result<Vec<u8>, CborError> {
-    let hint = encoded_len_hint(value)?;
-    let mut sink = VecSink::with_capacity(hint);
-    encode_value(&mut sink, value)?;
-    Ok(sink.into_vec())
-}
-
-/// Encode into an existing buffer, reusing its capacity.
-///
-/// The buffer is cleared before encoding.
-///
-/// # Errors
-///
-/// Returns an error if encoding fails or if the buffer cannot grow.
-pub fn encode_into(value: &CborValue, buf: &mut Vec<u8>) -> Result<(), CborError> {
-    buf.clear();
-    let hint = encoded_len_hint(value)?;
-    if hint != 0 {
-        try_reserve(buf, hint, 0)?;
-    }
-    let mut sink = VecSinkBorrowed { buf };
-    encode_value(&mut sink, value)
-}
-
-#[cfg(feature = "sha2")]
-pub fn encode_sha256(value: &CborValue) -> Result<[u8; 32], CborError> {
-    use sha2::{Digest, Sha256};
-
-    let mut sink = HashSink::new(Sha256::new());
-    encode_value(&mut sink, value)?;
-    let out = sink.hasher.finalize();
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(out.as_slice());
-    Ok(digest)
-}
 
 trait Sink {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError>;
@@ -113,10 +20,6 @@ trait Sink {
 
 struct VecSink {
     buf: Vec<u8>,
-}
-
-struct VecSinkBorrowed<'a> {
-    buf: &'a mut Vec<u8>,
 }
 
 impl VecSink {
@@ -168,142 +71,8 @@ impl Sink for VecSink {
     }
 }
 
-impl VecSinkBorrowed<'_> {
-    #[inline]
-    fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
-        let available = self.buf.capacity().saturating_sub(self.buf.len());
-        if additional <= available {
-            return Ok(());
-        }
-        let offset = self.buf.len();
-        let _needed = offset
-            .checked_add(additional)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
-        try_reserve(self.buf, additional, offset)
-    }
-}
-
-impl Sink for VecSinkBorrowed<'_> {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        self.reserve(bytes.len())?;
-        self.buf.extend_from_slice(bytes);
-        Ok(())
-    }
-
-    fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
-        if self.buf.len() == self.buf.capacity() {
-            self.reserve(1)?;
-        }
-        self.buf.push(byte);
-        Ok(())
-    }
-
-    fn position(&self) -> usize {
-        self.buf.len()
-    }
-}
-
-#[cfg(feature = "sha2")]
-struct HashSink<D> {
-    hasher: D,
-    len: usize,
-}
-
-#[cfg(feature = "sha2")]
-impl<D> HashSink<D> {
-    const fn new(hasher: D) -> Self {
-        Self { hasher, len: 0 }
-    }
-}
-
-#[cfg(feature = "sha2")]
-impl<D: sha2::Digest> Sink for HashSink<D> {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        self.hasher.update(bytes);
-        self.len = self
-            .len
-            .checked_add(bytes.len())
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.len))?;
-        Ok(())
-    }
-
-    fn position(&self) -> usize {
-        self.len
-    }
-}
-
-fn encode_value<S: Sink>(sink: &mut S, value: &CborValue) -> Result<(), CborError> {
-    let mut stack = SmallStack::<64>::new();
-    let mut current = Some(value);
-
-    loop {
-        if let Some(v) = current.take() {
-            match v.repr() {
-                ValueRepr::Integer(i) => encode_integer(sink, i)?,
-                ValueRepr::Bytes(b) => encode_bytes(sink, b)?,
-                ValueRepr::Text(s) => encode_text(sink, s)?,
-                ValueRepr::Bool(false) => sink.write_u8(0xf4)?,
-                ValueRepr::Bool(true) => sink.write_u8(0xf5)?,
-                ValueRepr::Null => sink.write_u8(0xf6)?,
-                ValueRepr::Float(bits) => encode_float64(sink, *bits)?,
-                ValueRepr::Array(items) => {
-                    encode_major_len(sink, 4, items.len())?;
-                    if !items.is_empty() {
-                        stack.push(Frame::Array { items, idx: 0 }, sink.position())?;
-                        current = Some(&items[0]);
-                    }
-                }
-                ValueRepr::Map(map) => {
-                    let entries = map.entries();
-                    encode_major_len(sink, 5, entries.len())?;
-                    if !entries.is_empty() {
-                        encode_text(sink, entries[0].0.as_ref())?;
-                        stack.push(Frame::Map { entries, idx: 0 }, sink.position())?;
-                        current = Some(&entries[0].1);
-                    }
-                }
-            }
-
-            if current.is_some() {
-                continue;
-            }
-        }
-
-        let Some(frame) = stack.pop() else {
-            return Ok(());
-        };
-        match frame {
-            Frame::Array { items, idx } => {
-                let next = idx + 1;
-                if next < items.len() {
-                    stack.push(Frame::Array { items, idx: next }, sink.position())?;
-                    current = Some(&items[next]);
-                }
-            }
-            Frame::Map { entries, idx } => {
-                let next = idx + 1;
-                if next < entries.len() {
-                    encode_text(sink, entries[next].0.as_ref())?;
-                    stack.push(Frame::Map { entries, idx: next }, sink.position())?;
-                    current = Some(&entries[next].1);
-                }
-            }
-        }
-    }
-}
-
 fn err_at<S: Sink>(sink: &S, code: ErrorCode) -> CborError {
     CborError::new(code, sink.position())
-}
-
-fn encode_integer<S: Sink>(sink: &mut S, value: &CborInteger) -> Result<(), CborError> {
-    if let Some(v) = value.as_i64() {
-        return encode_int(sink, v);
-    }
-    let b = value
-        .as_bigint()
-        .ok_or_else(|| err_at(sink, ErrorCode::LengthOverflow))?;
-    encode_bignum(sink, b)
 }
 
 fn encode_int<S: Sink>(sink: &mut S, v: i64) -> Result<(), CborError> {
@@ -315,12 +84,6 @@ fn encode_int<S: Sink>(sink: &mut S, v: i64) -> Result<(), CborError> {
         let n_u64 = u64::try_from(n_i128).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
         encode_major_uint(sink, 1, n_u64)
     }
-}
-
-fn encode_bignum<S: Sink>(sink: &mut S, b: &BigInt) -> Result<(), CborError> {
-    let tag = if b.is_negative() { 3u64 } else { 2u64 };
-    encode_major_uint(sink, 6, tag)?;
-    encode_bytes(sink, b.magnitude())
 }
 
 fn encode_bytes<S: Sink>(sink: &mut S, bytes: &[u8]) -> Result<(), CborError> {
@@ -369,94 +132,9 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
     sink.write(&value.to_be_bytes())
 }
 
-fn encoded_len_hint(value: &CborValue) -> Result<usize, CborError> {
-    encoded_len_value(value)
-}
-
-fn encoded_len_value(value: &CborValue) -> Result<usize, CborError> {
-    match value.repr() {
-        ValueRepr::Null | ValueRepr::Bool(_) => Ok(1),
-        ValueRepr::Float(_) => Ok(9),
-        ValueRepr::Integer(i) => encoded_len_integer(i),
-        ValueRepr::Bytes(b) => encoded_len_bytes_len(b.len()),
-        ValueRepr::Text(s) => encoded_len_text_len(s.len()),
-        ValueRepr::Array(items) => {
-            let mut total = encoded_len_major_len(items.len())?;
-            for item in items {
-                total = add_len(total, encoded_len_value(item)?)?;
-            }
-            Ok(total)
-        }
-        ValueRepr::Map(map) => {
-            let mut total = encoded_len_major_len(map.len())?;
-            for (k, v) in map.entries() {
-                total = add_len(total, encoded_len_text_len(k.len())?)?;
-                total = add_len(total, encoded_len_value(v)?)?;
-            }
-            Ok(total)
-        }
-    }
-}
-
-fn encoded_len_integer(value: &CborInteger) -> Result<usize, CborError> {
-    if let Some(v) = value.as_i64() {
-        if v >= 0 {
-            let u = u64::try_from(v).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
-            return Ok(encoded_len_major_uint(u));
-        }
-        let n_i128 = -1_i128 - i128::from(v);
-        let n_u64 =
-            u64::try_from(n_i128).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
-        return Ok(encoded_len_major_uint(n_u64));
-    }
-    let b = value
-        .as_bigint()
-        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, 0))?;
-    let tag = if b.is_negative() { 3u64 } else { 2u64 };
-    let tag_len = encoded_len_major_uint(tag);
-    let mag_len = encoded_len_bytes_len(b.magnitude().len())?;
-    add_len(tag_len, mag_len)
-}
-
-fn encoded_len_bytes_len(len: usize) -> Result<usize, CborError> {
-    let header = encoded_len_major_len(len)?;
-    add_len(header, len)
-}
-
-fn encoded_len_text_len(len: usize) -> Result<usize, CborError> {
-    let header = encoded_len_major_len(len)?;
-    add_len(header, len)
-}
-
-fn encoded_len_major_len(len: usize) -> Result<usize, CborError> {
-    let len_u64 = u64::try_from(len).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
-    Ok(encoded_len_major_uint(len_u64))
-}
-
-fn encoded_len_major_uint(value: u64) -> usize {
-    if value < 24 {
-        return 1;
-    }
-    if u8::try_from(value).is_ok() {
-        return 2;
-    }
-    if u16::try_from(value).is_ok() {
-        return 3;
-    }
-    if u32::try_from(value).is_ok() {
-        return 5;
-    }
-    9
-}
-
-fn add_len(a: usize, b: usize) -> Result<usize, CborError> {
-    a.checked_add(b)
-        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, 0))
-}
-
 /// Streaming encoder that writes canonical CBOR directly into a `Vec<u8>`.
 ///
-/// This avoids building a `CborValue` tree and supports splicing validated canonical bytes.
+/// This supports splicing validated canonical bytes.
 pub struct Encoder {
     sink: VecSink,
 }
@@ -476,6 +154,18 @@ impl Encoder {
         Self {
             sink: VecSink::with_capacity(capacity),
         }
+    }
+
+    /// Return the number of bytes written so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sink.buf.len()
+    }
+
+    /// Returns `true` if no bytes have been written.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sink.buf.is_empty()
     }
 
     /// Consume and return the encoded bytes.
@@ -626,15 +316,6 @@ impl Encoder {
     /// Returns an error if encoding fails.
     pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
         encode_float64(&mut self.sink, bits)
-    }
-
-    /// Encode an existing `CborValue`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
-    pub fn value(&mut self, v: &CborValue) -> Result<(), CborError> {
-        encode_value(&mut self.sink, v)
     }
 
     /// Splice already validated canonical CBOR bytes as the next value.
@@ -830,16 +511,6 @@ impl ArrayEncoder<'_> {
     pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
         self.consume_one()?;
         self.enc.float(bits)
-    }
-
-    /// Encode an existing `CborValue`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn value(&mut self, v: &CborValue) -> Result<(), CborError> {
-        self.consume_one()?;
-        self.enc.value(v)
     }
 
     /// Splice canonical CBOR bytes as the next array element.

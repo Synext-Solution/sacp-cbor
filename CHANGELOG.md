@@ -2,6 +2,7 @@
 
 ## 0.7.0
 
+- **Breaking:** removed owned value tree APIs and the `cbor!` macro; encoding is streaming-only via `Encoder`/`cbor_bytes!`.
 - **Breaking:** removed serde `to_value` / `from_value` conversion helpers; serde now streams directly to `Encoder` and validates+deserializes in a single pass from bytes (`from_slice` / `from_slice_borrowed`).
 - **Breaking:** removed `from_value_ref`, `from_bytes_ref_borrowed`, `from_value_ref_borrowed`, and `CborRefDeserializer` in favor of the direct single-pass deserializer.
 - **Breaking:** removed `decode_value`, `decode_value_trusted`, and `decode_value_canonical`; owned decoding now goes through serde `from_slice` / `from_slice_borrowed` (single-pass, inline validation).
@@ -39,10 +40,8 @@
 - Added `CborIntegerRef` and unified query integer handling (`CborKind::Integer`).
 - Reworked query helpers for multi-key lookup, extras, and required keys; fixed view equality semantics.
 - Added direct canonical encoder (`CanonicalEncoder`) and `cbor_bytes!` macro for zero-copy splicing.
-- Added serde support for `CborValue` and `serde_value` helper module (feature `serde`).
 - Updated fuzz targets and tests for the new APIs.
 
 ## 0.3.0
 
-- Added the `cbor!` macro for fallible, JSON-like construction of `CborValue` (alloc feature).
 - Added integration tests for the macro (canonical encoding, bignum boundaries, float rules, key ergonomics).

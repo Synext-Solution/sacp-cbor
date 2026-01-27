@@ -3,49 +3,54 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-use sacp_cbor::{validate_canonical, CborMap, CborValue, DecodeLimits};
-
-#[cfg(feature = "serde")]
-use sacp_cbor::from_slice;
+use sacp_cbor::{validate_canonical, CborError, DecodeLimits, Encoder};
 
 fn sample_small() -> Vec<u8> {
     vec![0xa1, 0x61, 0x61, 0x01] // {"a":1}
 }
 
-fn sample_medium_value() -> CborValue {
-    let mut entries = Vec::new();
-    for i in 0..64_i64 {
-        entries.push((
-            format!("k{i:03}").into_boxed_str(),
-            CborValue::int(i).unwrap(),
-        ));
-    }
-    let map = CborMap::new(entries).unwrap();
-    CborValue::map(map)
+fn encode_map(len: usize, width: usize) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.map(len, |m| {
+        for i in 0..len {
+            let key = format!("k{i:0width$}", width = width);
+            m.entry(key.as_str(), |e| e.int(i as i64))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    enc.into_vec()
 }
 
 fn sample_medium() -> Vec<u8> {
-    sample_medium_value().encode_canonical().unwrap()
+    encode_map(64, 5)
 }
 
 fn sample_large_map(len: usize) -> Vec<u8> {
-    let mut entries = Vec::new();
-    for i in 0..len {
-        entries.push((
-            format!("k{i:05}").into_boxed_str(),
-            CborValue::int(i as i64).unwrap(),
-        ));
+    encode_map(len, 5)
+}
+
+fn encode_depth_encoder(enc: &mut Encoder, depth: usize) -> Result<(), CborError> {
+    if depth == 0 {
+        return enc.null();
     }
-    let map = CborMap::new(entries).unwrap();
-    CborValue::map(map).encode_canonical().unwrap()
+    enc.array(1, |a| encode_depth_array(a, depth - 1))
+}
+
+fn encode_depth_array(
+    arr: &mut sacp_cbor::ArrayEncoder<'_>,
+    depth: usize,
+) -> Result<(), CborError> {
+    if depth == 0 {
+        return arr.null();
+    }
+    arr.array(1, |a| encode_depth_array(a, depth - 1))
 }
 
 fn sample_deep(depth: usize) -> Vec<u8> {
-    let mut v = CborValue::null();
-    for _ in 0..depth {
-        v = CborValue::array(vec![v]);
-    }
-    v.encode_canonical().unwrap()
+    let mut enc = Encoder::new();
+    encode_depth_encoder(&mut enc, depth).unwrap();
+    enc.into_vec()
 }
 
 fn bench_validate(c: &mut Criterion) {
@@ -83,35 +88,10 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
-    #[cfg(feature = "serde")]
-    c.bench_function("from_slice_medium", |b| {
+    c.bench_function("encode_stream_medium", |b| {
         b.iter(|| {
-            let v: CborValue = from_slice(black_box(&medium), medium_limits).unwrap();
-            black_box(v);
-        })
-    });
-
-    #[cfg(feature = "serde")]
-    c.bench_function("from_slice_deep", |b| {
-        b.iter(|| {
-            let v: CborValue = from_slice(black_box(&deep), deep_limits).unwrap();
-            black_box(v);
-        })
-    });
-
-    let decoded = sample_medium_value();
-    c.bench_function("encode_canonical_medium", |b| {
-        b.iter(|| {
-            let bytes = decoded.encode_canonical().unwrap();
+            let bytes = sample_medium();
             black_box(bytes);
-        })
-    });
-
-    #[cfg(feature = "sha2")]
-    c.bench_function("encode_sha256_medium", |b| {
-        b.iter(|| {
-            let digest = decoded.sha256_canonical().unwrap();
-            black_box(digest);
         })
     });
 }
