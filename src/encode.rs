@@ -71,6 +71,19 @@ pub fn encode_to_vec(value: &CborValue) -> Result<Vec<u8>, CborError> {
     Ok(sink.into_vec())
 }
 
+/// Encode into an existing buffer, reusing its capacity.
+///
+/// The buffer is cleared before encoding.
+///
+/// # Errors
+///
+/// Returns an error if encoding fails or if the buffer cannot grow.
+pub fn encode_into(value: &CborValue, buf: &mut Vec<u8>) -> Result<(), CborError> {
+    buf.clear();
+    let mut sink = VecSinkBorrowed { buf };
+    encode_value(&mut sink, value)
+}
+
 #[cfg(feature = "sha2")]
 pub fn encode_sha256(value: &CborValue) -> Result<[u8; 32], CborError> {
     use sha2::{Digest, Sha256};
@@ -95,6 +108,10 @@ trait Sink {
 
 struct VecSink {
     buf: Vec<u8>,
+}
+
+struct VecSinkBorrowed<'a> {
+    buf: &'a mut Vec<u8>,
 }
 
 impl VecSink {
@@ -125,6 +142,37 @@ impl VecSink {
 }
 
 impl Sink for VecSink {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
+        self.reserve(bytes.len())?;
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
+        self.reserve(1)?;
+        self.buf.push(byte);
+        Ok(())
+    }
+
+    fn position(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl VecSinkBorrowed<'_> {
+    fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
+        let offset = self.buf.len();
+        let needed = offset
+            .checked_add(additional)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
+        if needed <= self.buf.capacity() {
+            return Ok(());
+        }
+        try_reserve(self.buf, additional, offset)
+    }
+}
+
+impl Sink for VecSinkBorrowed<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
         self.reserve(bytes.len())?;
         self.buf.extend_from_slice(bytes);

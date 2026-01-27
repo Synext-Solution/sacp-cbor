@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::encode;
 use crate::profile::{
@@ -81,11 +82,26 @@ impl CborMap {
         for (k, _) in &entries {
             checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
         }
-        entries.sort_by(|(ka, _), (kb, _)| cmp_text_keys_canonical(ka, kb));
+        let mut is_sorted = true;
+        for i in 0..entries.len().saturating_sub(1) {
+            match cmp_text_keys_canonical(&entries[i].0, &entries[i + 1].0) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    return Err(CborError::new(ErrorCode::DuplicateMapKey, 0));
+                }
+                Ordering::Greater => {
+                    is_sorted = false;
+                    break;
+                }
+            }
+        }
 
-        for w in entries.windows(2) {
-            if w[0].0 == w[1].0 {
-                return Err(CborError::new(ErrorCode::DuplicateMapKey, 0));
+        if !is_sorted {
+            entries.sort_by(|(ka, _), (kb, _)| cmp_text_keys_canonical(ka, kb));
+            for w in entries.windows(2) {
+                if w[0].0 == w[1].0 {
+                    return Err(CborError::new(ErrorCode::DuplicateMapKey, 0));
+                }
             }
         }
 

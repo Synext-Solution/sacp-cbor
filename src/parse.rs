@@ -734,16 +734,23 @@ enum BuildFrame {
         entries: Vec<(Box<str>, CborValue)>,
         remaining_pairs: usize,
         key: Option<Box<str>>,
+        prev_key_range: Option<(usize, usize)>,
     },
 }
 
 #[cfg(feature = "alloc")]
-fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, usize), CborError> {
+fn decode_value_inner(
+    data: &[u8],
+    start: usize,
+    limits: Option<DecodeLimits>,
+    mode: Mode,
+) -> Result<(CborValue, usize), CborError> {
     use crate::alloc_util::try_vec_with_capacity;
 
-    let mut p = Parser::new(data, start, None, Mode::Trusted);
+    let mut p = Parser::new(data, start, limits, mode);
     let mut stack: Vec<BuildFrame> = Vec::new();
     let mut pending: Option<CborValue> = None;
+    let mut depth: usize = 0;
 
     loop {
         if let Some(value) = pending.take() {
@@ -757,6 +764,7 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                         if *remaining == 0 {
                             let items = core::mem::take(items);
                             stack.pop();
+                            depth = depth.saturating_sub(1);
                             pending = Some(CborValue::array(items));
                         }
                     }
@@ -764,6 +772,7 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                         entries,
                         remaining_pairs,
                         key,
+                        prev_key_range: _,
                     } => {
                         let Some(k) = key.take() else {
                             return Err(CborError::new(ErrorCode::MalformedCanonical, p.pos));
@@ -775,6 +784,7 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                         if *remaining_pairs == 0 {
                             let entries = core::mem::take(entries);
                             stack.pop();
+                            depth = depth.saturating_sub(1);
                             pending = Some(CborValue::map(CborMap::from_sorted_entries(entries)));
                         }
                     }
@@ -785,21 +795,27 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
             continue;
         }
 
-        if let Some(BuildFrame::Map { key, .. }) = stack.last_mut() {
+        if let Some(BuildFrame::Map {
+            key,
+            prev_key_range,
+            ..
+        }) = stack.last_mut()
+        {
             if key.is_none() {
-                let k = parse_map_key(&mut p)?;
+                let k = parse_map_key(&mut p, prev_key_range)?;
                 *key = Some(k);
                 continue;
             }
         }
 
-        match parse_item(&mut p)? {
+        match parse_item(&mut p, depth)? {
             ParsedItem::Value(v) => pending = Some(v),
             ParsedItem::ArrayStart { len } => {
                 if len == 0 {
                     pending = Some(CborValue::array(Vec::new()));
                 } else {
                     try_reserve(&mut stack, 1, p.pos)?;
+                    depth = depth.saturating_add(1);
                     stack.push(BuildFrame::Array {
                         items: try_vec_with_capacity(len, p.pos)?,
                         remaining: len,
@@ -811,10 +827,12 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                     pending = Some(CborValue::map(CborMap::from_sorted_entries(Vec::new())));
                 } else {
                     try_reserve(&mut stack, 1, p.pos)?;
+                    depth = depth.saturating_add(1);
                     stack.push(BuildFrame::Map {
                         entries: try_vec_with_capacity(len, p.pos)?,
                         remaining_pairs: len,
                         key: None,
+                        prev_key_range: None,
                     });
                 }
             }
@@ -828,7 +846,7 @@ pub fn decode_value_trusted_range(
     start: usize,
     end: usize,
 ) -> Result<CborValue, CborError> {
-    let (value, pos) = decode_value_trusted_inner(data, start)?;
+    let (value, pos) = decode_value_inner(data, start, None, Mode::Trusted)?;
     if pos != end {
         return Err(CborError::new(ErrorCode::MalformedCanonical, start));
     }
@@ -836,10 +854,31 @@ pub fn decode_value_trusted_range(
 }
 
 #[cfg(feature = "alloc")]
-fn parse_map_key(p: &mut Parser<'_>) -> Result<Box<str>, CborError> {
+pub fn decode_value_checked_range(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    limits: DecodeLimits,
+) -> Result<CborValue, CborError> {
+    if data.len() > limits.max_input_bytes {
+        return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
+    }
+    let (value, pos) = decode_value_inner(data, start, Some(limits), Mode::Checked)?;
+    if pos != end {
+        return Err(CborError::new(ErrorCode::TrailingBytes, pos));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "alloc")]
+fn parse_map_key(
+    p: &mut Parser<'_>,
+    prev_key_range: &mut Option<(usize, usize)>,
+) -> Result<Box<str>, CborError> {
     use crate::alloc_util::try_box_str_from_str;
 
     let off = p.pos;
+    let key_start = p.pos;
     let ib = p.read_u8()?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
@@ -847,14 +886,37 @@ fn parse_map_key(p: &mut Parser<'_>) -> Result<Box<str>, CborError> {
         return Err(CborError::new(ErrorCode::MapKeyMustBeText, off));
     }
     let len = p.read_len(ai, off)?;
+    if let Some(limits) = p.limits {
+        Parser::enforce_len(
+            len,
+            limits.max_text_len,
+            ErrorCode::TextLenLimitExceeded,
+            off,
+        )?;
+    }
     let bytes = p.read_exact(len)?;
     let text =
         core::str::from_utf8(bytes).map_err(|_| CborError::new(ErrorCode::Utf8Invalid, off))?;
+    let key_end = p.pos;
+    if p.mode == Mode::Checked {
+        let curr = &p.data[key_start..key_end];
+        if let Some((ps, pe)) = *prev_key_range {
+            let prev = &p.data[ps..pe];
+            if prev == curr {
+                return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+            }
+            if !is_strictly_increasing_encoded(prev, curr) {
+                return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+            }
+        }
+        *prev_key_range = Some((key_start, key_end));
+    }
     try_box_str_from_str(text, off)
 }
 
 #[cfg(feature = "alloc")]
-fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
+#[allow(clippy::too_many_lines)]
+fn parse_item(p: &mut Parser<'_>, depth: usize) -> Result<ParsedItem, CborError> {
     use crate::alloc_util::{try_box_str_from_str, try_vec_from_slice};
 
     let off = p.pos;
@@ -865,6 +927,9 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
     match major {
         0 => {
             let v = p.read_uint_arg(ai, off)?;
+            if p.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
+                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+            }
             let v_i64 = i64::try_from(v)
                 .map_err(|_| CborError::new(ErrorCode::IntegerOutsideSafeRange, off))?;
             Ok(ParsedItem::Value(CborValue::integer(
@@ -873,6 +938,9 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
         }
         1 => {
             let n = p.read_uint_arg(ai, off)?;
+            if p.mode == Mode::Checked && n >= MAX_SAFE_INTEGER {
+                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+            }
             let n_i128 = i128::from(n);
             let v_i128 = -1 - n_i128;
             let v_i64 = i64::try_from(v_i128)
@@ -883,12 +951,28 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
         }
         2 => {
             let len = p.read_len(ai, off)?;
+            if let Some(limits) = p.limits {
+                Parser::enforce_len(
+                    len,
+                    limits.max_bytes_len,
+                    ErrorCode::BytesLenLimitExceeded,
+                    off,
+                )?;
+            }
             let bytes = p.read_exact(len)?;
             let out = try_vec_from_slice(bytes, off)?;
             Ok(ParsedItem::Value(CborValue::bytes(out)))
         }
         3 => {
             let len = p.read_len(ai, off)?;
+            if let Some(limits) = p.limits {
+                Parser::enforce_len(
+                    len,
+                    limits.max_text_len,
+                    ErrorCode::TextLenLimitExceeded,
+                    off,
+                )?;
+            }
             let bytes = p.read_exact(len)?;
             let text = core::str::from_utf8(bytes)
                 .map_err(|_| CborError::new(ErrorCode::Utf8Invalid, off))?;
@@ -897,10 +981,32 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
         }
         4 => {
             let len = p.read_len(ai, off)?;
+            if let Some(limits) = p.limits {
+                Parser::enforce_len(
+                    len,
+                    limits.max_array_len,
+                    ErrorCode::ArrayLenLimitExceeded,
+                    off,
+                )?;
+            }
+            if p.mode == Mode::Checked {
+                p.bump_items(len, off)?;
+                Parser::ensure_depth(p, depth + 1, off)?;
+            }
             Ok(ParsedItem::ArrayStart { len })
         }
         5 => {
             let len = p.read_len(ai, off)?;
+            if let Some(limits) = p.limits {
+                Parser::enforce_len(len, limits.max_map_len, ErrorCode::MapLenLimitExceeded, off)?;
+            }
+            if p.mode == Mode::Checked {
+                let items = len
+                    .checked_mul(2)
+                    .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+                p.bump_items(items, off)?;
+                Parser::ensure_depth(p, depth + 1, off)?;
+            }
             Ok(ParsedItem::MapStart { len })
         }
         6 => {
@@ -918,25 +1024,62 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
                 return Err(CborError::new(ErrorCode::ForbiddenOrMalformedTag, m_off));
             }
             let m_len = p.read_len(m_ai, m_off)?;
+            if let Some(limits) = p.limits {
+                Parser::enforce_len(
+                    m_len,
+                    limits.max_bytes_len,
+                    ErrorCode::BytesLenLimitExceeded,
+                    m_off,
+                )?;
+            }
             let mag = p.read_exact(m_len)?;
+            if p.mode == Mode::Checked {
+                validate_bignum_bytes(negative, mag).map_err(|code| CborError::new(code, m_off))?;
+            }
             let mag = try_vec_from_slice(mag, m_off)?;
             let big = BigInt::new_unchecked(negative, mag);
             Ok(ParsedItem::Value(CborValue::integer(
                 CborInteger::from_bigint(big),
             )))
         }
-        7 => match ai {
-            20 => Ok(ParsedItem::Value(CborValue::bool(false))),
-            21 => Ok(ParsedItem::Value(CborValue::bool(true))),
-            22 => Ok(ParsedItem::Value(CborValue::null())),
-            27 => {
-                let bits = p.read_be_u64()?;
-                Ok(ParsedItem::Value(CborValue::float(F64Bits::new_unchecked(
-                    bits,
-                ))))
+        7 => {
+            if p.mode == Mode::Checked {
+                match ai {
+                    20 => Ok(ParsedItem::Value(CborValue::bool(false))),
+                    21 => Ok(ParsedItem::Value(CborValue::bool(true))),
+                    22 => Ok(ParsedItem::Value(CborValue::null())),
+                    27 => {
+                        let bits = p.read_be_u64()?;
+                        validate_f64_bits(bits).map_err(|code| CborError::new(code, off))?;
+                        Ok(ParsedItem::Value(CborValue::float(F64Bits::new_unchecked(
+                            bits,
+                        ))))
+                    }
+                    24 => {
+                        let simple = p.read_u8()?;
+                        if simple < 24 {
+                            return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
+                        }
+                        Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                    }
+                    28..=30 => Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off)),
+                    _ => Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off)),
+                }
+            } else {
+                match ai {
+                    20 => Ok(ParsedItem::Value(CborValue::bool(false))),
+                    21 => Ok(ParsedItem::Value(CborValue::bool(true))),
+                    22 => Ok(ParsedItem::Value(CborValue::null())),
+                    27 => {
+                        let bits = p.read_be_u64()?;
+                        Ok(ParsedItem::Value(CborValue::float(F64Bits::new_unchecked(
+                            bits,
+                        ))))
+                    }
+                    _ => Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off)),
+                }
             }
-            _ => Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off)),
-        },
+        }
         _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
     }
 }

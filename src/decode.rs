@@ -1,4 +1,4 @@
-use crate::parse::{decode_value_trusted_range, validate_canonical};
+use crate::parse::{decode_value_checked_range, decode_value_trusted_range};
 use crate::{CborError, DecodeLimits};
 
 #[cfg(feature = "alloc")]
@@ -13,8 +13,7 @@ use crate::value::CborValue;
 /// Returns an error if validation fails or allocation fails while building the value.
 #[cfg(feature = "alloc")]
 pub fn decode_value(bytes: &[u8], limits: DecodeLimits) -> Result<CborValue, CborError> {
-    let canon = validate_canonical(bytes, limits)?;
-    decode_value_trusted_range(canon.as_bytes(), 0, canon.len())
+    decode_value_checked_range(bytes, 0, bytes.len(), limits)
 }
 
 /// Decode trusted canonical CBOR bytes into an owned [`CborValue`].

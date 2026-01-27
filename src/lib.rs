@@ -102,7 +102,7 @@ pub use crate::edit::{
     ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
 };
 #[cfg(feature = "alloc")]
-pub use crate::encode::{ArrayEncoder, Encoder, MapEncoder};
+pub use crate::encode::{encode_into, ArrayEncoder, Encoder, MapEncoder};
 #[cfg(feature = "alloc")]
 #[doc(hidden)]
 pub use crate::macros::__cbor_macro;
