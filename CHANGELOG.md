@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0
+
+- **Breaking:** renamed canonical owned/borrowed bytes to `CborBytes`/`CborBytesRef` and encoder/editor to `Encoder`/`Editor`.
+- **Breaking:** `CborBytesRef::to_owned()` now returns `Result<CborBytes, CborError>` to surface allocation failures.
+- **Breaking:** array edits are now splice-based; `insert/delete/replace` on array indices are supported and indices are interpreted against the original array.
+- Added array splice API (`Editor::splice`, `ArrayPos`, `ArraySpliceBuilder`) and `push`/`push_encoded` helpers.
+- Made `Encoder::array` and `Encoder::map` transactional on errors.
+- Added `CborBytes::from_vec` / `from_vec_default_limits` for zero-copy owned validation.
+- Added `Encoder::int_i128` / `int_u128` and centralized bignum magnitude handling.
+- Tightened trusted decode to range-checked API and removed redundant trailing-byte validation.
+- Improved allocation-failure handling across fallible APIs.
+
 ## 0.4.1
 
 - Patch release: no-alloc query sorting fix and build hygiene updates.

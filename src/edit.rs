@@ -1,0 +1,1453 @@
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+
+use crate::canonical::{CborBytes, CborBytesRef};
+use crate::encode::{ArrayEncoder, MapEncoder};
+use crate::parse;
+use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding};
+use crate::query::{CborValueRef, PathElem};
+use crate::scalar::F64Bits;
+use crate::value::CborValue;
+use crate::{CborError, Encoder, ErrorCode};
+
+const fn err(code: ErrorCode, offset: usize) -> CborError {
+    CborError::new(code, offset)
+}
+
+const fn invalid_query() -> CborError {
+    err(ErrorCode::InvalidQuery, 0)
+}
+
+const fn patch_conflict() -> CborError {
+    err(ErrorCode::PatchConflict, 0)
+}
+
+const fn missing_key(offset: usize) -> CborError {
+    err(ErrorCode::MissingKey, offset)
+}
+
+const fn index_out_of_bounds(offset: usize) -> CborError {
+    err(ErrorCode::IndexOutOfBounds, offset)
+}
+
+const fn length_overflow(offset: usize) -> CborError {
+    err(ErrorCode::LengthOverflow, offset)
+}
+
+/// Mode for map set operations.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMode {
+    /// Insert or replace the target key (default).
+    Upsert,
+    /// Insert only; error if the key already exists.
+    InsertOnly,
+    /// Replace only; error if the key is missing.
+    ReplaceOnly,
+}
+
+/// Mode for delete operations.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Require the key to exist (default).
+    Require,
+    /// Ignore missing keys.
+    IfPresent,
+}
+
+/// Array splice position.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayPos {
+    /// Splice at the given index.
+    At(usize),
+    /// Splice at the end of the array.
+    End,
+}
+
+/// Edit behavior options.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EditOptions {
+    /// Allow creating missing map containers when descending into absent keys.
+    pub create_missing_maps: bool,
+}
+
+/// Incremental editor for canonical CBOR bytes.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[derive(Debug)]
+pub struct Editor<'a> {
+    root: CborValueRef<'a>,
+    options: EditOptions,
+    ops: Node<'a>,
+}
+
+impl<'a> Editor<'a> {
+    pub(crate) const fn new(root: CborValueRef<'a>) -> Self {
+        Self {
+            root,
+            options: EditOptions {
+                create_missing_maps: false,
+            },
+            ops: Node::new(),
+        }
+    }
+
+    /// Returns mutable access to editor options.
+    pub fn options_mut(&mut self) -> &mut EditOptions {
+        &mut self.options
+    }
+
+    /// Start building an array splice at `array_path`.
+    ///
+    /// `array_path` must resolve to an array at apply time. Indices are interpreted
+    /// against the original array (before edits).
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on invalid paths or malformed splice parameters.
+    pub fn splice<'p>(
+        &'p mut self,
+        array_path: &'p [PathElem<'p>],
+        pos: ArrayPos,
+        delete: usize,
+    ) -> Result<ArraySpliceBuilder<'p, 'a, 'p>, CborError> {
+        if matches!(pos, ArrayPos::End) && delete != 0 {
+            return Err(invalid_query());
+        }
+        Ok(ArraySpliceBuilder {
+            editor: self,
+            path: array_path,
+            pos,
+            delete,
+            inserts: Vec::new(),
+            bounds: BoundsMode::Require,
+        })
+    }
+
+    /// Append a value to the end of an array.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` for invalid paths or encoding failure.
+    pub fn push<T: EditEncode<'a>>(
+        &mut self,
+        array_path: &[PathElem<'_>],
+        value: T,
+    ) -> Result<(), CborError> {
+        self.splice(array_path, ArrayPos::End, 0)?
+            .insert(value)?
+            .finish()
+    }
+
+    /// Append an encoded value to the end of an array.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` for invalid paths or encoding failure.
+    pub fn push_encoded<F>(&mut self, array_path: &[PathElem<'_>], f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        self.splice(array_path, ArrayPos::End, 0)?
+            .insert_encoded(f)?
+            .finish()
+    }
+
+    /// Set or replace the value at `path`.
+    ///
+    /// For map keys this performs an upsert; for arrays it replaces the element.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on invalid paths, conflicts, or encoding failure.
+    pub fn set<T: EditEncode<'a>>(
+        &mut self,
+        path: &[PathElem<'_>],
+        value: T,
+    ) -> Result<(), CborError> {
+        self.set_with_mode(path, SetMode::Upsert, value)
+    }
+
+    /// Insert an entry at `path`.
+    ///
+    /// For map keys this inserts the key. For arrays this inserts before the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key already exists or if the path is invalid.
+    pub fn insert<T: EditEncode<'a>>(
+        &mut self,
+        path: &[PathElem<'_>],
+        value: T,
+    ) -> Result<(), CborError> {
+        self.set_with_mode(path, SetMode::InsertOnly, value)
+    }
+
+    /// Replace an entry at `path`.
+    ///
+    /// For map keys this replaces the key. For arrays this replaces the element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is missing or if the path is invalid.
+    pub fn replace<T: EditEncode<'a>>(
+        &mut self,
+        path: &[PathElem<'_>],
+        value: T,
+    ) -> Result<(), CborError> {
+        self.set_with_mode(path, SetMode::ReplaceOnly, value)
+    }
+
+    /// Set a value from an existing canonical value reference without re-encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on invalid paths or conflicts.
+    pub fn set_raw(
+        &mut self,
+        path: &[PathElem<'_>],
+        value: CborValueRef<'a>,
+    ) -> Result<(), CborError> {
+        self.insert_terminal(
+            path,
+            Terminal::Set {
+                mode: SetMode::Upsert,
+                value: EditValue::Raw(value),
+            },
+        )
+    }
+
+    /// Encode a value using a `Encoder` and set it at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if encoding fails or if the encoded bytes are not a single CBOR item.
+    pub fn set_encoded<F>(&mut self, path: &[PathElem<'_>], f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        let bytes = encode_with(f)?;
+        self.insert_terminal(
+            path,
+            Terminal::Set {
+                mode: SetMode::Upsert,
+                value: EditValue::BytesOwned(bytes),
+            },
+        )
+    }
+
+    /// Delete an entry at `path`.
+    ///
+    /// For map keys this deletes the key. For arrays this deletes the element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is missing or if the path is invalid.
+    pub fn delete(&mut self, path: &[PathElem<'_>]) -> Result<(), CborError> {
+        self.insert_terminal(
+            path,
+            Terminal::Delete {
+                mode: DeleteMode::Require,
+            },
+        )
+    }
+
+    /// Delete an entry at `path` if present.
+    ///
+    /// For map keys this ignores missing keys. For arrays this ignores out-of-bounds indices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths or conflicts.
+    pub fn delete_if_present(&mut self, path: &[PathElem<'_>]) -> Result<(), CborError> {
+        self.insert_terminal(
+            path,
+            Terminal::Delete {
+                mode: DeleteMode::IfPresent,
+            },
+        )
+    }
+
+    /// Apply all recorded edits and return updated canonical CBOR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any edit is invalid, conflicts, or fails during encoding.
+    pub fn apply(self) -> Result<CborBytes, CborError> {
+        let mut enc = Encoder::with_capacity(self.root.len());
+        emit_value(&mut enc, self.root, &self.ops, self.options)?;
+        Ok(enc.into_canonical())
+    }
+
+    fn set_with_mode<T: EditEncode<'a>>(
+        &mut self,
+        path: &[PathElem<'_>],
+        mode: SetMode,
+        value: T,
+    ) -> Result<(), CborError> {
+        let new_value = value.into_value()?;
+        self.insert_terminal(
+            path,
+            Terminal::Set {
+                mode,
+                value: new_value,
+            },
+        )
+    }
+
+    fn insert_terminal(
+        &mut self,
+        path: &[PathElem<'_>],
+        terminal: Terminal<'a>,
+    ) -> Result<(), CborError> {
+        if path.is_empty() {
+            return Err(invalid_query());
+        }
+        if let Some(PathElem::Index(index)) = path.last() {
+            let parent = &path[..path.len() - 1];
+            let splice = match terminal {
+                Terminal::Delete { mode } => ArraySplice {
+                    pos: ArrayPos::At(*index),
+                    delete: 1,
+                    inserts: Vec::new(),
+                    bounds: match mode {
+                        DeleteMode::Require => BoundsMode::Require,
+                        DeleteMode::IfPresent => BoundsMode::IfPresent,
+                    },
+                },
+                Terminal::Set { mode, value } => {
+                    let (delete, bounds) = match mode {
+                        SetMode::InsertOnly => (0, BoundsMode::Require),
+                        SetMode::Upsert | SetMode::ReplaceOnly => (1, BoundsMode::Require),
+                    };
+                    let mut inserts = crate::alloc_util::try_vec_with_capacity(1, 0)?;
+                    inserts.push(value);
+                    ArraySplice {
+                        pos: ArrayPos::At(*index),
+                        delete,
+                        inserts,
+                        bounds,
+                    }
+                }
+            };
+            return self.ops.insert_splice(parent, splice);
+        }
+        self.ops.insert(path, terminal)
+    }
+}
+
+/// Encodes a single canonical CBOR value into an `Encoder`.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub trait EditEncode<'a> {
+    /// Encode this value into a canonical CBOR item ready for patching.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if encoding fails or produces invalid canonical CBOR.
+    fn into_value(self) -> Result<EditValue<'a>, CborError>;
+}
+
+impl<'a> EditEncode<'a> for bool {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.bool(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for () {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(Encoder::null)
+    }
+}
+
+impl<'a> EditEncode<'a> for &str {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.text(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for String {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.text(self.as_str()))
+    }
+}
+
+impl<'a> EditEncode<'a> for &[u8] {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.bytes(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for Vec<u8> {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.bytes(self.as_slice()))
+    }
+}
+
+impl<'a> EditEncode<'a> for F64Bits {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.float(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for f64 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.float(F64Bits::try_from_f64(self)?))
+    }
+}
+
+impl<'a> EditEncode<'a> for f32 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.float(F64Bits::try_from_f64(f64::from(self))?))
+    }
+}
+
+impl<'a> EditEncode<'a> for i64 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.int_i128(i128::from(self)))
+    }
+}
+
+impl<'a> EditEncode<'a> for u64 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.int_u128(u128::from(self)))
+    }
+}
+
+impl<'a> EditEncode<'a> for i128 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.int_i128(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for u128 {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.int_u128(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for CborValue {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.value(&self))
+    }
+}
+
+impl<'a> EditEncode<'a> for &CborValue {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        encode_to_vec(|enc| enc.value(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for CborBytesRef<'a> {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        Ok(EditValue::BytesRef(self))
+    }
+}
+
+impl<'a> EditEncode<'a> for CborBytes {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        Ok(EditValue::BytesOwned(self.into_bytes()))
+    }
+}
+
+impl<'a> EditEncode<'a> for &'a CborBytes {
+    fn into_value(self) -> Result<EditValue<'a>, CborError> {
+        Ok(EditValue::BytesRef(CborBytesRef::new(self.as_bytes())))
+    }
+}
+
+/// Builder for an array splice edit.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub struct ArraySpliceBuilder<'e, 'a, 'p> {
+    editor: &'e mut Editor<'a>,
+    path: &'p [PathElem<'p>],
+    pos: ArrayPos,
+    delete: usize,
+    inserts: Vec<EditValue<'a>>,
+    bounds: BoundsMode,
+}
+
+impl<'a> ArraySpliceBuilder<'_, 'a, '_> {
+    /// Insert a value into the splice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if encoding fails.
+    pub fn insert<T: EditEncode<'a>>(mut self, value: T) -> Result<Self, CborError> {
+        let value = value.into_value()?;
+        self.inserts
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        self.inserts.push(value);
+        Ok(self)
+    }
+
+    /// Insert a raw canonical value reference into the splice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on allocation failure.
+    pub fn insert_raw(mut self, value: CborValueRef<'a>) -> Result<Self, CborError> {
+        self.inserts
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        self.inserts.push(EditValue::Raw(value));
+        Ok(self)
+    }
+
+    /// Insert a value encoded via `Encoder` into the splice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if encoding fails.
+    pub fn insert_encoded<F>(mut self, f: F) -> Result<Self, CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        let bytes = encode_with(f)?;
+        self.inserts
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        self.inserts.push(EditValue::BytesOwned(bytes));
+        Ok(self)
+    }
+
+    /// Finalize and record the splice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` for invalid paths or conflicts.
+    pub fn finish(self) -> Result<(), CborError> {
+        let splice = ArraySplice {
+            pos: self.pos,
+            delete: self.delete,
+            inserts: self.inserts,
+            bounds: self.bounds,
+        };
+        self.editor.ops.insert_splice(self.path, splice)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildKind {
+    Key,
+    Index,
+}
+
+impl ChildKind {
+    const fn of(elem: &PathElem<'_>) -> Self {
+        match elem {
+            PathElem::Key(_) => Self::Key,
+            PathElem::Index(_) => Self::Index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathElemOwned {
+    Key(Box<str>),
+    Index(usize),
+}
+
+impl PathElemOwned {
+    fn matches(&self, elem: &PathElem<'_>) -> bool {
+        match (self, elem) {
+            (Self::Key(k), PathElem::Key(v)) => k.as_ref() == *v,
+            (Self::Index(a), PathElem::Index(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Terminal<'a> {
+    Delete { mode: DeleteMode },
+    Set { mode: SetMode, value: EditValue<'a> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundsMode {
+    Require,
+    IfPresent,
+}
+
+#[derive(Debug, Clone)]
+struct ArraySplice<'a> {
+    pos: ArrayPos,
+    delete: usize,
+    inserts: Vec<EditValue<'a>>,
+    bounds: BoundsMode,
+}
+
+#[derive(Debug, Clone)]
+/// Encoded edit value used by the editor.
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub enum EditValue<'a> {
+    /// Splice an existing canonical value reference.
+    Raw(CborValueRef<'a>),
+    /// Splice canonical bytes by reference.
+    BytesRef(CborBytesRef<'a>),
+    /// Splice owned canonical bytes.
+    BytesOwned(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct Node<'a> {
+    terminal: Option<Terminal<'a>>,
+    children: Vec<(PathElemOwned, Node<'a>)>,
+    child_kind: Option<ChildKind>,
+    splices: Vec<ArraySplice<'a>>,
+}
+
+impl<'a> Node<'a> {
+    const fn new() -> Self {
+        Self {
+            terminal: None,
+            children: Vec::new(),
+            child_kind: None,
+            splices: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.terminal.is_none() && self.children.is_empty() && self.splices.is_empty()
+    }
+
+    fn insert(&mut self, path: &[PathElem<'_>], terminal: Terminal<'a>) -> Result<(), CborError> {
+        let mut cur = self;
+
+        for (idx, pe) in path.iter().enumerate() {
+            if cur.terminal.is_some() {
+                return Err(patch_conflict());
+            }
+
+            let kind = ChildKind::of(pe);
+            cur.ensure_child_kind(kind)?;
+            let child = cur.child_mut(pe)?;
+
+            if idx + 1 == path.len() {
+                if child.terminal.is_some()
+                    || !child.children.is_empty()
+                    || !child.splices.is_empty()
+                {
+                    return Err(patch_conflict());
+                }
+                child.terminal = Some(terminal);
+                return Ok(());
+            }
+
+            cur = child;
+        }
+
+        Err(invalid_query())
+    }
+
+    fn insert_splice(
+        &mut self,
+        path: &[PathElem<'_>],
+        splice: ArraySplice<'a>,
+    ) -> Result<(), CborError> {
+        let mut cur = self;
+
+        for pe in path {
+            if cur.terminal.is_some() {
+                return Err(patch_conflict());
+            }
+            let kind = ChildKind::of(pe);
+            cur.ensure_child_kind(kind)?;
+            cur = cur.child_mut(pe)?;
+        }
+
+        if cur.terminal.is_some() {
+            return Err(patch_conflict());
+        }
+        cur.ensure_child_kind(ChildKind::Index)?;
+
+        if matches!(splice.pos, ArrayPos::End) && splice.delete != 0 {
+            return Err(invalid_query());
+        }
+
+        for existing in &cur.splices {
+            if existing.pos == splice.pos {
+                return Err(patch_conflict());
+            }
+            if let (ArrayPos::At(a), ArrayPos::At(b)) = (existing.pos, splice.pos) {
+                let a_end = a.saturating_add(existing.delete);
+                let b_end = b.saturating_add(splice.delete);
+                if (a < b && a_end > b) || (b < a && b_end > a) {
+                    return Err(patch_conflict());
+                }
+            }
+        }
+
+        cur.splices
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        cur.splices.push(splice);
+        Ok(())
+    }
+
+    fn ensure_child_kind(&mut self, kind: ChildKind) -> Result<(), CborError> {
+        match self.child_kind {
+            None => {
+                self.child_kind = Some(kind);
+                Ok(())
+            }
+            Some(existing) if existing == kind => Ok(()),
+            Some(_) => Err(patch_conflict()),
+        }
+    }
+
+    fn child_mut(&mut self, elem: &PathElem<'_>) -> Result<&mut Self, CborError> {
+        if let Some(idx) = self
+            .children
+            .iter()
+            .position(|(owned, _)| owned.matches(elem))
+        {
+            return Ok(&mut self.children[idx].1);
+        }
+
+        let owned = match elem {
+            PathElem::Key(k) => {
+                checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
+                PathElemOwned::Key(boxed_str(k)?)
+            }
+            PathElem::Index(i) => PathElemOwned::Index(*i),
+        };
+
+        self.children
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        self.children.push((owned, Node::new()));
+        let idx = self.children.len() - 1;
+        Ok(&mut self.children[idx].1)
+    }
+}
+
+struct KeyChild<'a> {
+    key: &'a str,
+    node: &'a Node<'a>,
+}
+
+struct IndexChild<'a> {
+    index: usize,
+    node: &'a Node<'a>,
+}
+
+struct ResolvedSplice<'a> {
+    start: usize,
+    delete: usize,
+    inserts: &'a [EditValue<'a>],
+}
+
+fn boxed_str(s: &str) -> Result<Box<str>, CborError> {
+    let mut out = String::new();
+    out.try_reserve_exact(s.len())
+        .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+    out.push_str(s);
+    Ok(out.into_boxed_str())
+}
+
+fn encode_with<F>(f: F) -> Result<Vec<u8>, CborError>
+where
+    F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+{
+    let mut enc = Encoder::new();
+    f(&mut enc)?;
+    let bytes = enc.into_vec();
+    ensure_single_item(&bytes)?;
+    Ok(bytes)
+}
+
+fn ensure_single_item(bytes: &[u8]) -> Result<(), CborError> {
+    let end = parse::value_end_trusted(bytes, 0)?;
+    if end != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, end));
+    }
+    Ok(())
+}
+
+fn encode_to_vec<'a, F>(f: F) -> Result<EditValue<'a>, CborError>
+where
+    F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+{
+    let bytes = encode_with(f)?;
+    Ok(EditValue::BytesOwned(bytes))
+}
+
+trait ValueEncoder {
+    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError>;
+    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError>;
+    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>;
+    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>;
+}
+
+impl ValueEncoder for Encoder {
+    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
+        Self::raw_value_ref(self, v)
+    }
+
+    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
+        Self::raw_cbor(self, v)
+    }
+
+    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
+    {
+        Self::map(self, len, f)
+    }
+
+    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
+    {
+        Self::array(self, len, f)
+    }
+}
+
+impl ValueEncoder for ArrayEncoder<'_> {
+    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
+        ArrayEncoder::raw_value_ref(self, v)
+    }
+
+    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
+        ArrayEncoder::raw_cbor(self, v)
+    }
+
+    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
+    {
+        ArrayEncoder::map(self, len, f)
+    }
+
+    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
+    {
+        ArrayEncoder::array(self, len, f)
+    }
+}
+
+fn write_new_value<E: ValueEncoder>(enc: &mut E, value: &EditValue<'_>) -> Result<(), CborError> {
+    match value {
+        EditValue::Raw(v) => enc.raw_value_ref(*v),
+        EditValue::BytesRef(b) => enc.raw_cbor(*b),
+        EditValue::BytesOwned(b) => enc.raw_cbor(CborBytesRef::new(b.as_slice())),
+    }
+}
+
+fn emit_value<'a, E: ValueEncoder>(
+    enc: &mut E,
+    src: CborValueRef<'a>,
+    node: &Node<'a>,
+    options: EditOptions,
+) -> Result<(), CborError> {
+    if node.is_empty() {
+        return enc.raw_value_ref(src);
+    }
+
+    if let Some(term) = node.terminal.as_ref() {
+        return match term {
+            Terminal::Set { value, .. } => write_new_value(enc, value),
+            Terminal::Delete { .. } => Err(invalid_query()),
+        };
+    }
+
+    match node.child_kind {
+        Some(ChildKind::Key) => emit_patched_map(enc, src, node, options),
+        Some(ChildKind::Index) => emit_patched_array(enc, src, node, options),
+        None => enc.raw_value_ref(src),
+    }
+}
+
+fn emit_patched_map<'a, E: ValueEncoder>(
+    enc: &mut E,
+    src: CborValueRef<'a>,
+    node: &Node<'a>,
+    options: EditOptions,
+) -> Result<(), CborError> {
+    let map = src.map()?;
+    let map_off = src.offset();
+    let mut mods = collect_key_children(node, map_off)?;
+
+    if mods.is_empty() {
+        return enc.raw_value_ref(src);
+    }
+
+    mods.sort_by(|a, b| cmp_text_keys_by_canonical_encoding(a.key, b.key));
+    for w in mods.windows(2) {
+        if w[0].key == w[1].key {
+            return Err(patch_conflict());
+        }
+    }
+
+    let out_len = compute_map_len_and_validate(map, &mods, options, map_off)?;
+    enc.map(out_len, |menc| {
+        emit_map_entries(menc, map, &mods, options, map_off)
+    })
+}
+
+fn emit_patched_array<'a, E: ValueEncoder>(
+    enc: &mut E,
+    src: CborValueRef<'a>,
+    node: &Node<'a>,
+    options: EditOptions,
+) -> Result<(), CborError> {
+    let array = src.array()?;
+    let len = array.len();
+    let array_off = src.offset();
+    let mut mods = collect_index_children(node, array_off)?;
+    let splices = collect_splices(node, len, array_off)?;
+
+    if mods.is_empty() && splices.is_empty() {
+        return enc.raw_value_ref(src);
+    }
+
+    mods.sort_by(|a, b| a.index.cmp(&b.index));
+    for w in mods.windows(2) {
+        if w[0].index == w[1].index {
+            return Err(patch_conflict());
+        }
+    }
+
+    if let Some(max) = mods.last().map(|m| m.index) {
+        if max >= len {
+            return Err(index_out_of_bounds(array_off));
+        }
+    }
+
+    ensure_splice_mod_conflicts(&mods, &splices)?;
+    let out_len = compute_array_out_len(len, &splices, array_off)?;
+
+    enc.array(out_len, |aenc| {
+        emit_array_items(aenc, array, &mods, &splices, options, array_off, len)
+    })
+}
+
+fn ensure_splice_mod_conflicts<'a>(
+    mods: &[IndexChild<'a>],
+    splices: &[ResolvedSplice<'a>],
+) -> Result<(), CborError> {
+    if mods.is_empty() || splices.is_empty() {
+        return Ok(());
+    }
+    let mut mod_idx = 0usize;
+    for splice in splices {
+        if splice.delete == 0 {
+            continue;
+        }
+        let end_idx = splice.start.saturating_add(splice.delete);
+        while mod_idx < mods.len() && mods[mod_idx].index < splice.start {
+            mod_idx += 1;
+        }
+        if mod_idx < mods.len() && mods[mod_idx].index < end_idx {
+            return Err(patch_conflict());
+        }
+    }
+    Ok(())
+}
+
+fn compute_array_out_len(
+    len: usize,
+    splices: &[ResolvedSplice<'_>],
+    offset: usize,
+) -> Result<usize, CborError> {
+    let mut out_len = len;
+    for splice in splices {
+        out_len = out_len
+            .checked_sub(splice.delete)
+            .ok_or_else(|| length_overflow(offset))?;
+        out_len = out_len
+            .checked_add(splice.inserts.len())
+            .ok_or_else(|| length_overflow(offset))?;
+    }
+    Ok(out_len)
+}
+
+fn emit_array_items<'a, E: ValueEncoder>(
+    aenc: &mut E,
+    array: crate::query::ArrayRef<'a>,
+    mods: &[IndexChild<'a>],
+    splices: &[ResolvedSplice<'a>],
+    options: EditOptions,
+    array_off: usize,
+    len: usize,
+) -> Result<(), CborError> {
+    let mut splice_iter = splices.iter().peekable();
+    let mut mods_iter = mods.iter().peekable();
+    let mut iter = array.iter();
+    let mut idx = 0usize;
+
+    while idx < len {
+        if let Some(splice) = splice_iter.peek() {
+            if splice.start == idx {
+                for value in splice.inserts {
+                    write_new_value(aenc, value)?;
+                }
+                let delete = splice.delete;
+                splice_iter.next();
+                if delete > 0 {
+                    for _ in 0..delete {
+                        let item = iter
+                            .next()
+                            .ok_or_else(|| err(ErrorCode::MalformedCanonical, array_off))??;
+                        let _ = item;
+                    }
+                    idx = idx.saturating_add(delete);
+                    continue;
+                }
+            }
+        }
+
+        let item = iter
+            .next()
+            .ok_or_else(|| err(ErrorCode::MalformedCanonical, array_off))??;
+        match mods_iter.peek() {
+            Some(m) if m.index == idx => {
+                let m = mods_iter.next().ok_or_else(invalid_query)?;
+                if let Some(term) = m.node.terminal.as_ref() {
+                    match term {
+                        Terminal::Delete { .. } => return Err(invalid_query()),
+                        Terminal::Set { mode, value } => {
+                            if *mode == SetMode::InsertOnly {
+                                return Err(invalid_query());
+                            }
+                            write_new_value(aenc, value)?;
+                        }
+                    }
+                } else {
+                    emit_value(aenc, item, m.node, options)?;
+                }
+            }
+            _ => aenc.raw_value_ref(item)?,
+        }
+        idx += 1;
+    }
+
+    for splice in splice_iter {
+        if splice.start != len {
+            return Err(index_out_of_bounds(array_off));
+        }
+        for value in splice.inserts {
+            write_new_value(aenc, value)?;
+        }
+    }
+
+    if mods_iter.peek().is_some() {
+        return Err(index_out_of_bounds(array_off));
+    }
+
+    Ok(())
+}
+
+fn collect_key_children<'a>(
+    node: &'a Node<'a>,
+    offset: usize,
+) -> Result<Vec<KeyChild<'a>>, CborError> {
+    let mut out = crate::alloc_util::try_vec_with_capacity(node.children.len(), offset)?;
+    for (elem, child) in &node.children {
+        match elem {
+            PathElemOwned::Key(k) => out.push(KeyChild {
+                key: k.as_ref(),
+                node: child,
+            }),
+            PathElemOwned::Index(_) => return Err(err(ErrorCode::ExpectedMap, offset)),
+        }
+    }
+    Ok(out)
+}
+
+fn collect_index_children<'a>(
+    node: &'a Node<'a>,
+    offset: usize,
+) -> Result<Vec<IndexChild<'a>>, CborError> {
+    let mut out = crate::alloc_util::try_vec_with_capacity(node.children.len(), offset)?;
+    for (elem, child) in &node.children {
+        match elem {
+            PathElemOwned::Index(i) => out.push(IndexChild {
+                index: *i,
+                node: child,
+            }),
+            PathElemOwned::Key(_) => return Err(err(ErrorCode::ExpectedArray, offset)),
+        }
+    }
+    Ok(out)
+}
+
+fn collect_splices<'a>(
+    node: &'a Node<'a>,
+    len: usize,
+    offset: usize,
+) -> Result<Vec<ResolvedSplice<'a>>, CborError> {
+    let mut out = crate::alloc_util::try_vec_with_capacity(node.splices.len(), offset)?;
+    for splice in &node.splices {
+        if matches!(splice.pos, ArrayPos::End) && splice.delete != 0 {
+            return Err(invalid_query());
+        }
+        let start = match splice.pos {
+            ArrayPos::At(i) => i,
+            ArrayPos::End => len,
+        };
+
+        if start >= len {
+            if splice.bounds == BoundsMode::IfPresent {
+                continue;
+            }
+            if start > len || splice.delete != 0 {
+                return Err(index_out_of_bounds(offset));
+            }
+        }
+
+        if splice.delete > len.saturating_sub(start) {
+            return Err(index_out_of_bounds(offset));
+        }
+
+        out.push(ResolvedSplice {
+            start,
+            delete: splice.delete,
+            inserts: splice.inserts.as_slice(),
+        });
+    }
+
+    out.sort_by(|a, b| a.start.cmp(&b.start));
+    for w in out.windows(2) {
+        if w[0].start == w[1].start {
+            return Err(patch_conflict());
+        }
+        let end = w[0].start.saturating_add(w[0].delete);
+        if end > w[1].start {
+            return Err(patch_conflict());
+        }
+    }
+
+    Ok(out)
+}
+
+fn compute_map_len_and_validate<'a>(
+    map: crate::query::MapRef<'a>,
+    mods: &[KeyChild<'a>],
+    options: EditOptions,
+    map_off: usize,
+) -> Result<usize, CborError> {
+    let mut out_len = map.len();
+    let mut mod_idx = 0usize;
+    let mut iter = map.iter();
+    let mut entry = next_map_entry(&mut iter)?;
+
+    while entry.is_some() || mod_idx < mods.len() {
+        let cur_mod = mods.get(mod_idx);
+        match (entry, cur_mod) {
+            (Some((key, _value)), Some(mod_key)) => {
+                match cmp_text_keys_by_canonical_encoding(key, mod_key.key) {
+                    Ordering::Less => {
+                        entry = next_map_entry(&mut iter)?;
+                    }
+                    Ordering::Equal => {
+                        match mod_key.node.terminal.as_ref() {
+                            Some(Terminal::Delete { .. }) => {
+                                out_len = out_len
+                                    .checked_sub(1)
+                                    .ok_or_else(|| length_overflow(map_off))?;
+                            }
+                            Some(Terminal::Set {
+                                mode: SetMode::InsertOnly,
+                                ..
+                            }) => {
+                                return Err(err(ErrorCode::InvalidQuery, map_off));
+                            }
+                            _ => {}
+                        }
+                        mod_idx += 1;
+                        entry = next_map_entry(&mut iter)?;
+                    }
+                    Ordering::Greater => {
+                        out_len = handle_missing_map_mod(out_len, mod_key, options, map_off)?;
+                        mod_idx += 1;
+                    }
+                }
+            }
+            (Some((_key, _value)), None) => {
+                entry = next_map_entry(&mut iter)?;
+            }
+            (None, Some(mod_key)) => {
+                out_len = handle_missing_map_mod(out_len, mod_key, options, map_off)?;
+                mod_idx += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    Ok(out_len)
+}
+
+fn handle_missing_map_mod(
+    out_len: usize,
+    mod_key: &KeyChild<'_>,
+    options: EditOptions,
+    map_off: usize,
+) -> Result<usize, CborError> {
+    match mod_key.node.terminal.as_ref() {
+        Some(Terminal::Delete {
+            mode: DeleteMode::IfPresent,
+        }) => Ok(out_len),
+        Some(
+            Terminal::Delete {
+                mode: DeleteMode::Require,
+            }
+            | Terminal::Set {
+                mode: SetMode::ReplaceOnly,
+                ..
+            },
+        ) => Err(missing_key(map_off)),
+        Some(Terminal::Set { .. }) => out_len
+            .checked_add(1)
+            .ok_or_else(|| length_overflow(map_off)),
+        None => {
+            if options.create_missing_maps {
+                match mod_key.node.child_kind {
+                    Some(ChildKind::Key) => out_len
+                        .checked_add(1)
+                        .ok_or_else(|| length_overflow(map_off)),
+                    _ => Err(err(ErrorCode::InvalidQuery, map_off)),
+                }
+            } else {
+                Err(missing_key(map_off))
+            }
+        }
+    }
+}
+
+fn emit_map_entries<'a>(
+    menc: &mut MapEncoder<'_>,
+    map: crate::query::MapRef<'a>,
+    mods: &[KeyChild<'a>],
+    options: EditOptions,
+    map_off: usize,
+) -> Result<(), CborError> {
+    let mut mod_idx = 0usize;
+    let mut iter = map.iter();
+    let mut entry = next_map_entry(&mut iter)?;
+
+    while entry.is_some() || mod_idx < mods.len() {
+        let cur_mod = mods.get(mod_idx);
+        match (entry, cur_mod) {
+            (Some((key, value)), Some(mod_key)) => {
+                match cmp_text_keys_by_canonical_encoding(key, mod_key.key) {
+                    Ordering::Less => {
+                        let value_ref = value;
+                        menc.entry(key, |venc| venc.raw_value_ref(value_ref))?;
+                        entry = next_map_entry(&mut iter)?;
+                    }
+                    Ordering::Equal => {
+                        match mod_key.node.terminal.as_ref() {
+                            Some(Terminal::Delete { .. }) => {}
+                            Some(Terminal::Set {
+                                mode: SetMode::InsertOnly,
+                                ..
+                            }) => {
+                                return Err(err(ErrorCode::InvalidQuery, map_off));
+                            }
+                            Some(Terminal::Set { value, .. }) => {
+                                menc.entry(key, |venc| write_new_value(venc, value))?;
+                            }
+                            None => {
+                                let value_ref = value;
+                                menc.entry(key, |venc| {
+                                    emit_value(venc, value_ref, mod_key.node, options)
+                                })?;
+                            }
+                        }
+                        mod_idx += 1;
+                        entry = next_map_entry(&mut iter)?;
+                    }
+                    Ordering::Greater => {
+                        emit_missing_map_entry(menc, mod_key, options, map_off)?;
+                        mod_idx += 1;
+                    }
+                }
+            }
+            (Some((key, value)), None) => {
+                let value_ref = value;
+                menc.entry(key, |venc| venc.raw_value_ref(value_ref))?;
+                entry = next_map_entry(&mut iter)?;
+            }
+            (None, Some(mod_key)) => {
+                emit_missing_map_entry(menc, mod_key, options, map_off)?;
+                mod_idx += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_missing_map_entry(
+    menc: &mut MapEncoder<'_>,
+    mod_key: &KeyChild<'_>,
+    options: EditOptions,
+    map_off: usize,
+) -> Result<(), CborError> {
+    match mod_key.node.terminal.as_ref() {
+        Some(Terminal::Delete {
+            mode: DeleteMode::IfPresent,
+        }) => Ok(()),
+        Some(
+            Terminal::Delete {
+                mode: DeleteMode::Require,
+            }
+            | Terminal::Set {
+                mode: SetMode::ReplaceOnly,
+                ..
+            },
+        ) => Err(missing_key(map_off)),
+        Some(Terminal::Set { value, .. }) => {
+            menc.entry(mod_key.key, |venc| write_new_value(venc, value))
+        }
+        None => {
+            if options.create_missing_maps {
+                match mod_key.node.child_kind {
+                    Some(ChildKind::Key) => menc.entry(mod_key.key, |venc| {
+                        emit_created_value(venc, mod_key.node, options)
+                    }),
+                    _ => Err(err(ErrorCode::InvalidQuery, map_off)),
+                }
+            } else {
+                Err(missing_key(map_off))
+            }
+        }
+    }
+}
+
+fn emit_created_value<E: ValueEncoder>(
+    enc: &mut E,
+    node: &Node<'_>,
+    options: EditOptions,
+) -> Result<(), CborError> {
+    if let Some(term) = node.terminal.as_ref() {
+        return match term {
+            Terminal::Set { value, .. } => write_new_value(enc, value),
+            Terminal::Delete { .. } => Err(invalid_query()),
+        };
+    }
+
+    match node.child_kind {
+        Some(ChildKind::Key) => emit_created_map(enc, node, options),
+        _ => Err(invalid_query()),
+    }
+}
+
+fn emit_created_map<E: ValueEncoder>(
+    enc: &mut E,
+    node: &Node<'_>,
+    options: EditOptions,
+) -> Result<(), CborError> {
+    let mut mods = collect_key_children(node, 0)?;
+    mods.sort_by(|a, b| cmp_text_keys_by_canonical_encoding(a.key, b.key));
+    for w in mods.windows(2) {
+        if w[0].key == w[1].key {
+            return Err(patch_conflict());
+        }
+    }
+
+    let mut out_len = 0usize;
+    for m in &mods {
+        match m.node.terminal.as_ref() {
+            Some(Terminal::Delete { .. }) => return Err(invalid_query()),
+            Some(Terminal::Set {
+                mode: SetMode::ReplaceOnly,
+                ..
+            }) => return Err(missing_key(0)),
+            Some(Terminal::Set { .. }) => {
+                out_len = out_len.checked_add(1).ok_or_else(|| length_overflow(0))?;
+            }
+            None => match m.node.child_kind {
+                Some(ChildKind::Key) if options.create_missing_maps => {
+                    out_len = out_len.checked_add(1).ok_or_else(|| length_overflow(0))?;
+                }
+                _ => return Err(missing_key(0)),
+            },
+        }
+    }
+
+    enc.map(out_len, |menc| {
+        for m in &mods {
+            match m.node.terminal.as_ref() {
+                Some(Terminal::Delete { .. }) => return Err(invalid_query()),
+                Some(Terminal::Set { value, .. }) => {
+                    menc.entry(m.key, |venc| write_new_value(venc, value))?;
+                }
+                None => {
+                    menc.entry(m.key, |venc| emit_created_value(venc, m.node, options))?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn next_map_entry<'a, I>(iter: &mut I) -> Result<Option<(&'a str, CborValueRef<'a>)>, CborError>
+where
+    I: Iterator<Item = Result<(&'a str, CborValueRef<'a>), CborError>>,
+{
+    match iter.next() {
+        None => Ok(None),
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => Err(e),
+    }
+}
+
+/// Adds editing methods to `CborBytesRef`.
+impl<'a> CborBytesRef<'a> {
+    /// Create a `Editor` for this message.
+    #[must_use]
+    pub const fn editor(self) -> Editor<'a> {
+        Editor::new(self.root())
+    }
+
+    /// Apply a sequence of edits atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if any edit fails or the patch is invalid.
+    pub fn edit<F>(self, f: F) -> Result<CborBytes, CborError>
+    where
+        F: FnOnce(&mut Editor<'a>) -> Result<(), CborError>,
+    {
+        let mut editor = self.editor();
+        f(&mut editor)?;
+        editor.apply()
+    }
+}
+
+/// Adds editing methods to `CborBytes`.
+impl CborBytes {
+    /// Create a `Editor` for this message.
+    #[must_use]
+    pub fn editor(&self) -> Editor<'_> {
+        Editor::new(self.root())
+    }
+
+    /// Apply a sequence of edits atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if any edit fails or the patch is invalid.
+    pub fn edit<'a, F>(&'a self, f: F) -> Result<Self, CborError>
+    where
+        F: FnOnce(&mut Editor<'a>) -> Result<(), CborError>,
+    {
+        let mut editor = self.editor();
+        f(&mut editor)?;
+        editor.apply()
+    }
+}

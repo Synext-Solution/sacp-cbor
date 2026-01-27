@@ -89,6 +89,11 @@ pub enum ErrorCode {
     /// Expected a float64 at the current location.
     ExpectedFloat,
 
+    /// Patch operations overlap or conflict.
+    PatchConflict,
+    /// Array index is out of bounds.
+    IndexOutOfBounds,
+
     /// Invalid query arguments (e.g., output slice length mismatch).
     InvalidQuery,
     /// Required key missing from map.
@@ -167,6 +172,8 @@ impl fmt::Display for CborError {
             ErrorCode::ExpectedBytes => "expected CBOR byte string",
             ErrorCode::ExpectedBool => "expected CBOR bool",
             ErrorCode::ExpectedFloat => "expected CBOR float64",
+            ErrorCode::PatchConflict => "patch operations conflict",
+            ErrorCode::IndexOutOfBounds => "array index out of bounds",
             ErrorCode::InvalidQuery => "invalid query arguments",
             ErrorCode::MissingKey => "missing required map key",
             ErrorCode::MalformedCanonical => "malformed canonical CBOR",

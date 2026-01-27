@@ -105,14 +105,14 @@ macro_rules! cbor {
 
 /// Construct canonical CBOR bytes directly using a JSON-like literal syntax.
 ///
-/// This macro returns `Result<crate::CanonicalCbor, crate::CborError>`.
+/// This macro returns `Result<crate::CborBytes, crate::CborError>`.
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 #[macro_export]
 macro_rules! cbor_bytes {
     ($($tt:tt)+) => {{
-        (|| -> ::core::result::Result<$crate::CanonicalCbor, $crate::CborError> {
-            let mut __enc = $crate::CanonicalEncoder::new();
+        (|| -> ::core::result::Result<$crate::CborBytes, $crate::CborError> {
+            let mut __enc = $crate::Encoder::new();
             $crate::__cbor_bytes_into!(&mut __enc, $($tt)+)?;
             ::core::result::Result::Ok(__enc.into_canonical())
         })()
@@ -207,9 +207,8 @@ pub mod __cbor_macro {
     pub use alloc::vec::Vec;
 
     use crate::{
-        BigInt, CanonicalCbor, CanonicalCborRef, CanonicalEncoder, CborError, CborInteger, CborMap,
-        CborValue, CborValueRef, ErrorCode, F64Bits, MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64,
-        MIN_SAFE_INTEGER,
+        BigInt, CborBytes, CborBytesRef, CborError, CborInteger, CborMap, CborValue, CborValueRef,
+        Encoder, ErrorCode, F64Bits, MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER,
     };
 
     #[inline]
@@ -431,8 +430,11 @@ pub mod __cbor_macro {
 
     impl IntoCborValue for &[CborValue] {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            // Clone into a new Vec (may allocate).
-            Ok(CborValue::array(self.to_vec()))
+            let mut out: Vec<CborValue> = Vec::new();
+            out.try_reserve_exact(self.len())
+                .map_err(|_| alloc_failed())?;
+            out.extend_from_slice(self);
+            Ok(CborValue::array(out))
         }
     }
 
@@ -484,87 +486,53 @@ pub mod __cbor_macro {
     }
 
     pub trait IntoCborBytes {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError>;
-    }
-
-    fn encode_u128(enc: &mut CanonicalEncoder, v: u128) -> Result<(), CborError> {
-        let safe_max = u128::from(MAX_SAFE_INTEGER);
-        if v <= safe_max {
-            let i = i64::try_from(v).map_err(|_| overflow())?;
-            return enc.int(i);
-        }
-
-        let raw = v.to_be_bytes();
-        let leading = (v.leading_zeros() / 8) as usize;
-        enc.bignum(false, &raw[leading..])
-    }
-
-    fn encode_i128(enc: &mut CanonicalEncoder, v: i128) -> Result<(), CborError> {
-        let min = i128::from(MIN_SAFE_INTEGER);
-        let max = i128::from(MAX_SAFE_INTEGER_I64);
-
-        if v >= min && v <= max {
-            let i = i64::try_from(v).map_err(|_| overflow())?;
-            return enc.int(i);
-        }
-
-        let negative = v < 0;
-        let n_u128 = if negative {
-            let n_i128 = -1_i128 - v;
-            u128::try_from(n_i128).map_err(|_| overflow())?
-        } else {
-            u128::try_from(v).map_err(|_| overflow())?
-        };
-
-        let raw = n_u128.to_be_bytes();
-        let leading = (n_u128.leading_zeros() / 8) as usize;
-        enc.bignum(negative, &raw[leading..])
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError>;
     }
 
     impl IntoCborBytes for CborValue {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.value(&self)
         }
     }
 
     impl IntoCborBytes for &CborValue {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.value(self)
         }
     }
 
-    impl IntoCborBytes for CanonicalCborRef<'_> {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+    impl IntoCborBytes for CborBytesRef<'_> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.raw_cbor(self)
         }
     }
 
-    impl IntoCborBytes for &CanonicalCbor {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
-            enc.raw_cbor(CanonicalCborRef::new(self.as_bytes()))
+    impl IntoCborBytes for &CborBytes {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.raw_cbor(CborBytesRef::new(self.as_bytes()))
         }
     }
 
     impl IntoCborBytes for CborValueRef<'_> {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.raw_value_ref(self)
         }
     }
 
     impl IntoCborBytes for bool {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.bool(self)
         }
     }
 
     impl IntoCborBytes for () {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.null()
         }
     }
 
     impl<T: IntoCborBytes> IntoCborBytes for Option<T> {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             match self {
                 None => enc.null(),
                 Some(v) => v.into_cbor_bytes(enc),
@@ -573,61 +541,61 @@ pub mod __cbor_macro {
     }
 
     impl IntoCborBytes for String {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.text(self.as_str())
         }
     }
 
     impl IntoCborBytes for &String {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.text(self.as_str())
         }
     }
 
     impl IntoCborBytes for &str {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.text(self)
         }
     }
 
     impl IntoCborBytes for Vec<u8> {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.bytes(self.as_slice())
         }
     }
 
     impl IntoCborBytes for &Vec<u8> {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.bytes(self.as_slice())
         }
     }
 
     impl IntoCborBytes for &[u8] {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.bytes(self)
         }
     }
 
     impl<const N: usize> IntoCborBytes for &[u8; N] {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.bytes(&self[..])
         }
     }
 
     impl IntoCborBytes for F64Bits {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.float(self)
         }
     }
 
     impl IntoCborBytes for f64 {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.float(F64Bits::try_from_f64(self)?)
         }
     }
 
     impl IntoCborBytes for f32 {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.float(F64Bits::try_from_f64(f64::from(self))?)
         }
     }
@@ -635,8 +603,8 @@ pub mod __cbor_macro {
     macro_rules! impl_into_int_signed_bytes {
         ($($t:ty),* $(,)?) => {$(
             impl IntoCborBytes for $t {
-                fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
-                    encode_i128(enc, i128::from(self))
+                fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+                    enc.int_i128(i128::from(self))
                 }
             }
         )*};
@@ -645,8 +613,8 @@ pub mod __cbor_macro {
     macro_rules! impl_into_int_unsigned_bytes {
         ($($t:ty),* $(,)?) => {$(
             impl IntoCborBytes for $t {
-                fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
-                    encode_u128(enc, u128::from(self))
+                fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+                    enc.int_u128(u128::from(self))
                 }
             }
         )*};
@@ -656,14 +624,14 @@ pub mod __cbor_macro {
     impl_into_int_unsigned_bytes!(u8, u16, u32, u64, u128);
 
     impl IntoCborBytes for isize {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
-            encode_i128(enc, i128::try_from(self).map_err(|_| overflow())?)
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int_i128(i128::try_from(self).map_err(|_| overflow())?)
         }
     }
 
     impl IntoCborBytes for usize {
-        fn into_cbor_bytes(self, enc: &mut CanonicalEncoder) -> Result<(), CborError> {
-            encode_u128(enc, u128::try_from(self).map_err(|_| overflow())?)
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int_u128(u128::try_from(self).map_err(|_| overflow())?)
         }
     }
 }

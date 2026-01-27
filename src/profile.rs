@@ -114,15 +114,12 @@ pub fn is_strictly_increasing_encoded(prev: &[u8], curr: &[u8]) -> bool {
 /// 1) shorter encoded key sorts first (this includes the header bytes), then
 /// 2) lexicographic ordering of the encoded key bytes.
 ///
-/// For text strings, once encoded length is equal, the header bytes are equal and the lexicographic
-/// ordering reduces to lexicographic ordering of UTF-8 bytes.
+/// For text strings, encoded length is strictly monotone in payload length, so this reduces to
+/// comparing payload lengths and then the UTF-8 bytes.
 #[inline]
 #[must_use]
 pub fn cmp_text_keys_by_canonical_encoding(a: &str, b: &str) -> Ordering {
-    let a_len = encoded_text_len(a.len());
-    let b_len = encoded_text_len(b.len());
-
-    match a_len.cmp(&b_len) {
+    match a.len().cmp(&b.len()) {
         Ordering::Equal => a.as_bytes().cmp(b.as_bytes()),
         other => other,
     }
@@ -152,25 +149,4 @@ pub fn checked_text_len(n: usize) -> Result<u64, ErrorCode> {
         9
     };
     n_u64.checked_add(header).ok_or(ErrorCode::LengthOverflow)
-}
-
-/// Return the length in bytes of the canonical CBOR encoding of a text string payload of length `n`.
-///
-/// This assumes `checked_text_len(n)` has already been enforced.
-#[inline]
-#[must_use]
-pub const fn encoded_text_len(n: usize) -> u64 {
-    let n_u64 = n as u64;
-    let header = if n < 24 {
-        1
-    } else if n <= 0xff {
-        2
-    } else if n <= 0xffff {
-        3
-    } else if n <= 0xffff_ffff {
-        5
-    } else {
-        9
-    };
-    n_u64 + header
 }

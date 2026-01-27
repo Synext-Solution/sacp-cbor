@@ -7,9 +7,10 @@ use serde::de::{DeserializeOwned, IntoDeserializer, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::int::{integer_from_i128, integer_from_u128};
 use crate::profile::{CANONICAL_NAN_BITS, NEGATIVE_ZERO_BITS};
 use crate::scalar::F64Bits;
-use crate::value::{BigInt, CborInteger, CborMap, CborValue, ValueRepr};
+use crate::value::{BigInt, CborMap, CborValue, ValueRepr};
 use crate::{CborError, DecodeLimits, ErrorCode};
 
 impl Serialize for CborValue {
@@ -157,22 +158,28 @@ impl<'de> Visitor<'de> for CborValueVisitor {
         Ok(CborValue::float(bits))
     }
 
-    fn visit_char<E>(self, v: char) -> Result<Self::Value, E> {
+    fn visit_char<E: serde::de::Error>(self, v: char) -> Result<Self::Value, E> {
         let mut buf = [0u8; 4];
         let s = v.encode_utf8(&mut buf);
-        Ok(CborValue::text(s))
+        let boxed = crate::alloc_util::try_box_str_from_str(s, 0)
+            .map_err(|_| E::custom("allocation failed"))?;
+        Ok(CborValue::text(boxed))
     }
 
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(CborValue::text(v))
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        let boxed = crate::alloc_util::try_box_str_from_str(v, 0)
+            .map_err(|_| E::custom("allocation failed"))?;
+        Ok(CborValue::text(boxed))
     }
 
     fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
         Ok(CborValue::text(v))
     }
 
-    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> {
-        Ok(CborValue::bytes(v.to_vec()))
+    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+        let out = crate::alloc_util::try_vec_from_slice(v, 0)
+            .map_err(|_| E::custom("allocation failed"))?;
+        Ok(CborValue::bytes(out))
     }
 
     fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E> {
@@ -191,8 +198,15 @@ impl<'de> Visitor<'de> for CborValueVisitor {
     where
         A: serde::de::SeqAccess<'de>,
     {
-        let mut items: Vec<CborValue> = Vec::new();
+        let mut items: Vec<CborValue> = match seq.size_hint() {
+            Some(len) => crate::alloc_util::try_vec_with_capacity(len, 0)
+                .map_err(|_| <A::Error as serde::de::Error>::custom("allocation failed"))?,
+            None => Vec::new(),
+        };
         while let Some(v) = seq.next_element::<CborValue>()? {
+            items
+                .try_reserve(1)
+                .map_err(|_| <A::Error as serde::de::Error>::custom("allocation failed"))?;
             items.push(v);
         }
         Ok(CborValue::array(items))
@@ -202,8 +216,15 @@ impl<'de> Visitor<'de> for CborValueVisitor {
     where
         M: serde::de::MapAccess<'de>,
     {
-        let mut entries: Vec<(Box<str>, CborValue)> = Vec::new();
+        let mut entries: Vec<(Box<str>, CborValue)> = match map.size_hint() {
+            Some(len) => crate::alloc_util::try_vec_with_capacity(len, 0)
+                .map_err(|_| <M::Error as serde::de::Error>::custom("allocation failed"))?,
+            None => Vec::new(),
+        };
         while let Some((k, v)) = map.next_entry::<Box<str>, CborValue>()? {
+            entries
+                .try_reserve(1)
+                .map_err(|_| <M::Error as serde::de::Error>::custom("allocation failed"))?;
             entries.push((k, v));
         }
         let map = CborMap::new(entries)
@@ -267,6 +288,10 @@ struct SerdeError {
 impl SerdeError {
     const fn with_code(code: ErrorCode) -> Self {
         Self { code }
+    }
+
+    const fn alloc_failed() -> Self {
+        Self::with_code(ErrorCode::AllocationFailed)
     }
 }
 
@@ -367,15 +392,21 @@ impl Serializer for CborSerializer {
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
         let s = v.encode_utf8(&mut buf);
-        Ok(CborValue::text(s))
+        let boxed = crate::alloc_util::try_box_str_from_str(s, 0)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        Ok(CborValue::text(boxed))
     }
 
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::text(v))
+        let boxed = crate::alloc_util::try_box_str_from_str(v, 0)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        Ok(CborValue::text(boxed))
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::bytes(v.to_vec()))
+        let out =
+            crate::alloc_util::try_vec_from_slice(v, 0).map_err(|_| SerdeError::alloc_failed())?;
+        Ok(CborValue::bytes(out))
     }
 
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
@@ -423,11 +454,11 @@ impl Serializer for CborSerializer {
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        Ok(SeqSerializer::new(len))
+        SeqSerializer::new(len)
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        Ok(SeqSerializer::new(Some(len)))
+        SeqSerializer::new(Some(len))
     }
 
     fn serialize_tuple_struct(
@@ -435,7 +466,7 @@ impl Serializer for CborSerializer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        Ok(SeqSerializer::new(Some(len)))
+        SeqSerializer::new(Some(len))
     }
 
     fn serialize_tuple_variant(
@@ -445,11 +476,11 @@ impl Serializer for CborSerializer {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        Ok(TupleVariantSerializer::new(variant, Some(len)))
+        TupleVariantSerializer::new(variant, Some(len))
     }
 
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        Ok(MapSerializer::new(len))
+        MapSerializer::new(len)
     }
 
     fn serialize_struct(
@@ -457,7 +488,7 @@ impl Serializer for CborSerializer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
-        Ok(StructSerializer::new(Some(len)))
+        StructSerializer::new(Some(len))
     }
 
     fn serialize_struct_variant(
@@ -467,7 +498,7 @@ impl Serializer for CborSerializer {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        Ok(StructVariantSerializer::new(variant, Some(len)))
+        StructVariantSerializer::new(variant, Some(len))
     }
 }
 
@@ -476,9 +507,13 @@ struct SeqSerializer {
 }
 
 impl SeqSerializer {
-    fn new(len: Option<usize>) -> Self {
-        let items = len.map_or_else(Vec::new, Vec::with_capacity);
-        Self { items }
+    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
+        let items = match len {
+            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0)
+                .map_err(|_| SerdeError::alloc_failed())?,
+            None => Vec::new(),
+        };
+        Ok(Self { items })
     }
 }
 
@@ -487,6 +522,9 @@ impl SerializeSeq for SeqSerializer {
     type Error = SerdeError;
 
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.items
+            .try_reserve(1)
+            .map_err(|_| SerdeError::alloc_failed())?;
         self.items.push(value.serialize(CborSerializer)?);
         Ok(())
     }
@@ -528,9 +566,13 @@ struct TupleVariantSerializer {
 }
 
 impl TupleVariantSerializer {
-    fn new(variant: &'static str, len: Option<usize>) -> Self {
-        let items = len.map_or_else(Vec::new, Vec::with_capacity);
-        Self { variant, items }
+    fn new(variant: &'static str, len: Option<usize>) -> Result<Self, SerdeError> {
+        let items = match len {
+            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0)
+                .map_err(|_| SerdeError::alloc_failed())?,
+            None => Vec::new(),
+        };
+        Ok(Self { variant, items })
     }
 }
 
@@ -539,6 +581,9 @@ impl serde::ser::SerializeTupleVariant for TupleVariantSerializer {
     type Error = SerdeError;
 
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+        self.items
+            .try_reserve(1)
+            .map_err(|_| SerdeError::alloc_failed())?;
         self.items.push(value.serialize(CborSerializer)?);
         Ok(())
     }
@@ -554,12 +599,16 @@ struct MapSerializer {
 }
 
 impl MapSerializer {
-    fn new(len: Option<usize>) -> Self {
-        let entries = len.map_or_else(Vec::new, Vec::with_capacity);
-        Self {
+    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
+        let entries = match len {
+            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0)
+                .map_err(|_| SerdeError::alloc_failed())?,
+            None => Vec::new(),
+        };
+        Ok(Self {
             entries,
             next_key: None,
-        }
+        })
     }
 }
 
@@ -579,6 +628,9 @@ impl SerializeMap for MapSerializer {
             .take()
             .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
         let val = value.serialize(CborSerializer)?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SerdeError::alloc_failed())?;
         self.entries.push((key, val));
         Ok(())
     }
@@ -599,7 +651,12 @@ impl serde::ser::SerializeStruct for StructSerializer {
         value: &T,
     ) -> Result<(), Self::Error> {
         let val = value.serialize(CborSerializer)?;
-        self.entries.push((Box::from(key), val));
+        let key = crate::alloc_util::try_box_str_from_str(key, 0)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        self.entries.push((key, val));
         Ok(())
     }
 
@@ -614,9 +671,13 @@ struct StructSerializer {
 }
 
 impl StructSerializer {
-    fn new(len: Option<usize>) -> Self {
-        let entries = len.map_or_else(Vec::new, Vec::with_capacity);
-        Self { entries }
+    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
+        let entries = match len {
+            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0)
+                .map_err(|_| SerdeError::alloc_failed())?,
+            None => Vec::new(),
+        };
+        Ok(Self { entries })
     }
 }
 
@@ -626,9 +687,13 @@ struct StructVariantSerializer {
 }
 
 impl StructVariantSerializer {
-    fn new(variant: &'static str, len: Option<usize>) -> Self {
-        let entries = len.map_or_else(Vec::new, Vec::with_capacity);
-        Self { variant, entries }
+    fn new(variant: &'static str, len: Option<usize>) -> Result<Self, SerdeError> {
+        let entries = match len {
+            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0)
+                .map_err(|_| SerdeError::alloc_failed())?,
+            None => Vec::new(),
+        };
+        Ok(Self { variant, entries })
     }
 }
 
@@ -642,7 +707,12 @@ impl serde::ser::SerializeStructVariant for StructVariantSerializer {
         value: &T,
     ) -> Result<(), Self::Error> {
         let val = value.serialize(CborSerializer)?;
-        self.entries.push((Box::from(key), val));
+        let key = crate::alloc_util::try_box_str_from_str(key, 0)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| SerdeError::alloc_failed())?;
+        self.entries.push((key, val));
         Ok(())
     }
 
@@ -667,13 +737,13 @@ impl Serializer for KeySerializer {
     type SerializeStructVariant = Impossible<Box<str>, SerdeError>;
 
     fn serialize_str(self, value: &str) -> Result<Self::Ok, Self::Error> {
-        Ok(Box::from(value))
+        crate::alloc_util::try_box_str_from_str(value, 0).map_err(|_| SerdeError::alloc_failed())
     }
 
     fn serialize_char(self, value: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
         let s = value.encode_utf8(&mut buf);
-        Ok(Box::from(s))
+        crate::alloc_util::try_box_str_from_str(s, 0).map_err(|_| SerdeError::alloc_failed())
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
@@ -1479,49 +1549,23 @@ where
 }
 
 fn enum_map(variant: &str, value: CborValue) -> Result<CborValue, SerdeError> {
-    let map = CborMap::new(vec![(Box::from(variant), value)])
-        .map_err(|err| SerdeError::with_code(err.code))?;
+    let key = crate::alloc_util::try_box_str_from_str(variant, 0)
+        .map_err(|_| SerdeError::alloc_failed())?;
+    let mut entries =
+        crate::alloc_util::try_vec_with_capacity(1, 0).map_err(|_| SerdeError::alloc_failed())?;
+    entries.push((key, value));
+    let map = CborMap::new(entries).map_err(|err| SerdeError::with_code(err.code))?;
     Ok(CborValue::map(map))
 }
 
 fn int_to_value(v: i128) -> Result<CborValue, SerdeError> {
-    let min = i128::from(crate::MIN_SAFE_INTEGER);
-    let max = i128::from(crate::MAX_SAFE_INTEGER_I64);
-    if v >= min && v <= max {
-        let i = i64::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        return Ok(CborValue::integer(CborInteger::new_safe_unchecked(i)));
-    }
-    let negative = v < 0;
-    let n = if negative {
-        u128::try_from(-1 - v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?
-    } else {
-        u128::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?
-    };
-    bignum_from_u128(negative, n)
+    let integer = integer_from_i128(v).map_err(SerdeError::with_code)?;
+    Ok(CborValue::integer(integer))
 }
 
 fn uint_to_value(v: u128) -> Result<CborValue, SerdeError> {
-    let max = u128::from(crate::MAX_SAFE_INTEGER);
-    if v <= max {
-        let i = i64::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        return Ok(CborValue::integer(CborInteger::new_safe_unchecked(i)));
-    }
-    bignum_from_u128(false, v)
-}
-
-fn bignum_from_u128(negative: bool, n: u128) -> Result<CborValue, SerdeError> {
-    let magnitude = u128_to_be_bytes_nonzero(n)?;
-    let bigint = BigInt::new(negative, magnitude).map_err(|err| SerdeError::with_code(err.code))?;
-    Ok(CborValue::integer(CborInteger::from_bigint(bigint)))
-}
-
-fn u128_to_be_bytes_nonzero(n: u128) -> Result<Vec<u8>, SerdeError> {
-    if n == 0 {
-        return Err(SerdeError::with_code(ErrorCode::SerdeError));
-    }
-    let leading_bytes = (n.leading_zeros() / 8) as usize;
-    let bytes = n.to_be_bytes();
-    Ok(bytes[leading_bytes..].to_vec())
+    let integer = integer_from_u128(v).map_err(SerdeError::with_code)?;
+    Ok(CborValue::integer(integer))
 }
 
 fn bigint_to_u128(big: &BigInt) -> Option<u128> {

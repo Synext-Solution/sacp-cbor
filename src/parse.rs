@@ -1,4 +1,4 @@
-use crate::canonical::CanonicalCborRef;
+use crate::canonical::CborBytesRef;
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::MAX_SAFE_INTEGER;
 use crate::profile::{is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits};
@@ -688,7 +688,7 @@ pub fn validate(bytes: &[u8], limits: DecodeLimits) -> Result<(), CborError> {
 pub fn validate_canonical(
     bytes: &'_ [u8],
     limits: DecodeLimits,
-) -> Result<CanonicalCborRef<'_>, CborError> {
+) -> Result<CborBytesRef<'_>, CborError> {
     if bytes.len() > limits.max_input_bytes {
         return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
     }
@@ -696,7 +696,7 @@ pub fn validate_canonical(
     if end != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, end));
     }
-    Ok(CanonicalCborRef::new(bytes))
+    Ok(CborBytesRef::new(bytes))
 }
 
 pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
@@ -734,7 +734,9 @@ enum BuildFrame {
 }
 
 #[cfg(feature = "alloc")]
-pub fn decode_value_trusted(data: &[u8], start: usize) -> Result<(CborValue, usize), CborError> {
+fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, usize), CborError> {
+    use crate::alloc_util::{alloc_failed, try_vec_with_capacity};
+
     let mut p = Parser::new(data, start, None, Mode::Trusted);
     let mut stack: Vec<BuildFrame> = Vec::new();
     let mut pending: Option<CborValue> = None;
@@ -793,8 +795,9 @@ pub fn decode_value_trusted(data: &[u8], start: usize) -> Result<(CborValue, usi
                 if len == 0 {
                     pending = Some(CborValue::array(Vec::new()));
                 } else {
+                    stack.try_reserve(1).map_err(|_| alloc_failed(p.pos))?;
                     stack.push(BuildFrame::Array {
-                        items: Vec::with_capacity(len),
+                        items: try_vec_with_capacity(len, p.pos)?,
                         remaining: len,
                     });
                 }
@@ -803,8 +806,9 @@ pub fn decode_value_trusted(data: &[u8], start: usize) -> Result<(CborValue, usi
                 if len == 0 {
                     pending = Some(CborValue::map(CborMap::from_sorted_entries(Vec::new())));
                 } else {
+                    stack.try_reserve(1).map_err(|_| alloc_failed(p.pos))?;
                     stack.push(BuildFrame::Map {
-                        entries: Vec::with_capacity(len),
+                        entries: try_vec_with_capacity(len, p.pos)?,
                         remaining_pairs: len,
                         key: None,
                     });
@@ -815,7 +819,22 @@ pub fn decode_value_trusted(data: &[u8], start: usize) -> Result<(CborValue, usi
 }
 
 #[cfg(feature = "alloc")]
+pub fn decode_value_trusted_range(
+    data: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<CborValue, CborError> {
+    let (value, pos) = decode_value_trusted_inner(data, start)?;
+    if pos != end {
+        return Err(CborError::new(ErrorCode::MalformedCanonical, start));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "alloc")]
 fn parse_map_key(p: &mut Parser<'_>) -> Result<Box<str>, CborError> {
+    use crate::alloc_util::try_box_str_from_str;
+
     let off = p.pos;
     let ib = p.read_u8()?;
     let major = ib >> 5;
@@ -827,11 +846,13 @@ fn parse_map_key(p: &mut Parser<'_>) -> Result<Box<str>, CborError> {
     let bytes = p.read_exact(len)?;
     let text =
         core::str::from_utf8(bytes).map_err(|_| CborError::new(ErrorCode::Utf8Invalid, off))?;
-    Ok(Box::from(text))
+    try_box_str_from_str(text, off)
 }
 
 #[cfg(feature = "alloc")]
 fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
+    use crate::alloc_util::{try_box_str_from_str, try_vec_from_slice};
+
     let off = p.pos;
     let ib = p.read_u8()?;
     let major = ib >> 5;
@@ -859,14 +880,16 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
         2 => {
             let len = p.read_len(ai, off)?;
             let bytes = p.read_exact(len)?;
-            Ok(ParsedItem::Value(CborValue::bytes(bytes.to_vec())))
+            let out = try_vec_from_slice(bytes, off)?;
+            Ok(ParsedItem::Value(CborValue::bytes(out)))
         }
         3 => {
             let len = p.read_len(ai, off)?;
             let bytes = p.read_exact(len)?;
             let text = core::str::from_utf8(bytes)
                 .map_err(|_| CborError::new(ErrorCode::Utf8Invalid, off))?;
-            Ok(ParsedItem::Value(CborValue::text(text)))
+            let boxed = try_box_str_from_str(text, off)?;
+            Ok(ParsedItem::Value(CborValue::text(boxed)))
         }
         4 => {
             let len = p.read_len(ai, off)?;
@@ -892,7 +915,8 @@ fn parse_item(p: &mut Parser<'_>) -> Result<ParsedItem, CborError> {
             }
             let m_len = p.read_len(m_ai, m_off)?;
             let mag = p.read_exact(m_len)?;
-            let big = BigInt::new_unchecked(negative, mag.to_vec());
+            let mag = try_vec_from_slice(mag, m_off)?;
+            let big = BigInt::new_unchecked(negative, mag);
             Ok(ParsedItem::Value(CborValue::integer(
                 CborInteger::from_bigint(big),
             )))

@@ -1,4 +1,4 @@
-use crate::canonical::{CanonicalCbor, CanonicalCborRef};
+use crate::canonical::{CborBytes, CborBytesRef};
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
 };
@@ -6,12 +6,27 @@ use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::value::{BigInt, CborInteger, CborValue, ValueRepr};
 use crate::{CborError, ErrorCode};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+
+#[derive(Clone, Copy)]
+enum MapPhase {
+    Key,
+    Value,
+}
 
 #[derive(Clone, Copy)]
 enum Frame<'a> {
     Value(&'a CborValue),
-    TextKey(&'a str),
+    Array {
+        items: &'a [CborValue],
+        idx: usize,
+    },
+    Map {
+        entries: &'a [(Box<str>, CborValue)],
+        idx: usize,
+        phase: MapPhase,
+    },
 }
 
 struct SmallStack<'a, const N: usize> {
@@ -29,17 +44,24 @@ impl<'a, const N: usize> SmallStack<'a, N> {
         }
     }
 
-    fn push(&mut self, frame: Frame<'a>) {
+    fn push(&mut self, frame: Frame<'a>, offset: usize) -> Result<(), CborError> {
         if !self.overflow.is_empty() {
+            self.overflow
+                .try_reserve(1)
+                .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))?;
             self.overflow.push(frame);
-            return;
+            return Ok(());
         }
         if self.len < N {
             self.inline[self.len] = Some(frame);
             self.len += 1;
-        } else {
-            self.overflow.push(frame);
+            return Ok(());
         }
+        self.overflow
+            .try_reserve(1)
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))?;
+        self.overflow.push(frame);
+        Ok(())
     }
 
     fn pop(&mut self) -> Option<Frame<'a>> {
@@ -89,6 +111,12 @@ struct VecSink {
 impl VecSink {
     const fn new() -> Self {
         Self { buf: Vec::new() }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let mut buf = Vec::new();
+        let _ = buf.try_reserve(capacity);
+        Self { buf }
     }
 
     fn into_vec(self) -> Vec<u8> {
@@ -152,35 +180,81 @@ impl<D: sha2::Digest> Sink for HashSink<D> {
 
 fn encode_value<S: Sink>(sink: &mut S, value: &CborValue) -> Result<(), CborError> {
     let mut stack = SmallStack::<64>::new();
-    stack.push(Frame::Value(value));
+    stack.push(Frame::Value(value), sink.position())?;
 
     while let Some(frame) = stack.pop() {
         match frame {
-            Frame::TextKey(key) => {
-                encode_text(sink, key)?;
-            }
             Frame::Value(v) => match v.repr() {
                 ValueRepr::Integer(i) => encode_integer(sink, i)?,
                 ValueRepr::Bytes(b) => encode_bytes(sink, b)?,
                 ValueRepr::Text(s) => encode_text(sink, s)?,
                 ValueRepr::Array(items) => {
                     encode_major_len(sink, 4, items.len())?;
-                    for item in items.iter().rev() {
-                        stack.push(Frame::Value(item));
-                    }
+                    stack.push(Frame::Array { items, idx: 0 }, sink.position())?;
                 }
                 ValueRepr::Map(map) => {
-                    encode_major_len(sink, 5, map.len())?;
-                    for (k, v) in map.entries().iter().rev() {
-                        stack.push(Frame::Value(v));
-                        stack.push(Frame::TextKey(k));
-                    }
+                    let entries = map.entries();
+                    encode_major_len(sink, 5, entries.len())?;
+                    stack.push(
+                        Frame::Map {
+                            entries,
+                            idx: 0,
+                            phase: MapPhase::Key,
+                        },
+                        sink.position(),
+                    )?;
                 }
                 ValueRepr::Bool(false) => sink.write_u8(0xf4)?,
                 ValueRepr::Bool(true) => sink.write_u8(0xf5)?,
                 ValueRepr::Null => sink.write_u8(0xf6)?,
                 ValueRepr::Float(bits) => encode_float64(sink, *bits)?,
             },
+            Frame::Array { items, idx } => {
+                if idx >= items.len() {
+                    continue;
+                }
+                stack.push(
+                    Frame::Array {
+                        items,
+                        idx: idx + 1,
+                    },
+                    sink.position(),
+                )?;
+                stack.push(Frame::Value(&items[idx]), sink.position())?;
+            }
+            Frame::Map {
+                entries,
+                idx,
+                phase,
+            } => {
+                if idx >= entries.len() {
+                    continue;
+                }
+                match phase {
+                    MapPhase::Key => {
+                        encode_text(sink, entries[idx].0.as_ref())?;
+                        stack.push(
+                            Frame::Map {
+                                entries,
+                                idx,
+                                phase: MapPhase::Value,
+                            },
+                            sink.position(),
+                        )?;
+                    }
+                    MapPhase::Value => {
+                        stack.push(
+                            Frame::Map {
+                                entries,
+                                idx: idx + 1,
+                                phase: MapPhase::Key,
+                            },
+                            sink.position(),
+                        )?;
+                        stack.push(Frame::Value(&entries[idx].1), sink.position())?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -266,16 +340,24 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
 /// Streaming encoder that writes canonical CBOR directly into a `Vec<u8>`.
 ///
 /// This avoids building a `CborValue` tree and supports splicing validated canonical bytes.
-pub struct CanonicalEncoder {
+pub struct Encoder {
     sink: VecSink,
 }
 
-impl CanonicalEncoder {
+impl Encoder {
     /// Create a new canonical encoder.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             sink: VecSink::new(),
+        }
+    }
+
+    /// Create a canonical encoder with pre-allocated capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            sink: VecSink::with_capacity(capacity),
         }
     }
 
@@ -285,10 +367,10 @@ impl CanonicalEncoder {
         self.sink.into_vec()
     }
 
-    /// Consume and return canonical bytes as a `CanonicalCbor`.
+    /// Consume and return canonical bytes as a `CborBytes`.
     #[must_use]
-    pub fn into_canonical(self) -> CanonicalCbor {
-        CanonicalCbor::new_unchecked(self.into_vec())
+    pub fn into_canonical(self) -> CborBytes {
+        CborBytes::new_unchecked(self.into_vec())
     }
 
     /// Borrow the bytes emitted so far.
@@ -323,6 +405,54 @@ impl CanonicalEncoder {
     pub fn int(&mut self, v: i64) -> Result<(), CborError> {
         validate_int_safe_i64(v).map_err(|code| CborError::new(code, self.sink.position()))?;
         encode_int(&mut self.sink, v)
+    }
+
+    /// Encode an unsigned integer, using a bignum when outside the safe range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails or allocation for the bignum magnitude fails.
+    pub fn int_u128(&mut self, v: u128) -> Result<(), CborError> {
+        let safe_max = u128::from(crate::profile::MAX_SAFE_INTEGER);
+        if v <= safe_max {
+            let i = i64::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
+            return self.int(i);
+        }
+
+        let magnitude = crate::int::magnitude_from_u128(v)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
+        self.bignum(false, &magnitude)
+    }
+
+    /// Encode a signed integer, using a bignum when outside the safe range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails or allocation for the bignum magnitude fails.
+    pub fn int_i128(&mut self, v: i128) -> Result<(), CborError> {
+        let min = i128::from(crate::profile::MIN_SAFE_INTEGER);
+        let max = i128::from(crate::profile::MAX_SAFE_INTEGER_I64);
+
+        if v >= min && v <= max {
+            let i = i64::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
+            return self.int(i);
+        }
+
+        let negative = v < 0;
+        let n_u128 = if negative {
+            let n_i128 = -1_i128 - v;
+            u128::try_from(n_i128)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
+        } else {
+            u128::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
+        };
+
+        let magnitude = crate::int::magnitude_from_u128(n_u128)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
+        self.bignum(negative, &magnitude)
     }
 
     /// Encode a CBOR bignum (tag 2/3 + byte string magnitude).
@@ -379,7 +509,7 @@ impl CanonicalEncoder {
     /// # Errors
     ///
     /// Returns an error if writing to the underlying buffer fails.
-    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
+    pub fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
         self.sink.write(v.as_bytes())
     }
 
@@ -401,17 +531,23 @@ impl CanonicalEncoder {
     where
         F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
     {
-        encode_major_len(&mut self.sink, 4, len)?;
+        let start = self.sink.buf.len();
+        if let Err(err) = encode_major_len(&mut self.sink, 4, len) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
         let mut a = ArrayEncoder {
             enc: self,
             remaining: len,
         };
-        f(&mut a)?;
+        if let Err(err) = f(&mut a) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
         if a.remaining != 0 {
-            return Err(CborError::new(
-                ErrorCode::ArrayLenMismatch,
-                self.sink.position(),
-            ));
+            let err = CborError::new(ErrorCode::ArrayLenMismatch, self.sink.position());
+            self.sink.buf.truncate(start);
+            return Err(err);
         }
         Ok(())
     }
@@ -425,18 +561,24 @@ impl CanonicalEncoder {
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
     {
-        encode_major_len(&mut self.sink, 5, len)?;
+        let start = self.sink.buf.len();
+        if let Err(err) = encode_major_len(&mut self.sink, 5, len) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
         let mut m = MapEncoder {
             enc: self,
             remaining: len,
             prev_key_range: None,
         };
-        f(&mut m)?;
+        if let Err(err) = f(&mut m) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
         if m.remaining != 0 {
-            return Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.sink.position(),
-            ));
+            let err = CborError::new(ErrorCode::MapLenMismatch, self.sink.position());
+            self.sink.buf.truncate(start);
+            return Err(err);
         }
         Ok(())
     }
@@ -452,7 +594,7 @@ impl CanonicalEncoder {
     }
 }
 
-impl Default for CanonicalEncoder {
+impl Default for Encoder {
     fn default() -> Self {
         Self::new()
     }
@@ -460,7 +602,7 @@ impl Default for CanonicalEncoder {
 
 /// Builder for writing array elements into a canonical CBOR stream.
 pub struct ArrayEncoder<'a> {
-    enc: &'a mut CanonicalEncoder,
+    enc: &'a mut Encoder,
     remaining: usize,
 }
 
@@ -562,7 +704,7 @@ impl ArrayEncoder<'_> {
     /// # Errors
     ///
     /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
+    pub fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
         self.consume_one()?;
         self.enc.raw_cbor(v)
     }
@@ -616,7 +758,7 @@ impl ArrayEncoder<'_> {
 
 /// Builder for writing map entries into a canonical CBOR stream.
 pub struct MapEncoder<'a> {
-    enc: &'a mut CanonicalEncoder,
+    enc: &'a mut Encoder,
     remaining: usize,
     prev_key_range: Option<(usize, usize)>,
 }
@@ -630,7 +772,7 @@ impl MapEncoder<'_> {
     /// Returns an error if encoding fails, if keys are out of order, or if duplicates are found.
     pub fn entry<F>(&mut self, key: &str, f: F) -> Result<(), CborError>
     where
-        F: FnOnce(&mut CanonicalEncoder) -> Result<(), CborError>,
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
         if self.remaining == 0 {
             return Err(CborError::new(

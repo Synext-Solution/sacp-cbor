@@ -1,7 +1,7 @@
 //! Query support for canonical CBOR messages.
 //!
 //! This module provides a lightweight, allocation-free query engine for
-//! [`CanonicalCborRef`](crate::CanonicalCborRef). Queries return borrowed views
+//! [`CborBytesRef`](crate::CborBytesRef). Queries return borrowed views
 //! ([`CborValueRef`]) pointing into the original message bytes.
 //!
 //! The query layer assumes the input bytes are already validated as canonical via
@@ -10,20 +10,18 @@
 
 use core::cmp::Ordering;
 
-use crate::canonical::CanonicalCborRef;
+use crate::canonical::CborBytesRef;
 use crate::parse;
-use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding, encoded_text_len};
+use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding};
 use crate::stream::CborStream;
 use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
-use crate::canonical::CanonicalCbor;
+use crate::canonical::CborBytes;
 
 #[cfg(feature = "alloc")]
 use crate::value::{CborMap, CborValue};
 
-#[cfg(feature = "alloc")]
-use alloc::vec;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
@@ -97,6 +95,18 @@ pub enum PathElem<'p> {
     Key(&'p str),
     /// Select an index from a CBOR array.
     Index(usize),
+}
+
+impl<'p> From<&'p str> for PathElem<'p> {
+    fn from(key: &'p str) -> Self {
+        Self::Key(key)
+    }
+}
+
+impl From<usize> for PathElem<'_> {
+    fn from(index: usize) -> Self {
+        Self::Index(index)
+    }
 }
 
 /// A borrowed view of a CBOR bignum (tag 2 / tag 3).
@@ -489,7 +499,7 @@ impl<'a> MapRef<'a> {
             let parsed = read_text(&mut s)?;
             let value_start = s.position();
 
-            let cmp = cmp_text_key_bytes_to_query(parsed.bytes, parsed.enc_len, key);
+            let cmp = cmp_text_key_bytes_to_query(parsed.bytes, key);
             match cmp {
                 Ordering::Less => {
                     pos = value_end(self.data, value_start)?;
@@ -673,12 +683,17 @@ impl<'a> MapRef<'a> {
     where
         'a: 'k,
     {
+        use crate::alloc_util::try_vec_with_capacity;
+
         validate_query_keys(used_keys, self.map_off)?;
         if used_keys.is_empty() {
             return self.extras_sorted_vec(&[]);
         }
 
-        let mut idxs: Vec<usize> = (0..used_keys.len()).collect();
+        let mut idxs = try_vec_with_capacity(used_keys.len(), self.map_off)?;
+        for idx in 0..used_keys.len() {
+            idxs.push(idx);
+        }
         idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(used_keys[i], used_keys[j]));
         for w in idxs.windows(2) {
             if used_keys[w[0]] == used_keys[w[1]] {
@@ -686,7 +701,10 @@ impl<'a> MapRef<'a> {
             }
         }
 
-        let sorted: Vec<&str> = idxs.into_iter().map(|i| used_keys[i]).collect();
+        let mut sorted = try_vec_with_capacity(used_keys.len(), self.map_off)?;
+        for idx in idxs {
+            sorted.push(used_keys[idx]);
+        }
         self.extras_sorted_vec(&sorted)
     }
 
@@ -699,7 +717,7 @@ impl<'a> MapRef<'a> {
     /// Returns `CborError` for invalid query inputs or malformed canonical data.
     #[cfg(feature = "alloc")]
     pub fn get_many(self, keys: &[&str]) -> Result<Vec<Option<CborValueRef<'a>>>, CborError> {
-        let mut out: Vec<Option<CborValueRef<'a>>> = vec![None; keys.len()];
+        let mut out = crate::alloc_util::try_vec_repeat_copy(keys.len(), None, self.map_off)?;
         self.get_many_into(keys, &mut out)?;
         Ok(out)
     }
@@ -713,10 +731,10 @@ impl<'a> MapRef<'a> {
     /// Returns `CborError::MissingKey` if any key is not present.
     #[cfg(feature = "alloc")]
     pub fn require_many(self, keys: &[&str]) -> Result<Vec<CborValueRef<'a>>, CborError> {
-        let mut out: Vec<Option<CborValueRef<'a>>> = vec![None; keys.len()];
+        let mut out = crate::alloc_util::try_vec_repeat_copy(keys.len(), None, self.map_off)?;
         self.get_many_into(keys, &mut out)?;
 
-        let mut req: Vec<CborValueRef<'a>> = Vec::with_capacity(out.len());
+        let mut req = crate::alloc_util::try_vec_with_capacity(out.len(), self.map_off)?;
         for slot in out {
             match slot {
                 Some(v) => req.push(v),
@@ -831,8 +849,8 @@ impl<'a> ArrayRef<'a> {
     }
 }
 
-/// Adds query methods to `CanonicalCborRef`.
-impl<'a> CanonicalCborRef<'a> {
+/// Adds query methods to `CborBytesRef`.
+impl<'a> CborBytesRef<'a> {
     /// Returns a borrowed view of the root CBOR item.
     ///
     /// Canonical validation guarantees the message is exactly one CBOR item, so the
@@ -853,7 +871,7 @@ impl<'a> CanonicalCborRef<'a> {
 }
 
 #[cfg(feature = "alloc")]
-impl CanonicalCbor {
+impl CborBytes {
     /// Returns a borrowed view of the root CBOR item.
     #[must_use]
     pub fn root(&self) -> CborValueRef<'_> {
@@ -880,11 +898,7 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError` if the value is malformed.
     pub fn to_owned(self) -> Result<CborValue, CborError> {
-        let (value, end) = parse::decode_value_trusted(self.data, self.start)?;
-        if end != self.end {
-            return Err(malformed(self.start));
-        }
-        Ok(value)
+        parse::decode_value_trusted_range(self.data, self.start, self.end)
     }
 }
 
@@ -1038,7 +1052,6 @@ fn read_len(s: &mut CborStream<'_>, ai: u8, off: usize) -> Result<usize, CborErr
 #[derive(Clone, Copy)]
 struct CachedKey<'a> {
     key_bytes: &'a [u8],
-    key_enc_len: u64,
     value_start: usize,
 }
 
@@ -1067,7 +1080,6 @@ impl<'a> MapScanState<'a> {
             self.pos = value_start;
             self.cached = Some(CachedKey {
                 key_bytes: parsed.bytes,
-                key_enc_len: parsed.enc_len,
                 value_start,
             });
         }
@@ -1095,7 +1107,7 @@ impl<'a> MapScanState<'a> {
             return Ok(q_idx);
         };
 
-        match cmp_text_key_bytes_to_query(ck.key_bytes, ck.key_enc_len, query) {
+        match cmp_text_key_bytes_to_query(ck.key_bytes, query) {
             Ordering::Less => {
                 let _ = self.consume_cached_entry(ck)?;
                 Ok(q_idx)
@@ -1146,7 +1158,6 @@ impl<'a> MapScanState<'a> {
 struct ParsedText<'a> {
     s: &'a str,
     bytes: &'a [u8],
-    enc_len: u64,
 }
 
 #[cfg(feature = "alloc")]
@@ -1194,14 +1205,7 @@ fn read_text<'a>(s: &mut CborStream<'a>) -> Result<ParsedText<'a>, CborError> {
     let len = read_len(s, ai, off)?;
     let bytes = read_exact(s, len)?;
     let text = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
-    let enc_len = u64::try_from(s.position() - off)
-        .map_err(|_| CborError::new(ErrorCode::LengthOverflow, off))?;
-
-    Ok(ParsedText {
-        s: text,
-        bytes,
-        enc_len,
-    })
+    Ok(ParsedText { s: text, bytes })
 }
 
 fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
@@ -1238,11 +1242,9 @@ fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborE
     Ok((len, s.position()))
 }
 
-fn cmp_text_key_bytes_to_query(key_payload: &[u8], key_enc_len: u64, query: &str) -> Ordering {
+fn cmp_text_key_bytes_to_query(key_payload: &[u8], query: &str) -> Ordering {
     let q_bytes = query.as_bytes();
-    let q_enc_len = encoded_text_len(q_bytes.len());
-
-    match key_enc_len.cmp(&q_enc_len) {
+    match key_payload.len().cmp(&q_bytes.len()) {
         Ordering::Equal => key_payload.cmp(q_bytes),
         other => other,
     }

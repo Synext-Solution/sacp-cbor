@@ -10,11 +10,11 @@ use crate::{CborError, DecodeLimits};
 ///
 /// Therefore, for protocol purposes, these bytes can be treated as the stable canonical representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonicalCborRef<'a> {
+pub struct CborBytesRef<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> CanonicalCborRef<'a> {
+impl<'a> CborBytesRef<'a> {
     #[inline]
     pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
@@ -55,16 +55,21 @@ impl<'a> CanonicalCborRef<'a> {
         digest
     }
 
-    /// Copy into an owned [`CanonicalCbor`].
+    /// Copy into an owned [`CborBytes`].
     ///
     /// This method is available with the `alloc` feature.
     #[cfg(feature = "alloc")]
     #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-    #[must_use]
-    pub fn to_owned(self) -> CanonicalCbor {
-        CanonicalCbor {
-            bytes: self.bytes.to_vec(),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on allocation failure.
+    pub fn to_owned(self) -> Result<CborBytes, CborError> {
+        use crate::alloc_util::try_vec_from_slice;
+
+        Ok(CborBytes {
+            bytes: try_vec_from_slice(self.bytes, 0)?,
+        })
     }
 
     /// Compare canonical bytes for equality.
@@ -75,7 +80,7 @@ impl<'a> CanonicalCborRef<'a> {
     }
 }
 
-impl AsRef<[u8]> for CanonicalCborRef<'_> {
+impl AsRef<[u8]> for CborBytesRef<'_> {
     fn as_ref(&self) -> &[u8] {
         self.bytes
     }
@@ -90,12 +95,12 @@ use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalCbor {
+pub struct CborBytes {
     bytes: Vec<u8>,
 }
 
 #[cfg(feature = "alloc")]
-impl CanonicalCbor {
+impl CborBytes {
     #[inline]
     pub(crate) const fn new_unchecked(bytes: Vec<u8>) -> Self {
         Self { bytes }
@@ -115,7 +120,27 @@ impl CanonicalCbor {
     /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item.
     pub fn from_slice(bytes: &[u8], limits: DecodeLimits) -> Result<Self, CborError> {
         let canon = crate::validate_canonical(bytes, limits)?;
-        Ok(canon.to_owned())
+        canon.to_owned()
+    }
+
+    /// Validate and wrap an owned canonical CBOR buffer without copying.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item.
+    pub fn from_vec(bytes: Vec<u8>, limits: DecodeLimits) -> Result<Self, CborError> {
+        crate::validate_canonical(&bytes, limits)?;
+        Ok(Self { bytes })
+    }
+
+    /// Validate and wrap an owned canonical CBOR buffer using default limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item.
+    pub fn from_vec_default_limits(bytes: Vec<u8>) -> Result<Self, CborError> {
+        let limits = DecodeLimits::for_bytes(bytes.len());
+        Self::from_vec(bytes, limits)
     }
 
     /// Borrow the canonical bytes.
@@ -137,12 +162,12 @@ impl CanonicalCbor {
     #[cfg_attr(docsrs, doc(cfg(feature = "sha2")))]
     #[must_use]
     pub fn sha256(&self) -> [u8; 32] {
-        CanonicalCborRef::new(&self.bytes).sha256()
+        CborBytesRef::new(&self.bytes).sha256()
     }
 }
 
 #[cfg(feature = "alloc")]
-impl AsRef<[u8]> for CanonicalCbor {
+impl AsRef<[u8]> for CborBytes {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
     }
@@ -150,19 +175,19 @@ impl AsRef<[u8]> for CanonicalCbor {
 
 #[cfg(feature = "serde")]
 mod serde_impls {
-    use super::{CanonicalCbor, CanonicalCborRef};
+    use super::{CborBytes, CborBytesRef};
     use crate::{validate_canonical, DecodeLimits};
     use serde::de::{Error as DeError, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    impl Serialize for CanonicalCborRef<'_> {
+    impl Serialize for CborBytesRef<'_> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.serialize_bytes(self.as_bytes())
         }
     }
 
     #[cfg(feature = "alloc")]
-    impl Serialize for CanonicalCbor {
+    impl Serialize for CborBytes {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.serialize_bytes(self.as_bytes())
         }
@@ -171,12 +196,12 @@ mod serde_impls {
     /// Deserializes from a CBOR byte string (or any serde bytes source) into an owned canonical
     /// wrapper. Validation uses `DecodeLimits::for_bytes(len)`.
     #[cfg(feature = "alloc")]
-    impl<'de> Deserialize<'de> for CanonicalCbor {
+    impl<'de> Deserialize<'de> for CborBytes {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             struct V;
 
             impl<'de> Visitor<'de> for V {
-                type Value = CanonicalCbor;
+                type Value = CborBytes;
 
                 fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                     write!(f, "canonical CBOR bytes")
@@ -188,13 +213,14 @@ mod serde_impls {
                 ) -> Result<Self::Value, E> {
                     let limits = DecodeLimits::for_bytes(v.len());
                     validate_canonical(&v, limits).map_err(E::custom)?;
-                    Ok(CanonicalCbor::new_unchecked(v))
+                    Ok(CborBytes::new_unchecked(v))
                 }
 
                 fn visit_borrowed_bytes<E: DeError>(self, v: &'de [u8]) -> Result<Self::Value, E> {
                     let limits = DecodeLimits::for_bytes(v.len());
                     validate_canonical(v, limits).map_err(E::custom)?;
-                    Ok(CanonicalCbor::new_unchecked(v.to_vec()))
+                    let out = crate::alloc_util::try_vec_from_slice(v, 0).map_err(E::custom)?;
+                    Ok(CborBytes::new_unchecked(out))
                 }
             }
 
