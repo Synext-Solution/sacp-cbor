@@ -2,8 +2,6 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
-use core::marker::PhantomData;
-
 use serde::de::{
     self, Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
     VariantAccess, Visitor,
@@ -13,11 +11,12 @@ use serde::{Deserialize as SerdeDeserialize, Serialize, Serializer};
 
 use crate::encode::Encoder;
 use crate::int::{integer_from_i128, integer_from_u128};
-use crate::profile::is_strictly_increasing_encoded;
-use crate::query::{CborIntegerRef, CborKind, CborValueRef};
+use crate::profile::{
+    is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
+};
 use crate::scalar::F64Bits;
 use crate::value::{CborMap, CborValue, ValueRepr};
-use crate::{CborBytesRef, CborError, DecodeLimits, ErrorCode};
+use crate::{CborError, DecodeLimits, ErrorCode};
 
 fn check_map_key_order(
     enc: &mut Encoder,
@@ -315,6 +314,8 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, CborError> {
 
 /// Deserialize a Rust value from canonical SACP-CBOR/1 bytes.
 ///
+/// This validates and deserializes in a single pass over the input.
+///
 /// # Errors
 ///
 /// Returns an error if bytes are invalid or if the decoded value doesn't match the target type.
@@ -322,18 +323,12 @@ pub fn from_slice<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let canon = crate::validate_canonical(bytes, limits)?;
-    from_value_ref(canon.root())
-}
-
-/// Deserialize a Rust value from a `CborValueRef`.
-///
-/// # Errors
-///
-/// Returns an error if the value doesn't match the target type.
-pub fn from_value_ref<'de, T: Deserialize<'de>>(value: CborValueRef<'de>) -> Result<T, CborError> {
-    let de = CborRefDeserializer::new(value);
-    T::deserialize(de).map_err(DeError::into_cbor_error)
+    let mut de = DirectDeserializer::new(bytes, limits)?;
+    let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
+    if de.offset() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1061,8 +1056,6 @@ impl ser::Serializer for MapKeySerializer<'_> {
 }
 
 /// A serde decoding error that preserves an [`ErrorCode`] plus an input offset.
-///
-/// This is the `serde::Deserializer::Error` type used by [`CborRefDeserializer`].
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeError {
@@ -1115,143 +1108,425 @@ const fn ser_err(off: usize) -> DeError {
     DeError::new(ErrorCode::SerdeError, off)
 }
 
-/// Validate `bytes` as canonical under `limits`, then deserialize `T` with zero-copy borrows.
-///
-/// # Errors
-///
-/// Returns an error if validation fails or if deserialization fails.
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Result<T, CborError>
-where
-    T: Deserialize<'de>,
-{
-    let canon = crate::validate_canonical(bytes, limits)?;
-    from_bytes_ref_borrowed(canon)
+struct DirectDeserializer<'de> {
+    input: &'de [u8],
+    pos: usize,
+    limits: DecodeLimits,
+    items_seen: usize,
+    depth: usize,
 }
 
-/// Deserialize from already-validated canonical bytes (fast path).
-///
-/// # Errors
-///
-/// Returns an error if deserialization fails.
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub fn from_bytes_ref_borrowed<'de, T>(canon: CborBytesRef<'de>) -> Result<T, CborError>
-where
-    T: Deserialize<'de>,
-{
-    from_value_ref_borrowed(canon.root())
-}
-
-/// Deserialize directly from a validated [`CborValueRef`].
-///
-/// # Errors
-///
-/// Returns an error if deserialization fails.
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub fn from_value_ref_borrowed<'de, T>(value: CborValueRef<'de>) -> Result<T, CborError>
-where
-    T: Deserialize<'de>,
-{
-    let de = CborRefDeserializer::new(value);
-    T::deserialize(de).map_err(DeError::into_cbor_error)
-}
-
-/// A zero-copy `serde::Deserializer` for canonical CBOR, backed by [`CborValueRef<'de>`].
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-#[derive(Debug, Clone, Copy)]
-pub struct CborRefDeserializer<'de> {
-    v: CborValueRef<'de>,
-}
-
-impl<'de> CborRefDeserializer<'de> {
-    #[inline]
-    #[must_use]
-    /// Construct a borrowed deserializer from a validated [`CborValueRef`].
-    pub const fn new(v: CborValueRef<'de>) -> Self {
-        Self { v }
+impl<'de> DirectDeserializer<'de> {
+    const fn new(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        if input.len() > limits.max_input_bytes {
+            return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
+        }
+        Ok(Self {
+            input,
+            pos: 0,
+            limits,
+            items_seen: 0,
+            depth: 0,
+        })
     }
 
     #[inline]
-    #[must_use]
-    const fn off(&self) -> usize {
-        self.v.offset()
+    const fn offset(&self) -> usize {
+        self.pos
     }
-}
 
-#[inline]
-fn parse_i128(v: CborValueRef<'_>) -> Result<i128, DeError> {
-    let off = v.offset();
-    match v.integer().map_err(DeError::from)? {
-        CborIntegerRef::Safe(i) => Ok(i128::from(i)),
-        CborIntegerRef::Big(b) => bigint_to_i128(b.is_negative(), b.magnitude())
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, off)),
+    fn peek_u8(&self) -> Result<u8, DeError> {
+        let off = self.pos;
+        self.input
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| DeError::new(ErrorCode::UnexpectedEof, off))
     }
-}
 
-#[inline]
-fn parse_u128(v: CborValueRef<'_>) -> Result<u128, DeError> {
-    let off = v.offset();
-    match v.integer().map_err(DeError::from)? {
-        CborIntegerRef::Safe(i) => {
-            if i < 0 {
-                return Err(DeError::new(ErrorCode::SerdeError, off));
+    fn read_u8(&mut self) -> Result<u8, DeError> {
+        let off = self.pos;
+        let b = *self
+            .input
+            .get(self.pos)
+            .ok_or_else(|| DeError::new(ErrorCode::UnexpectedEof, off))?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_exact(&mut self, n: usize) -> Result<&'de [u8], DeError> {
+        let off = self.pos;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| DeError::new(ErrorCode::LengthOverflow, off))?;
+        if end > self.input.len() {
+            return Err(DeError::new(ErrorCode::UnexpectedEof, off));
+        }
+        let out = &self.input[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn read_be_u16(&mut self) -> Result<u16, DeError> {
+        let s = self.read_exact(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+
+    fn read_be_u32(&mut self) -> Result<u32, DeError> {
+        let s = self.read_exact(4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn read_be_u64(&mut self) -> Result<u64, DeError> {
+        let s = self.read_exact(8)?;
+        Ok(u64::from_be_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    fn read_uint_arg_checked(&mut self, ai: u8, off: usize) -> Result<u64, DeError> {
+        match ai {
+            0..=23 => Ok(u64::from(ai)),
+            24 => {
+                let v = u64::from(self.read_u8()?);
+                if v < 24 {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Ok(v)
             }
-            u128::try_from(i).map_err(|_| DeError::new(ErrorCode::SerdeError, off))
+            25 => {
+                let v = u64::from(self.read_be_u16()?);
+                if u8::try_from(v).is_ok() {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Ok(v)
+            }
+            26 => {
+                let v = u64::from(self.read_be_u32()?);
+                if u16::try_from(v).is_ok() {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Ok(v)
+            }
+            27 => {
+                let v = self.read_be_u64()?;
+                if u32::try_from(v).is_ok() {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Ok(v)
+            }
+            _ => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
         }
-        CborIntegerRef::Big(b) => bigint_to_u128(b.is_negative(), b.magnitude())
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, off)),
+    }
+
+    fn read_len_checked(&mut self, ai: u8, off: usize) -> Result<usize, DeError> {
+        if ai == 31 {
+            return Err(DeError::new(ErrorCode::IndefiniteLengthForbidden, off));
+        }
+        let len = self.read_uint_arg_checked(ai, off)?;
+        usize::try_from(len).map_err(|_| DeError::new(ErrorCode::LengthOverflow, off))
+    }
+
+    const fn enforce_len(
+        len: usize,
+        max_len: usize,
+        code: ErrorCode,
+        off: usize,
+    ) -> Result<(), DeError> {
+        if len > max_len {
+            return Err(DeError::new(code, off));
+        }
+        Ok(())
+    }
+
+    fn bump_items(&mut self, add: usize, off: usize) -> Result<(), DeError> {
+        self.items_seen = self
+            .items_seen
+            .checked_add(add)
+            .ok_or_else(|| DeError::new(ErrorCode::LengthOverflow, off))?;
+        if self.items_seen > self.limits.max_total_items {
+            return Err(DeError::new(ErrorCode::TotalItemsLimitExceeded, off));
+        }
+        Ok(())
+    }
+
+    const fn ensure_depth(&self, next_depth: usize, off: usize) -> Result<(), DeError> {
+        if next_depth > self.limits.max_depth {
+            return Err(DeError::new(ErrorCode::DepthLimitExceeded, off));
+        }
+        Ok(())
+    }
+
+    fn parse_text_from_header(&mut self, off: usize, ai: u8) -> Result<&'de str, DeError> {
+        let len = self.read_len_checked(ai, off)?;
+        Self::enforce_len(
+            len,
+            self.limits.max_text_len,
+            ErrorCode::TextLenLimitExceeded,
+            off,
+        )?;
+        let bytes = self.read_exact(len)?;
+        let s =
+            core::str::from_utf8(bytes).map_err(|_| DeError::new(ErrorCode::Utf8Invalid, off))?;
+        Ok(s)
+    }
+
+    fn parse_bytes_from_header(&mut self, off: usize, ai: u8) -> Result<&'de [u8], DeError> {
+        let len = self.read_len_checked(ai, off)?;
+        Self::enforce_len(
+            len,
+            self.limits.max_bytes_len,
+            ErrorCode::BytesLenLimitExceeded,
+            off,
+        )?;
+        self.read_exact(len)
+    }
+
+    fn parse_text_key(
+        &mut self,
+        prev_key_range: &mut Option<(usize, usize)>,
+    ) -> Result<&'de str, DeError> {
+        let key_start = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 3 {
+            return Err(DeError::new(ErrorCode::MapKeyMustBeText, key_start));
+        }
+        let s = self.parse_text_from_header(key_start, ai)?;
+        let key_end = self.pos;
+        if let Some((ps, pe)) = *prev_key_range {
+            let prev = &self.input[ps..pe];
+            let curr = &self.input[key_start..key_end];
+            if prev == curr {
+                return Err(DeError::new(ErrorCode::DuplicateMapKey, key_start));
+            }
+            if !is_strictly_increasing_encoded(prev, curr) {
+                return Err(DeError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+            }
+        }
+        *prev_key_range = Some((key_start, key_end));
+        Ok(s)
+    }
+
+    fn parse_bignum(&mut self, off: usize, ai: u8) -> Result<(bool, &'de [u8]), DeError> {
+        let tag = self.read_uint_arg_checked(ai, off)?;
+        let negative = match tag {
+            2 => false,
+            3 => true,
+            _ => return Err(DeError::new(ErrorCode::ForbiddenOrMalformedTag, off)),
+        };
+        let m_off = self.pos;
+        let first = self.read_u8()?;
+        let m_major = first >> 5;
+        let m_ai = first & 0x1f;
+        if m_major != 2 {
+            return Err(DeError::new(ErrorCode::ForbiddenOrMalformedTag, m_off));
+        }
+        let m_len = self.read_len_checked(m_ai, m_off)?;
+        Self::enforce_len(
+            m_len,
+            self.limits.max_bytes_len,
+            ErrorCode::BytesLenLimitExceeded,
+            m_off,
+        )?;
+        let mag = self.read_exact(m_len)?;
+        validate_bignum_bytes(negative, mag).map_err(|code| DeError::new(code, m_off))?;
+        Ok((negative, mag))
+    }
+
+    fn parse_i128(&mut self) -> Result<i128, DeError> {
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 => {
+                let v = self.read_uint_arg_checked(ai, off)?;
+                if v > MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok(i128::from(v))
+            }
+            1 => {
+                let n = self.read_uint_arg_checked(ai, off)?;
+                if n >= MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok(-1 - i128::from(n))
+            }
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                bigint_to_i128(negative, mag).ok_or_else(|| ser_err(off))
+            }
+            _ => Err(DeError::new(ErrorCode::ExpectedInteger, off)),
+        }
+    }
+
+    fn parse_u128(&mut self) -> Result<u128, DeError> {
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 => {
+                let v = self.read_uint_arg_checked(ai, off)?;
+                if v > MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok(u128::from(v))
+            }
+            1 => Err(ser_err(off)),
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                if negative {
+                    return Err(ser_err(off));
+                }
+                bigint_to_u128(false, mag).ok_or_else(|| ser_err(off))
+            }
+            _ => Err(DeError::new(ErrorCode::ExpectedInteger, off)),
+        }
+    }
+
+    fn parse_i64(&mut self) -> Result<i64, DeError> {
+        let off = self.pos;
+        let n = self.parse_i128()?;
+        i64::try_from(n).map_err(|_| ser_err(off))
+    }
+
+    fn parse_u64(&mut self) -> Result<u64, DeError> {
+        let off = self.pos;
+        let n = self.parse_u128()?;
+        u64::try_from(n).map_err(|_| ser_err(off))
+    }
+
+    fn parse_float64(&mut self) -> Result<f64, DeError> {
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 7 {
+            return Err(DeError::new(ErrorCode::ExpectedFloat, off));
+        }
+        match ai {
+            27 => {
+                let bits = self.read_be_u64()?;
+                validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                Ok(f64::from_bits(bits))
+            }
+            20..=22 => Err(DeError::new(ErrorCode::ExpectedFloat, off)),
+            24 => {
+                let simple = self.read_u8()?;
+                if simple < 24 {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+            _ => Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off)),
+        }
+    }
+
+    fn consume_null(&mut self) -> Result<bool, DeError> {
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 7 {
+            return Err(ser_err(off));
+        }
+        match ai {
+            22 => Ok(true),
+            24 => {
+                let simple = self.read_u8()?;
+                if simple < 24 {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+            20 | 21 => Err(ser_err(off)),
+            _ => Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off)),
+        }
+    }
+
+    fn enter_array(&mut self, len: usize, off: usize) -> Result<bool, DeError> {
+        Self::enforce_len(
+            len,
+            self.limits.max_array_len,
+            ErrorCode::ArrayLenLimitExceeded,
+            off,
+        )?;
+        self.bump_items(len, off)?;
+        self.ensure_depth(self.depth + 1, off)?;
+        if len > 0 {
+            self.depth += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn enter_map(&mut self, len: usize, off: usize) -> Result<bool, DeError> {
+        Self::enforce_len(
+            len,
+            self.limits.max_map_len,
+            ErrorCode::MapLenLimitExceeded,
+            off,
+        )?;
+        let items = len
+            .checked_mul(2)
+            .ok_or_else(|| DeError::new(ErrorCode::LengthOverflow, off))?;
+        self.bump_items(items, off)?;
+        self.ensure_depth(self.depth + 1, off)?;
+        if len > 0 {
+            self.depth += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn exit_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 }
 
-#[inline]
-fn parse_u64(v: CborValueRef<'_>) -> Result<u64, DeError> {
-    let n = parse_u128(v)?;
-    u64::try_from(n).map_err(|_| DeError::new(ErrorCode::SerdeError, v.offset()))
-}
-
-#[inline]
-fn parse_i64(v: CborValueRef<'_>) -> Result<i64, DeError> {
-    let n = parse_i128(v)?;
-    i64::try_from(n).map_err(|_| DeError::new(ErrorCode::SerdeError, v.offset()))
-}
-
-struct CborSeqAccess<'de, I> {
-    iter: I,
+struct DirectSeqAccess<'a, 'de> {
+    de: &'a mut DirectDeserializer<'de>,
     remaining: usize,
-    _pd: PhantomData<&'de ()>,
+    depth_entered: bool,
 }
 
-impl<I> CborSeqAccess<'_, I> {
-    const fn new(iter: I, remaining: usize) -> Self {
+impl<'a, 'de> DirectSeqAccess<'a, 'de> {
+    fn new(de: &'a mut DirectDeserializer<'de>, remaining: usize, depth_entered: bool) -> Self {
         Self {
-            iter,
+            de,
             remaining,
-            _pd: PhantomData,
+            depth_entered,
         }
     }
 }
 
-impl<'de, I> SeqAccess<'de> for CborSeqAccess<'de, I>
-where
-    I: Iterator<Item = Result<CborValueRef<'de>, CborError>>,
-{
+impl<'de> SeqAccess<'de> for DirectSeqAccess<'_, 'de> {
     type Error = DeError;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, DeError>
     where
         T: DeserializeSeed<'de>,
     {
-        match self.iter.next() {
-            None => {
-                self.remaining = 0;
-                Ok(None)
+        if self.remaining == 0 {
+            if self.depth_entered {
+                self.de.exit_container();
             }
-            Some(Err(e)) => Err(DeError::from(e)),
-            Some(Ok(v)) => {
-                self.remaining = self.remaining.saturating_sub(1);
-                seed.deserialize(CborRefDeserializer::new(v)).map(Some)
-            }
+            return Ok(None);
         }
+        let value = seed.deserialize(&mut *self.de)?;
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 && self.depth_entered {
+            self.de.exit_container();
+        }
+        Ok(Some(value))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -1259,77 +1534,85 @@ where
     }
 }
 
-struct CborMapAccess<'de, I> {
-    iter: I,
-    remaining: usize,
-    pending_value: Option<CborValueRef<'de>>,
-    map_off: usize,
-    _pd: PhantomData<&'de ()>,
+struct DirectMapAccess<'a, 'de> {
+    de: &'a mut DirectDeserializer<'de>,
+    remaining_pairs: usize,
+    depth_entered: bool,
+    pending_key: bool,
+    prev_key_range: Option<(usize, usize)>,
 }
 
-impl<I> CborMapAccess<'_, I> {
-    const fn new(iter: I, remaining: usize, map_off: usize) -> Self {
+impl<'a, 'de> DirectMapAccess<'a, 'de> {
+    fn new(
+        de: &'a mut DirectDeserializer<'de>,
+        remaining_pairs: usize,
+        depth_entered: bool,
+    ) -> Self {
         Self {
-            iter,
-            remaining,
-            pending_value: None,
-            map_off,
-            _pd: PhantomData,
+            de,
+            remaining_pairs,
+            depth_entered,
+            pending_key: false,
+            prev_key_range: None,
         }
     }
 }
 
-impl<'de, I> MapAccess<'de> for CborMapAccess<'de, I>
-where
-    I: Iterator<Item = Result<(&'de str, CborValueRef<'de>), CborError>>,
-{
+impl<'de> MapAccess<'de> for DirectMapAccess<'_, 'de> {
     type Error = DeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, DeError>
     where
         K: DeserializeSeed<'de>,
     {
-        let next = match self.iter.next() {
-            None => {
-                self.remaining = 0;
-                return Ok(None);
+        if self.pending_key {
+            return Err(ser_err(self.de.offset()));
+        }
+        if self.remaining_pairs == 0 {
+            if self.depth_entered {
+                self.de.exit_container();
             }
-            Some(Err(e)) => return Err(DeError::from(e)),
-            Some(Ok(kv)) => kv,
-        };
+            return Ok(None);
+        }
 
-        let (k, v) = next;
-        self.pending_value = Some(v);
-        self.remaining = self.remaining.saturating_sub(1);
-        seed.deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(k))
-            .map(Some)
+        let key = self.de.parse_text_key(&mut self.prev_key_range)?;
+        self.pending_key = true;
+        let val =
+            seed.deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(key))?;
+        Ok(Some(val))
     }
 
     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, DeError>
     where
         V: DeserializeSeed<'de>,
     {
-        let v = self
-            .pending_value
-            .take()
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.map_off))?;
-        seed.deserialize(CborRefDeserializer::new(v))
+        if !self.pending_key {
+            return Err(ser_err(self.de.offset()));
+        }
+        let value = seed.deserialize(&mut *self.de)?;
+        self.pending_key = false;
+        self.remaining_pairs = self.remaining_pairs.saturating_sub(1);
+        if self.remaining_pairs == 0 && self.depth_entered {
+            self.de.exit_container();
+        }
+        Ok(value)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.remaining)
+        Some(self.remaining_pairs)
     }
 }
 
-struct CborEnumAccess<'de> {
+struct DirectEnumAccess<'a, 'de> {
+    de: &'a mut DirectDeserializer<'de>,
     variant: &'de str,
-    value: Option<CborValueRef<'de>>,
+    has_value: bool,
     off: usize,
 }
 
-impl<'de> EnumAccess<'de> for CborEnumAccess<'de> {
+impl<'a, 'de> EnumAccess<'de> for DirectEnumAccess<'a, 'de> {
     type Error = DeError;
-    type Variant = CborVariantAccess<'de>;
+    type Variant = DirectVariantAccess<'a, 'de>;
 
     fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), DeError>
     where
@@ -1340,27 +1623,34 @@ impl<'de> EnumAccess<'de> for CborEnumAccess<'de> {
         )?;
         Ok((
             v,
-            CborVariantAccess {
-                value: self.value,
+            DirectVariantAccess {
+                de: self.de,
+                has_value: self.has_value,
                 off: self.off,
             },
         ))
     }
 }
 
-struct CborVariantAccess<'de> {
-    value: Option<CborValueRef<'de>>,
+struct DirectVariantAccess<'a, 'de> {
+    de: &'a mut DirectDeserializer<'de>,
+    has_value: bool,
     off: usize,
 }
 
-impl<'de> VariantAccess<'de> for CborVariantAccess<'de> {
+impl<'de> VariantAccess<'de> for DirectVariantAccess<'_, 'de> {
     type Error = DeError;
 
     fn unit_variant(self) -> Result<(), DeError> {
-        match self.value {
-            None => Ok(()),
-            Some(v) if v.is_null() => Ok(()),
-            Some(_) => Err(DeError::new(ErrorCode::SerdeError, self.off)),
+        if !self.has_value {
+            return Ok(());
+        }
+        let is_null = self.de.consume_null()?;
+        if is_null {
+            self.de.exit_container();
+            Ok(())
+        } else {
+            Err(ser_err(self.off))
         }
     }
 
@@ -1368,22 +1658,24 @@ impl<'de> VariantAccess<'de> for CborVariantAccess<'de> {
     where
         T: DeserializeSeed<'de>,
     {
-        let v = self
-            .value
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
-        seed.deserialize(CborRefDeserializer::new(v))
+        if !self.has_value {
+            return Err(ser_err(self.off));
+        }
+        let value = seed.deserialize(&mut *self.de)?;
+        self.de.exit_container();
+        Ok(value)
     }
 
     fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let v = self
-            .value
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
-        let a = v.array().map_err(DeError::from)?;
-        let len = a.len();
-        visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
+        if !self.has_value {
+            return Err(ser_err(self.off));
+        }
+        let value = de::Deserializer::deserialize_seq(&mut *self.de, visitor)?;
+        self.de.exit_container();
+        Ok(value)
     }
 
     fn struct_variant<V>(
@@ -1394,59 +1686,91 @@ impl<'de> VariantAccess<'de> for CborVariantAccess<'de> {
     where
         V: Visitor<'de>,
     {
-        let v = self
-            .value
-            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
-        let m = v.map().map_err(DeError::from)?;
-        let len = m.len();
-        visitor.visit_map(CborMapAccess::new(m.iter(), len, v.offset()))
+        if !self.has_value {
+            return Err(ser_err(self.off));
+        }
+        let value = de::Deserializer::deserialize_map(&mut *self.de, visitor)?;
+        self.de.exit_container();
+        Ok(value)
     }
 }
 
-impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
+impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
     type Error = DeError;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let kind = self.v.kind().map_err(DeError::from)?;
-        match kind {
-            CborKind::Null => visitor.visit_unit(),
-            CborKind::Bool => visitor.visit_bool(self.v.bool().map_err(DeError::from)?),
-            CborKind::Text => visitor.visit_borrowed_str(self.v.text().map_err(DeError::from)?),
-            CborKind::Bytes => visitor.visit_borrowed_bytes(self.v.bytes().map_err(DeError::from)?),
-            CborKind::Float => visitor.visit_f64(self.v.float64().map_err(DeError::from)?),
-            CborKind::Integer => match self.v.integer().map_err(DeError::from)? {
-                CborIntegerRef::Safe(i) => {
-                    if i >= 0 {
-                        let n = u64::try_from(i).map_err(|_| ser_err(self.off()))?;
-                        visitor.visit_u64(n)
-                    } else {
-                        visitor.visit_i64(i)
-                    }
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 => {
+                let v = self.read_uint_arg_checked(ai, off)?;
+                if v > MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
-                CborIntegerRef::Big(b) => {
-                    let off = self.off();
-                    if b.is_negative() {
-                        let n = bigint_to_i128(true, b.magnitude()).ok_or_else(|| ser_err(off))?;
-                        visitor.visit_i128(n)
-                    } else {
-                        let n = bigint_to_u128(false, b.magnitude()).ok_or_else(|| ser_err(off))?;
-                        visitor.visit_u128(n)
-                    }
+                visitor.visit_u64(v)
+            }
+            1 => {
+                let n = self.read_uint_arg_checked(ai, off)?;
+                if n >= MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
+                let v = -1 - i128::from(n);
+                let out = i64::try_from(v).map_err(|_| ser_err(off))?;
+                visitor.visit_i64(out)
+            }
+            2 => {
+                let bytes = self.parse_bytes_from_header(off, ai)?;
+                visitor.visit_borrowed_bytes(bytes)
+            }
+            3 => {
+                let s = self.parse_text_from_header(off, ai)?;
+                visitor.visit_borrowed_str(s)
+            }
+            4 => {
+                let len = self.read_len_checked(ai, off)?;
+                let depth_entered = self.enter_array(len, off)?;
+                visitor.visit_seq(DirectSeqAccess::new(self, len, depth_entered))
+            }
+            5 => {
+                let len = self.read_len_checked(ai, off)?;
+                let depth_entered = self.enter_map(len, off)?;
+                visitor.visit_map(DirectMapAccess::new(self, len, depth_entered))
+            }
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                if negative {
+                    let n = bigint_to_i128(true, mag).ok_or_else(|| ser_err(off))?;
+                    visitor.visit_i128(n)
+                } else {
+                    let n = bigint_to_u128(false, mag).ok_or_else(|| ser_err(off))?;
+                    visitor.visit_u128(n)
+                }
+            }
+            7 => match ai {
+                20 => visitor.visit_bool(false),
+                21 => visitor.visit_bool(true),
+                22 => visitor.visit_unit(),
+                27 => {
+                    let bits = self.read_be_u64()?;
+                    validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                    visitor.visit_f64(f64::from_bits(bits))
+                }
+                24 => {
+                    let simple = self.read_u8()?;
+                    if simple < 24 {
+                        return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                    }
+                    Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off))
+                }
+                28..=30 => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+                _ => Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off)),
             },
-            CborKind::Array => {
-                let a = self.v.array().map_err(DeError::from)?;
-                let len = a.len();
-                visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
-            }
-            CborKind::Map => {
-                let m = self.v.map().map_err(DeError::from)?;
-                let len = m.len();
-                visitor.visit_map(CborMapAccess::new(m.iter(), len, self.off()))
-            }
+            _ => Err(DeError::new(ErrorCode::MalformedCanonical, off)),
         }
     }
 
@@ -1454,15 +1778,36 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_bool(self.v.bool().map_err(DeError::from)?)
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 7 {
+            return Err(DeError::new(ErrorCode::ExpectedBool, off));
+        }
+        match ai {
+            20 => visitor.visit_bool(false),
+            21 => visitor.visit_bool(true),
+            22 | 27 => Err(DeError::new(ErrorCode::ExpectedBool, off)),
+            24 => {
+                let simple = self.read_u8()?;
+                if simple < 24 {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+            _ => Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off)),
+        }
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let n = parse_i128(self.v)?;
-        let out = i8::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_i128()?;
+        let out = i8::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_i8(out)
     }
 
@@ -1470,8 +1815,9 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let n = parse_i128(self.v)?;
-        let out = i16::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_i128()?;
+        let out = i16::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_i16(out)
     }
 
@@ -1479,8 +1825,9 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let n = parse_i128(self.v)?;
-        let out = i32::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_i128()?;
+        let out = i32::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_i32(out)
     }
 
@@ -1488,22 +1835,23 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i64(parse_i64(self.v)?)
+        visitor.visit_i64(self.parse_i64()?)
     }
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_i128(parse_i128(self.v)?)
+        visitor.visit_i128(self.parse_i128()?)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let n = parse_u128(self.v)?;
-        let out = u8::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_u128()?;
+        let out = u8::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_u8(out)
     }
 
@@ -1511,8 +1859,9 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let n = parse_u128(self.v)?;
-        let out = u16::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_u128()?;
+        let out = u16::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_u16(out)
     }
 
@@ -1520,8 +1869,9 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let n = parse_u128(self.v)?;
-        let out = u32::try_from(n).map_err(|_| ser_err(self.off()))?;
+        let off = self.pos;
+        let n = self.parse_u128()?;
+        let out = u32::try_from(n).map_err(|_| ser_err(off))?;
         visitor.visit_u32(out)
     }
 
@@ -1529,21 +1879,22 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u64(parse_u64(self.v)?)
+        visitor.visit_u64(self.parse_u64()?)
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u128(parse_u128(self.v)?)
+        visitor.visit_u128(self.parse_u128()?)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let v = self.v.float64().map_err(DeError::from)?;
+        let off = self.pos;
+        let v = self.parse_float64()?;
         if v.is_nan() {
             return visitor.visit_f32(f32::NAN);
         }
@@ -1555,7 +1906,7 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
             });
         }
         if v > f64::from(f32::MAX) || v < f64::from(f32::MIN) {
-            return Err(ser_err(self.off()));
+            return Err(ser_err(off));
         }
         #[allow(clippy::cast_possible_truncation)]
         {
@@ -1567,18 +1918,25 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_f64(self.v.float64().map_err(DeError::from)?)
+        visitor.visit_f64(self.parse_float64()?)
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        let s = self.v.text().map_err(DeError::from)?;
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 3 {
+            return Err(DeError::new(ErrorCode::ExpectedText, off));
+        }
+        let s = self.parse_text_from_header(off, ai)?;
         let mut it = s.chars();
         match (it.next(), it.next()) {
             (Some(c), None) => visitor.visit_char(c),
-            _ => Err(ser_err(self.off())),
+            _ => Err(ser_err(off)),
         }
     }
 
@@ -1586,7 +1944,15 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_borrowed_str(self.v.text().map_err(DeError::from)?)
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 3 {
+            return Err(DeError::new(ErrorCode::ExpectedText, off));
+        }
+        let s = self.parse_text_from_header(off, ai)?;
+        visitor.visit_borrowed_str(s)
     }
 
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -1600,7 +1966,15 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        visitor.visit_borrowed_bytes(self.v.bytes().map_err(DeError::from)?)
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 2 {
+            return Err(DeError::new(ErrorCode::ExpectedBytes, off));
+        }
+        let bytes = self.parse_bytes_from_header(off, ai)?;
+        visitor.visit_borrowed_bytes(bytes)
     }
 
     fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -1614,7 +1988,8 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.v.is_null() {
+        if self.peek_u8()? == 0xf6 {
+            self.read_u8()?;
             visitor.visit_none()
         } else {
             visitor.visit_some(self)
@@ -1625,10 +2000,25 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        if self.v.is_null() {
-            visitor.visit_unit()
-        } else {
-            Err(ser_err(self.off()))
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 7 {
+            return Err(ser_err(off));
+        }
+        match ai {
+            22 => visitor.visit_unit(),
+            20 | 21 | 27 => Err(ser_err(off)),
+            24 => {
+                let simple = self.read_u8()?;
+                if simple < 24 {
+                    return Err(DeError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+            _ => Err(DeError::new(ErrorCode::UnsupportedSimpleValue, off)),
         }
     }
 
@@ -1658,9 +2048,16 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let a = self.v.array().map_err(DeError::from)?;
-        let len = a.len();
-        visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 4 {
+            return Err(DeError::new(ErrorCode::ExpectedArray, off));
+        }
+        let len = self.read_len_checked(ai, off)?;
+        let depth_entered = self.enter_array(len, off)?;
+        visitor.visit_seq(DirectSeqAccess::new(self, len, depth_entered))
     }
 
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, DeError>
@@ -1686,9 +2083,16 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let m = self.v.map().map_err(DeError::from)?;
-        let len = m.len();
-        visitor.visit_map(CborMapAccess::new(m.iter(), len, self.off()))
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        if major != 5 {
+            return Err(DeError::new(ErrorCode::ExpectedMap, off));
+        }
+        let len = self.read_len_checked(ai, off)?;
+        let depth_entered = self.enter_map(len, off)?;
+        visitor.visit_map(DirectMapAccess::new(self, len, depth_entered))
     }
 
     fn deserialize_struct<V>(
@@ -1712,33 +2116,39 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let off = self.off();
-        match self.v.kind().map_err(DeError::from)? {
-            CborKind::Text => {
-                let variant = self.v.text().map_err(DeError::from)?;
-                visitor.visit_enum(CborEnumAccess {
+        let off = self.pos;
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            3 => {
+                let variant = self.parse_text_from_header(off, ai)?;
+                visitor.visit_enum(DirectEnumAccess {
+                    de: self,
                     variant,
-                    value: None,
+                    has_value: false,
                     off,
                 })
             }
-            CborKind::Map => {
-                let m = self.v.map().map_err(DeError::from)?;
-                if m.len() != 1 {
-                    return Err(DeError::new(ErrorCode::SerdeError, off));
+            5 => {
+                let len = self.read_len_checked(ai, off)?;
+                if len != 1 {
+                    return Err(ser_err(off));
                 }
-                let (k, v) = m
-                    .iter()
-                    .next()
-                    .ok_or_else(|| DeError::new(ErrorCode::MalformedCanonical, off))?
-                    .map_err(DeError::from)?;
-                visitor.visit_enum(CborEnumAccess {
-                    variant: k,
-                    value: Some(v),
+                let depth_entered = self.enter_map(len, off)?;
+                if !depth_entered {
+                    return Err(ser_err(off));
+                }
+                let mut prev_key_range = None;
+                let variant = self.parse_text_key(&mut prev_key_range)?;
+                visitor.visit_enum(DirectEnumAccess {
+                    de: self,
+                    variant,
+                    has_value: true,
                     off,
                 })
             }
-            _ => Err(DeError::new(ErrorCode::SerdeError, off)),
+            _ => Err(ser_err(off)),
         }
     }
 
@@ -1753,8 +2163,27 @@ impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
+        let _ = serde::de::IgnoredAny::deserialize(self)?;
         visitor.visit_unit()
     }
+}
+
+/// Deserialize `T` with zero-copy borrows, validating during parsing.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or if deserialization fails.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    let mut de = DirectDeserializer::new(bytes, limits)?;
+    let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
+    if de.offset() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
+    }
+    Ok(value)
 }
 
 fn int_to_value(v: i128) -> Result<CborValue, SerdeError> {

@@ -1,5 +1,3 @@
-// src/macros.rs
-
 //! CBOR construction macro.
 //!
 //! This module provides [`cbor!`], a convenient macro to build [`crate::CborValue`] trees.

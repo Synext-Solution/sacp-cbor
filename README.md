@@ -900,8 +900,6 @@ assert_eq!(decoded, msg);
 ### Borrowed deserialization helpers
 
 - `from_slice_borrowed<T: Deserialize>(bytes, limits) -> Result<T, CborError>`
-- `from_bytes_ref_borrowed<T: Deserialize>(CborBytesRef) -> Result<T, CborError>`
-- `from_value_ref_borrowed<T: Deserialize>(CborValueRef) -> Result<T, CborError>`
 
 ### `serde_value` helper module
 
@@ -1106,7 +1104,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Serde (`serde` + `alloc`)
 
-- `to_vec`, `from_slice`, `from_value_ref` (borrowed)
+- `to_vec`, `from_slice`, `from_slice_borrowed`
 - `serde_value` helpers for struct fields
 - numeric bignums are limited to `i128/u128` roundtrips through serde
 
@@ -1128,7 +1126,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
   `CborBytesRef::edit` / `CborBytes::edit`
 
 - **You need serde:**
-  `to_vec/from_slice` (or `from_value_ref` for already-validated bytes)
+  `to_vec/from_slice` (or `from_slice_borrowed` when you want borrows)
 
 ---
 

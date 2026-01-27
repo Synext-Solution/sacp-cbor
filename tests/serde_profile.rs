@@ -1,6 +1,6 @@
 #![cfg(feature = "serde")]
 
-use sacp_cbor::{from_slice, from_value_ref, to_vec, validate_canonical, DecodeLimits, ErrorCode};
+use sacp_cbor::{from_slice, to_vec, DecodeLimits, ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -76,19 +76,11 @@ fn serde_roundtrip_struct_and_enum() {
     };
 
     let bytes = to_vec(&m).unwrap();
-    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
-    let decoded: Msg = from_value_ref(canon.root()).unwrap();
-    assert_eq!(decoded, m);
-
     let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(decoded, m);
 
     let s = Simple::Count(7);
     let bytes = to_vec(&s).unwrap();
-    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
-    let decoded: Simple = from_value_ref(canon.root()).unwrap();
-    assert_eq!(decoded, s);
-
     let decoded: Simple = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(decoded, s);
 }

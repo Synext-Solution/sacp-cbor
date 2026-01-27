@@ -112,10 +112,7 @@ pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue};
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::serde_value;
 #[cfg(feature = "serde")]
-pub use crate::serde_impl::{
-    from_bytes_ref_borrowed, from_slice, from_slice_borrowed, from_value_ref,
-    from_value_ref_borrowed, to_vec, CborRefDeserializer, DeError,
-};
+pub use crate::serde_impl::{from_slice, from_slice_borrowed, to_vec, DeError};
 
 /// Construct a path slice for query/edit operations.
 #[macro_export]

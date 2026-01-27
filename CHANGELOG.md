@@ -2,8 +2,8 @@
 
 ## 0.7.0
 
-- **Breaking:** removed serde `to_value` / `from_value` conversion helpers; serde now streams directly to `Encoder` and decodes via borrowed `CborValueRef`.
-- Added zero-copy serde deserialization helpers (`from_slice_borrowed`, `from_bytes_ref_borrowed`, `from_value_ref_borrowed`) and `CborRefDeserializer`.
+- **Breaking:** removed serde `to_value` / `from_value` conversion helpers; serde now streams directly to `Encoder` and validates+deserializes in a single pass from bytes (`from_slice` / `from_slice_borrowed`).
+- **Breaking:** removed `from_value_ref`, `from_bytes_ref_borrowed`, `from_value_ref_borrowed`, and `CborRefDeserializer` in favor of the direct single-pass deserializer.
 
 ## 0.6.0
 
