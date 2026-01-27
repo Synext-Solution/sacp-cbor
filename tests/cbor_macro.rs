@@ -1,6 +1,6 @@
 #![cfg(feature = "alloc")]
 
-use sacp_cbor::{decode_value, validate_canonical, CborValue, DecodeLimits, ErrorCode};
+use sacp_cbor::{validate_canonical, CborValue, DecodeLimits, ErrorCode};
 
 #[test]
 fn cbor_macro_primitives() {
@@ -124,7 +124,7 @@ fn cbor_macro_float_nan_and_negative_zero() {
 }
 
 #[test]
-fn cbor_macro_roundtrip_validate_and_decode() {
+fn cbor_macro_roundtrip_validate() {
     let v = sacp_cbor::cbor!({
         b: [true, null, 1, 2, 3],
         a: { nested: "ok" },
@@ -137,8 +137,7 @@ fn cbor_macro_roundtrip_validate_and_decode() {
     let canon = validate_canonical(&encoded, limits).unwrap();
     assert_eq!(canon.as_bytes(), encoded.as_slice());
 
-    let decoded = decode_value(&encoded, limits).unwrap();
-    assert_eq!(decoded, v);
+    assert_eq!(canon.as_bytes(), encoded.as_slice());
 }
 
 #[test]

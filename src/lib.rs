@@ -67,10 +67,8 @@ mod query;
 mod scalar;
 #[cfg(feature = "serde")]
 mod serde_impl;
-mod stream;
+mod wire;
 
-#[cfg(feature = "alloc")]
-mod decode;
 #[cfg(feature = "alloc")]
 mod edit;
 #[cfg(feature = "alloc")]
@@ -96,8 +94,6 @@ mod value;
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CborBytes;
 #[cfg(feature = "alloc")]
-pub use crate::decode::{decode_value, decode_value_trusted};
-#[cfg(feature = "alloc")]
 pub use crate::edit::{
     ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
 };
@@ -112,7 +108,10 @@ pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue};
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::serde_value;
 #[cfg(feature = "serde")]
-pub use crate::serde_impl::{from_slice, from_slice_borrowed, to_vec, DeError};
+pub use crate::serde_impl::{
+    from_canonical_bytes, from_canonical_bytes_ref, from_slice, from_slice_borrowed, to_vec,
+    DeError,
+};
 
 /// Construct a path slice for query/edit operations.
 #[macro_export]

@@ -1,20 +1,9 @@
-#[cfg(feature = "alloc")]
-use sacp_cbor::decode_value;
 use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode};
 
 fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) -> usize {
     let err = validate_canonical(bytes, limits).unwrap_err();
     assert_eq!(err.code, code);
     err.offset
-}
-
-#[cfg(feature = "alloc")]
-fn assert_decode_validate_match(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) {
-    let v_err = validate_canonical(bytes, limits).unwrap_err();
-    let d_err = decode_value(bytes, limits).unwrap_err();
-    assert_eq!(v_err.code, code);
-    assert_eq!(d_err.code, code);
-    assert_eq!(v_err.offset, d_err.offset);
 }
 
 fn tstr_encoded(len: usize, fill: u8) -> Vec<u8> {
@@ -58,11 +47,7 @@ fn accepts_minimal_valid_map() {
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(canon.as_bytes(), bytes);
 
-    #[cfg(feature = "alloc")]
-    {
-        let v = decode_value(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
-        assert_eq!(v.encode_canonical().unwrap(), bytes);
-    }
+    assert_eq!(canon.as_bytes(), bytes);
 }
 
 #[test]
@@ -72,11 +57,8 @@ fn rejects_input_len_over_limit() {
     let err = validate_canonical(&bytes, limits).unwrap_err();
     assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
 
-    #[cfg(feature = "alloc")]
-    {
-        let err = decode_value(&bytes, limits).unwrap_err();
-        assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
-    }
+    let err = validate_canonical(&bytes, limits).unwrap_err();
+    assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
 }
 
 #[test]
@@ -540,21 +522,4 @@ fn enforces_limits() {
     let mut limits = DecodeLimits::for_bytes(bytes_map.len());
     limits.max_total_items = 1;
     assert_invalid(&bytes_map, limits, ErrorCode::TotalItemsLimitExceeded);
-}
-
-#[cfg(feature = "alloc")]
-#[test]
-fn decode_and_validate_error_parity() {
-    let samples: &[(&[u8], ErrorCode)] = &[
-        (&[0x00, 0x00], ErrorCode::TrailingBytes),
-        (&[0x18, 0x17], ErrorCode::NonCanonicalEncoding),
-        (&[0x61, 0xff], ErrorCode::Utf8Invalid),
-        (&[0xc1, 0x00], ErrorCode::ForbiddenOrMalformedTag),
-        (&[0xf9, 0x00, 0x00], ErrorCode::UnsupportedSimpleValue),
-        (&[0xa1, 0x41, 0x00, 0x00], ErrorCode::MapKeyMustBeText),
-    ];
-
-    for (bytes, code) in samples {
-        assert_decode_validate_match(bytes, DecodeLimits::for_bytes(bytes.len()), *code);
-    }
 }

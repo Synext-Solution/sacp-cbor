@@ -1,6 +1,6 @@
 #![cfg(feature = "alloc")]
 
-use sacp_cbor::{decode_value, validate_canonical, CborMap, CborValue, DecodeLimits, PathElem};
+use sacp_cbor::{validate_canonical, CborMap, CborValue, DecodeLimits, PathElem};
 
 #[test]
 fn ref_query_matches_decoded_value_query() {
@@ -40,7 +40,6 @@ fn ref_query_matches_decoded_value_query() {
     let limits = DecodeLimits::for_bytes(bytes.len());
 
     let canon = validate_canonical(&bytes, limits).unwrap();
-    let decoded = decode_value(&bytes, limits).unwrap();
 
     let path_name = [
         PathElem::Key("user"),
@@ -49,7 +48,7 @@ fn ref_query_matches_decoded_value_query() {
     ];
 
     let got_ref = canon.at(&path_name).unwrap().unwrap();
-    let got_owned = decoded.at(&path_name).unwrap().unwrap();
+    let got_owned = v.at(&path_name).unwrap().unwrap();
 
     assert_eq!(
         got_ref.as_bytes(),
@@ -64,7 +63,7 @@ fn ref_query_matches_decoded_value_query() {
     ];
 
     let got_ref = canon.at(&path_tag1).unwrap().unwrap();
-    let got_owned = decoded.at(&path_tag1).unwrap().unwrap();
+    let got_owned = v.at(&path_tag1).unwrap().unwrap();
 
     assert_eq!(got_ref.text().unwrap(), "b");
     assert_eq!(
@@ -109,11 +108,7 @@ fn cbormap_get_many_sorted_single_pass() {
         .unwrap(),
     );
 
-    let bytes = v.encode_canonical().unwrap();
-    let limits = DecodeLimits::for_bytes(bytes.len());
-    let decoded = decode_value(&bytes, limits).unwrap();
-
-    let map = decoded.as_map().expect("expected map");
+    let map = v.as_map().expect("expected map");
 
     let out = map.get_many_sorted(["a", "b", "c"]).unwrap();
     assert_eq!(out[0].unwrap(), &CborValue::int(1).unwrap());

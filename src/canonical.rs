@@ -194,6 +194,13 @@ impl CborBytes {
         &self.bytes
     }
 
+    /// Borrow the canonical bytes as a validated reference wrapper.
+    #[inline]
+    #[must_use]
+    pub fn as_ref(&self) -> CborBytesRef<'_> {
+        CborBytesRef::new(self.as_bytes())
+    }
+
     /// Consume and return the canonical bytes.
     #[inline]
     #[must_use]

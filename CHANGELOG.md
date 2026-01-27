@@ -4,6 +4,8 @@
 
 - **Breaking:** removed serde `to_value` / `from_value` conversion helpers; serde now streams directly to `Encoder` and validates+deserializes in a single pass from bytes (`from_slice` / `from_slice_borrowed`).
 - **Breaking:** removed `from_value_ref`, `from_bytes_ref_borrowed`, `from_value_ref_borrowed`, and `CborRefDeserializer` in favor of the direct single-pass deserializer.
+- **Breaking:** removed `decode_value`, `decode_value_trusted`, and `decode_value_canonical`; owned decoding now goes through serde `from_slice` / `from_slice_borrowed` (single-pass, inline validation).
+- Added canonical-trusted serde decode helpers (`from_canonical_bytes_ref`, `from_canonical_bytes`) for validated canonical bytes.
 
 ## 0.6.0
 

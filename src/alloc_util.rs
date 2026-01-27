@@ -27,6 +27,13 @@ pub fn try_reserve_exact<T>(
 
 #[inline]
 pub fn try_reserve<T>(v: &mut Vec<T>, additional: usize, offset: usize) -> Result<(), CborError> {
+    let needed = v
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
+    if needed <= v.capacity() {
+        return Ok(());
+    }
     check_reserve_len::<T>(v.len(), additional, offset)?;
     v.try_reserve(additional)
         .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))

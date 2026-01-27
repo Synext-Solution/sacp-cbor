@@ -43,13 +43,6 @@ impl F64Bits {
         self.0
     }
 
-    /// Internal constructor used by the decoder after validation.
-    #[inline]
-    #[cfg(feature = "alloc")]
-    pub(crate) const fn new_unchecked(bits: u64) -> Self {
-        Self(bits)
-    }
-
     /// Convert into an `f64`.
     #[inline]
     #[must_use]

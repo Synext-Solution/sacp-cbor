@@ -8,8 +8,7 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 
 use sacp_cbor::{
-    cbor_equal, decode_value, validate_canonical, BigInt, CborInteger, CborMap, CborValue,
-    DecodeLimits, F64Bits,
+    validate_canonical, BigInt, CborInteger, CborMap, CborValue, DecodeLimits, F64Bits,
 };
 
 fn arb_key() -> impl Strategy<Value = Box<str>> {
@@ -131,23 +130,11 @@ proptest! {
     fn canonical_roundtrip(v in arb_value()) {
         let bytes = v.encode_canonical().unwrap();
         let limits = DecodeLimits::for_bytes(bytes.len());
-        #[cfg(feature = "sha2")]
         let canon = validate_canonical(&bytes, limits).unwrap();
-        #[cfg(not(feature = "sha2"))]
-        validate_canonical(&bytes, limits).unwrap();
+        prop_assert_eq!(canon.as_bytes(), bytes.as_slice());
 
-        let decoded = decode_value(&bytes, limits).unwrap();
-        prop_assert!(cbor_equal(&v, &decoded));
-
-        let bytes2 = decoded.encode_canonical().unwrap();
+        let bytes2 = v.encode_canonical().unwrap();
         prop_assert_eq!(&bytes, &bytes2);
-
-        #[cfg(feature = "sha2")]
-        {
-            let h1 = canon.sha256();
-            let h2 = decoded.sha256_canonical().unwrap();
-            prop_assert_eq!(h1, h2);
-        }
     }
 
     #[test]

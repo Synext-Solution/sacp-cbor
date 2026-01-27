@@ -13,7 +13,7 @@ use core::cmp::Ordering;
 use crate::canonical::CborBytesRef;
 use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
-use crate::stream::CborStream;
+use crate::wire;
 use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
@@ -211,9 +211,9 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError` if the underlying bytes are malformed.
     pub fn kind(self) -> Result<CborKind, CborError> {
-        let mut s = CborStream::new(self.data, self.start);
+        let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8(&mut s)?;
+        let ib = read_u8_trusted(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -224,7 +224,7 @@ impl<'a> CborValueRef<'a> {
             4 => Ok(CborKind::Array),
             5 => Ok(CborKind::Map),
             6 => {
-                let tag = read_uint_arg(&mut s, ai, off)?;
+                let tag = read_uint_trusted(self.data, &mut pos, ai, off)?;
                 match tag {
                     2 | 3 => Ok(CborKind::Integer),
                     _ => Err(malformed(off)),
@@ -325,41 +325,41 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError::ExpectedInteger` if the value is not an integer or is malformed.
     pub fn integer(self) -> Result<CborIntegerRef<'a>, CborError> {
-        let mut s = CborStream::new(self.data, self.start);
+        let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8(&mut s)?;
+        let ib = read_u8_trusted(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         match major {
             0 => {
-                let u = read_uint_arg(&mut s, ai, off)?;
+                let u = read_uint_trusted(self.data, &mut pos, ai, off)?;
                 let i = i64::try_from(u).map_err(|_| malformed(off))?;
                 Ok(CborIntegerRef::Safe(i))
             }
             1 => {
-                let n = read_uint_arg(&mut s, ai, off)?;
+                let n = read_uint_trusted(self.data, &mut pos, ai, off)?;
                 let n_i = i64::try_from(n).map_err(|_| malformed(off))?;
                 Ok(CborIntegerRef::Safe(-1 - n_i))
             }
             6 => {
-                let tag = read_uint_arg(&mut s, ai, off)?;
+                let tag = read_uint_trusted(self.data, &mut pos, ai, off)?;
                 let negative = match tag {
                     2 => false,
                     3 => true,
                     _ => return Err(expected_integer(off)),
                 };
 
-                let m_off = s.position();
-                let first = read_u8(&mut s)?;
+                let m_off = pos;
+                let first = read_u8_trusted(self.data, &mut pos)?;
                 let m_major = first >> 5;
                 let m_ai = first & 0x1f;
                 if m_major != 2 {
                     return Err(malformed(m_off));
                 }
 
-                let m_len = read_len(&mut s, m_ai, m_off)?;
-                let mag = read_exact(&mut s, m_len)?;
+                let m_len = read_len_trusted(self.data, &mut pos, m_ai, m_off)?;
+                let mag = read_exact_trusted(self.data, &mut pos, m_len)?;
 
                 Ok(CborIntegerRef::Big(BigIntRef {
                     negative,
@@ -376,9 +376,9 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError::ExpectedText` if the value is not a text string or is malformed.
     pub fn text(self) -> Result<&'a str, CborError> {
-        let mut s = CborStream::new(self.data, self.start);
+        let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8(&mut s)?;
+        let ib = read_u8_trusted(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -386,8 +386,8 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_text(off));
         }
 
-        let len = read_len(&mut s, ai, off)?;
-        let bytes = read_exact(&mut s, len)?;
+        let len = read_len_trusted(self.data, &mut pos, ai, off)?;
+        let bytes = read_exact_trusted(self.data, &mut pos, len)?;
         let s = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
         Ok(s)
     }
@@ -398,9 +398,9 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError::ExpectedBytes` if the value is not a byte string or is malformed.
     pub fn bytes(self) -> Result<&'a [u8], CborError> {
-        let mut s = CborStream::new(self.data, self.start);
+        let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8(&mut s)?;
+        let ib = read_u8_trusted(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -408,8 +408,8 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_bytes(off));
         }
 
-        let len = read_len(&mut s, ai, off)?;
-        let bytes = read_exact(&mut s, len)?;
+        let len = read_len_trusted(self.data, &mut pos, ai, off)?;
+        let bytes = read_exact_trusted(self.data, &mut pos, len)?;
         Ok(bytes)
     }
 
@@ -435,9 +435,9 @@ impl<'a> CborValueRef<'a> {
     ///
     /// Returns `CborError::ExpectedFloat` if the value is not a float64 or is malformed.
     pub fn float64(self) -> Result<f64, CborError> {
-        let mut s = CborStream::new(self.data, self.start);
+        let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8(&mut s)?;
+        let ib = read_u8_trusted(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -445,7 +445,7 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_float(off));
         }
 
-        let b = read_exact(&mut s, 8)?;
+        let b = read_exact_trusted(self.data, &mut pos, 8)?;
         let bits = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
         Ok(f64::from_bits(bits))
     }
@@ -497,9 +497,9 @@ impl<'a> MapRef<'a> {
 
         for _ in 0..self.len {
             let key_off = pos;
-            let mut s = CborStream::new(self.data, pos);
-            let parsed = read_text(&mut s)?;
-            let value_start = s.position();
+            let mut key_pos = pos;
+            let parsed = read_text(self.data, &mut key_pos)?;
+            let value_start = key_pos;
 
             let cmp = cmp_text_key_bytes_to_query(parsed.bytes, key);
             match cmp {
@@ -909,19 +909,6 @@ impl CborBytes {
 }
 
 #[cfg(feature = "alloc")]
-#[allow(clippy::elidable_lifetime_names)]
-impl<'a> CborValueRef<'a> {
-    /// Convert this borrowed value into an owned [`CborValue`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `CborError` if the value is malformed.
-    pub fn to_owned(self) -> Result<CborValue, CborError> {
-        parse::decode_value_trusted_range(self.data, self.start, self.end)
-    }
-}
-
-#[cfg(feature = "alloc")]
 impl CborValue {
     /// Traverses a nested path inside a decoded `CborValue`.
     ///
@@ -1046,28 +1033,32 @@ impl CborMap {
  * ========================= */
 
 #[inline]
-const fn map_stream_err(cause: CborError) -> CborError {
+const fn map_trusted_err(cause: CborError) -> CborError {
     err(ErrorCode::MalformedCanonical, cause.offset)
 }
 
 #[inline]
-fn read_u8(s: &mut CborStream<'_>) -> Result<u8, CborError> {
-    s.read_u8().map_err(map_stream_err)
+fn read_u8_trusted(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {
+    wire::read_u8(data, pos).map_err(map_trusted_err)
 }
 
 #[inline]
-fn read_exact<'a>(s: &mut CborStream<'a>, n: usize) -> Result<&'a [u8], CborError> {
-    s.read_exact(n).map_err(map_stream_err)
+fn read_exact_trusted<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    n: usize,
+) -> Result<&'a [u8], CborError> {
+    wire::read_exact(data, pos, n).map_err(map_trusted_err)
 }
 
 #[inline]
-fn read_uint_arg(s: &mut CborStream<'_>, ai: u8, off: usize) -> Result<u64, CborError> {
-    s.read_uint_arg(ai, off).map_err(map_stream_err)
+fn read_uint_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result<u64, CborError> {
+    wire::read_uint_trusted(data, pos, ai, off).map_err(map_trusted_err)
 }
 
 #[inline]
-fn read_len(s: &mut CborStream<'_>, ai: u8, off: usize) -> Result<usize, CborError> {
-    let n = s.read_len_arg(ai, off).map_err(map_stream_err)?;
+fn read_len_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result<usize, CborError> {
+    let n = wire::read_len_trusted(data, pos, ai, off).map_err(map_trusted_err)?;
     usize::try_from(n).map_err(|_| malformed(off))
 }
 
@@ -1096,9 +1087,9 @@ impl<'a> MapScanState<'a> {
 
     fn fill_cache(&mut self) -> Result<(), CborError> {
         if self.cached.is_none() {
-            let mut s = CborStream::new(self.data, self.pos);
-            let parsed = read_text(&mut s)?;
-            let value_start = s.position();
+            let mut key_pos = self.pos;
+            let parsed = read_text(self.data, &mut key_pos)?;
+            let value_start = key_pos;
             self.pos = value_start;
             self.cached = Some(CachedKey {
                 key_bytes: parsed.bytes,
@@ -1214,9 +1205,9 @@ fn scan_sorted_iter<'a, I, V>(
     }
 }
 
-fn read_text<'a>(s: &mut CborStream<'a>) -> Result<ParsedText<'a>, CborError> {
-    let off = s.position();
-    let ib = read_u8(s)?;
+fn read_text<'a>(data: &'a [u8], pos: &mut usize) -> Result<ParsedText<'a>, CborError> {
+    let off = *pos;
+    let ib = read_u8_trusted(data, pos)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
@@ -1224,8 +1215,8 @@ fn read_text<'a>(s: &mut CborStream<'a>) -> Result<ParsedText<'a>, CborError> {
         return Err(malformed(off));
     }
 
-    let len = read_len(s, ai, off)?;
-    let bytes = read_exact(s, len)?;
+    let len = read_len_trusted(data, pos, ai, off)?;
+    let bytes = read_exact_trusted(data, pos, len)?;
     let text = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
     Ok(ParsedText { s: text, bytes })
 }
@@ -1235,9 +1226,9 @@ fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
 }
 
 fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
-    let mut s = CborStream::new(data, start);
+    let mut pos = start;
     let off = start;
-    let ib = read_u8(&mut s)?;
+    let ib = read_u8_trusted(data, &mut pos)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
@@ -1245,14 +1236,14 @@ fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborErr
         return Err(expected_map(off));
     }
 
-    let len = read_len(&mut s, ai, off)?;
-    Ok((len, s.position()))
+    let len = read_len_trusted(data, &mut pos, ai, off)?;
+    Ok((len, pos))
 }
 
 fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
-    let mut s = CborStream::new(data, start);
+    let mut pos = start;
     let off = start;
-    let ib = read_u8(&mut s)?;
+    let ib = read_u8_trusted(data, &mut pos)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
@@ -1260,8 +1251,8 @@ fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborE
         return Err(expected_array(off));
     }
 
-    let len = read_len(&mut s, ai, off)?;
-    Ok((len, s.position()))
+    let len = read_len_trusted(data, &mut pos, ai, off)?;
+    Ok((len, pos))
 }
 
 fn cmp_text_key_bytes_to_query(key_payload: &[u8], query: &str) -> Ordering {
@@ -1344,8 +1335,8 @@ impl<'a> Iterator for MapIter<'a> {
             return None;
         }
 
-        let mut s = CborStream::new(self.data, self.pos);
-        let parsed = match read_text(&mut s) {
+        let mut key_pos = self.pos;
+        let parsed = match read_text(self.data, &mut key_pos) {
             Ok(v) => v,
             Err(e) => {
                 self.remaining = 0;
@@ -1353,7 +1344,7 @@ impl<'a> Iterator for MapIter<'a> {
             }
         };
 
-        let value_start = s.position();
+        let value_start = key_pos;
         let end = match value_end(self.data, value_start) {
             Ok(e) => e,
             Err(e) => {
@@ -1392,15 +1383,15 @@ impl<'a> Iterator for MapIterEncoded<'a> {
         }
 
         let key_start = self.pos;
-        let mut s = CborStream::new(self.data, self.pos);
-        let parsed = match read_text(&mut s) {
+        let mut key_pos = self.pos;
+        let parsed = match read_text(self.data, &mut key_pos) {
             Ok(v) => v,
             Err(e) => {
                 self.remaining = 0;
                 return Some(Err(e));
             }
         };
-        let key_end = s.position();
+        let key_end = key_pos;
 
         let value_start = key_end;
         let end = match value_end(self.data, value_start) {

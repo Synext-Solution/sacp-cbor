@@ -3,7 +3,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 
-use sacp_cbor::{decode_value, validate_canonical, CborMap, CborValue, DecodeLimits};
+use sacp_cbor::{from_slice, validate_canonical, CborMap, CborValue, DecodeLimits};
 
 fn sample_small() -> Vec<u8> {
     vec![0xa1, 0x61, 0x61, 0x01] // {"a":1}
@@ -76,21 +76,21 @@ fn bench_validate(c: &mut Criterion) {
         })
     });
 
-    c.bench_function("decode_value_medium", |b| {
+    c.bench_function("from_slice_medium", |b| {
         b.iter(|| {
-            let v = decode_value(black_box(&medium), medium_limits).unwrap();
+            let v: CborValue = from_slice(black_box(&medium), medium_limits).unwrap();
             black_box(v);
         })
     });
 
-    c.bench_function("decode_value_deep", |b| {
+    c.bench_function("from_slice_deep", |b| {
         b.iter(|| {
-            let v = decode_value(black_box(&deep), deep_limits).unwrap();
+            let v: CborValue = from_slice(black_box(&deep), deep_limits).unwrap();
             black_box(v);
         })
     });
 
-    let decoded = decode_value(&medium, medium_limits).unwrap();
+    let decoded: CborValue = from_slice(&medium, medium_limits).unwrap();
     c.bench_function("encode_canonical_medium", |b| {
         b.iter(|| {
             let bytes = decoded.encode_canonical().unwrap();

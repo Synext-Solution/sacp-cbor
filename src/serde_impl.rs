@@ -9,6 +9,7 @@ use serde::de::{
 use serde::ser::{self, SerializeMap, SerializeSeq, SerializeStruct};
 use serde::{Deserialize as SerdeDeserialize, Serialize, Serializer};
 
+use crate::canonical::{CborBytes, CborBytesRef};
 use crate::encode::Encoder;
 use crate::int::{integer_from_i128, integer_from_u128};
 use crate::profile::{
@@ -259,7 +260,8 @@ impl<'de> Visitor<'de> for CborValueVisitor {
         let mut items: Vec<CborValue> = match seq.size_hint() {
             Some(len) => crate::alloc_util::try_vec_with_capacity(len, 0)
                 .map_err(|_| <A::Error as serde::de::Error>::custom("allocation failed"))?,
-            None => Vec::new(),
+            None => crate::alloc_util::try_vec_with_capacity(8, 0)
+                .map_err(|_| <A::Error as serde::de::Error>::custom("allocation failed"))?,
         };
         while let Some(v) = seq.next_element::<CborValue>()? {
             crate::alloc_util::try_reserve(&mut items, 1, 0).map_err(|err| {
@@ -281,7 +283,8 @@ impl<'de> Visitor<'de> for CborValueVisitor {
         let mut entries: Vec<(Box<str>, CborValue)> = match map.size_hint() {
             Some(len) => crate::alloc_util::try_vec_with_capacity(len, 0)
                 .map_err(|_| <M::Error as serde::de::Error>::custom("allocation failed"))?,
-            None => Vec::new(),
+            None => crate::alloc_util::try_vec_with_capacity(8, 0)
+                .map_err(|_| <M::Error as serde::de::Error>::custom("allocation failed"))?,
         };
         while let Some((k, v)) = map.next_entry::<Box<str>, CborValue>()? {
             crate::alloc_util::try_reserve(&mut entries, 1, 0).map_err(|err| {
@@ -323,7 +326,7 @@ pub fn from_slice<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let mut de = DirectDeserializer::new(bytes, limits)?;
+    let mut de = DirectDeserializer::new_checked(bytes, limits)?;
     let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
     if de.offset() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
@@ -1114,10 +1117,25 @@ struct DirectDeserializer<'de> {
     limits: DecodeLimits,
     items_seen: usize,
     depth: usize,
+    mode: Mode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Checked,
+    CanonicalTrusted,
 }
 
 impl<'de> DirectDeserializer<'de> {
-    const fn new(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+    const fn new_checked(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        Self::new(input, limits, Mode::Checked)
+    }
+
+    const fn new_trusted(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        Self::new(input, limits, Mode::CanonicalTrusted)
+    }
+
+    const fn new(input: &'de [u8], limits: DecodeLimits, mode: Mode) -> Result<Self, CborError> {
         if input.len() > limits.max_input_bytes {
             return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
         }
@@ -1127,6 +1145,7 @@ impl<'de> DirectDeserializer<'de> {
             limits,
             items_seen: 0,
             depth: 0,
+            mode,
         })
     }
 
@@ -1219,12 +1238,45 @@ impl<'de> DirectDeserializer<'de> {
         }
     }
 
+    fn read_uint_arg_trusted(&mut self, ai: u8, off: usize) -> Result<u64, DeError> {
+        match ai {
+            0..=23 => Ok(u64::from(ai)),
+            24 => Ok(u64::from(self.read_u8()?)),
+            25 => Ok(u64::from(self.read_be_u16()?)),
+            26 => Ok(u64::from(self.read_be_u32()?)),
+            27 => Ok(self.read_be_u64()?),
+            _ => Err(DeError::new(ErrorCode::ReservedAdditionalInfo, off)),
+        }
+    }
+
+    fn read_uint_arg(&mut self, ai: u8, off: usize) -> Result<u64, DeError> {
+        match self.mode {
+            Mode::Checked => self.read_uint_arg_checked(ai, off),
+            Mode::CanonicalTrusted => self.read_uint_arg_trusted(ai, off),
+        }
+    }
+
     fn read_len_checked(&mut self, ai: u8, off: usize) -> Result<usize, DeError> {
         if ai == 31 {
             return Err(DeError::new(ErrorCode::IndefiniteLengthForbidden, off));
         }
         let len = self.read_uint_arg_checked(ai, off)?;
         usize::try_from(len).map_err(|_| DeError::new(ErrorCode::LengthOverflow, off))
+    }
+
+    fn read_len_trusted(&mut self, ai: u8, off: usize) -> Result<usize, DeError> {
+        if ai == 31 {
+            return Err(DeError::new(ErrorCode::IndefiniteLengthForbidden, off));
+        }
+        let len = self.read_uint_arg_trusted(ai, off)?;
+        usize::try_from(len).map_err(|_| DeError::new(ErrorCode::LengthOverflow, off))
+    }
+
+    fn read_len(&mut self, ai: u8, off: usize) -> Result<usize, DeError> {
+        match self.mode {
+            Mode::Checked => self.read_len_checked(ai, off),
+            Mode::CanonicalTrusted => self.read_len_trusted(ai, off),
+        }
     }
 
     const fn enforce_len(
@@ -1258,7 +1310,7 @@ impl<'de> DirectDeserializer<'de> {
     }
 
     fn parse_text_from_header(&mut self, off: usize, ai: u8) -> Result<&'de str, DeError> {
-        let len = self.read_len_checked(ai, off)?;
+        let len = self.read_len(ai, off)?;
         Self::enforce_len(
             len,
             self.limits.max_text_len,
@@ -1272,7 +1324,7 @@ impl<'de> DirectDeserializer<'de> {
     }
 
     fn parse_bytes_from_header(&mut self, off: usize, ai: u8) -> Result<&'de [u8], DeError> {
-        let len = self.read_len_checked(ai, off)?;
+        let len = self.read_len(ai, off)?;
         Self::enforce_len(
             len,
             self.limits.max_bytes_len,
@@ -1295,22 +1347,24 @@ impl<'de> DirectDeserializer<'de> {
         }
         let s = self.parse_text_from_header(key_start, ai)?;
         let key_end = self.pos;
-        if let Some((ps, pe)) = *prev_key_range {
-            let prev = &self.input[ps..pe];
-            let curr = &self.input[key_start..key_end];
-            if prev == curr {
-                return Err(DeError::new(ErrorCode::DuplicateMapKey, key_start));
+        if self.mode == Mode::Checked {
+            if let Some((ps, pe)) = *prev_key_range {
+                let prev = &self.input[ps..pe];
+                let curr = &self.input[key_start..key_end];
+                if prev == curr {
+                    return Err(DeError::new(ErrorCode::DuplicateMapKey, key_start));
+                }
+                if !is_strictly_increasing_encoded(prev, curr) {
+                    return Err(DeError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+                }
             }
-            if !is_strictly_increasing_encoded(prev, curr) {
-                return Err(DeError::new(ErrorCode::NonCanonicalMapOrder, key_start));
-            }
+            *prev_key_range = Some((key_start, key_end));
         }
-        *prev_key_range = Some((key_start, key_end));
         Ok(s)
     }
 
     fn parse_bignum(&mut self, off: usize, ai: u8) -> Result<(bool, &'de [u8]), DeError> {
-        let tag = self.read_uint_arg_checked(ai, off)?;
+        let tag = self.read_uint_arg(ai, off)?;
         let negative = match tag {
             2 => false,
             3 => true,
@@ -1323,7 +1377,7 @@ impl<'de> DirectDeserializer<'de> {
         if m_major != 2 {
             return Err(DeError::new(ErrorCode::ForbiddenOrMalformedTag, m_off));
         }
-        let m_len = self.read_len_checked(m_ai, m_off)?;
+        let m_len = self.read_len(m_ai, m_off)?;
         Self::enforce_len(
             m_len,
             self.limits.max_bytes_len,
@@ -1331,7 +1385,9 @@ impl<'de> DirectDeserializer<'de> {
             m_off,
         )?;
         let mag = self.read_exact(m_len)?;
-        validate_bignum_bytes(negative, mag).map_err(|code| DeError::new(code, m_off))?;
+        if self.mode == Mode::Checked {
+            validate_bignum_bytes(negative, mag).map_err(|code| DeError::new(code, m_off))?;
+        }
         Ok((negative, mag))
     }
 
@@ -1342,15 +1398,15 @@ impl<'de> DirectDeserializer<'de> {
         let ai = ib & 0x1f;
         match major {
             0 => {
-                let v = self.read_uint_arg_checked(ai, off)?;
-                if v > MAX_SAFE_INTEGER {
+                let v = self.read_uint_arg(ai, off)?;
+                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(i128::from(v))
             }
             1 => {
-                let n = self.read_uint_arg_checked(ai, off)?;
-                if n >= MAX_SAFE_INTEGER {
+                let n = self.read_uint_arg(ai, off)?;
+                if self.mode == Mode::Checked && n >= MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(-1 - i128::from(n))
@@ -1370,8 +1426,8 @@ impl<'de> DirectDeserializer<'de> {
         let ai = ib & 0x1f;
         match major {
             0 => {
-                let v = self.read_uint_arg_checked(ai, off)?;
-                if v > MAX_SAFE_INTEGER {
+                let v = self.read_uint_arg(ai, off)?;
+                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(u128::from(v))
@@ -2178,12 +2234,49 @@ pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Re
 where
     T: Deserialize<'de>,
 {
-    let mut de = DirectDeserializer::new(bytes, limits)?;
+    let mut de = DirectDeserializer::new_checked(bytes, limits)?;
     let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
     if de.offset() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
     }
     Ok(value)
+}
+
+/// Deserialize `T` from validated canonical bytes without re-checking canonical encodings.
+///
+/// This assumes `canon` was produced by `validate_canonical`.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails or if trailing bytes are found.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_canonical_bytes_ref<'de, T>(canon: CborBytesRef<'de>) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    let bytes = canon.as_bytes();
+    let limits = DecodeLimits::for_bytes(bytes.len());
+    let mut de = DirectDeserializer::new_trusted(bytes, limits)?;
+    let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
+    if de.offset() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
+    }
+    Ok(value)
+}
+
+/// Deserialize `T` from owned canonical bytes without re-checking canonical encodings.
+///
+/// This assumes `canon` was produced by `CborBytes::from_slice` or `CborBytes::from_vec`.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails or if trailing bytes are found.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_canonical_bytes<'de, T>(canon: &'de CborBytes) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    from_canonical_bytes_ref(canon.as_ref())
 }
 
 fn int_to_value(v: i128) -> Result<CborValue, SerdeError> {

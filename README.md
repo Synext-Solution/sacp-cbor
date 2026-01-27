@@ -12,7 +12,7 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 
 - **Validate** that an input is a *single, canonical* CBOR item under a strict profile (`validate_canonical`).
 - Wrap validated bytes as `CborBytesRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
-- Optionally **decode** into an owned DOM (`CborValue`) with `decode_value` (`alloc`).
+- Optionally **decode** into owned Rust types (including `CborValue`) via serde `from_slice` (`serde` + `alloc`).
 - **Encode canonical CBOR** directly (`Encoder`, `MapEncoder`, `ArrayEncoder`) (`alloc`).
 - Build values with the **fallible** `cbor!` macro (`alloc`) and build canonical bytes with `cbor_bytes!` (`alloc`).
 - **Patch/edit** canonical bytes without decoding the whole structure (`Editor`) (`alloc`).
@@ -52,8 +52,8 @@ This crate is `no_std` by default unless `std` is enabled.
 | Feature | Enables | Notes |
 |---|---|---|
 | `std` | `std::error::Error` for `CborError` | Otherwise `no_std` |
-| `alloc` | Owned types + encoding/decoding + editor + macros | Required for `CborBytes`, `CborValue`, `Encoder`, `Editor`, `cbor!`, `cbor_bytes!` |
-| `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice |
+| `alloc` | Owned types + encoding + editor + macros | Required for `CborBytes`, `CborValue`, `Encoder`, `Editor`, `cbor!`, `cbor_bytes!` |
+| `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice; enables owned decoding via `from_slice` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
 
 ### Recommended dependency configs
@@ -194,16 +194,16 @@ fn main() -> Result<(), sacp_cbor::CborError> {
   - Typical: shallow maps with early exits are much smaller
 - Space: `O(1)`
 
-### 3) Decode into an owned `CborValue` (requires `alloc`)
+### 3) Decode into an owned `CborValue` (requires `serde` + `alloc`)
 
 ```rust
-use sacp_cbor::{decode_value, DecodeLimits};
+use sacp_cbor::{from_slice, CborValue, DecodeLimits};
 
 fn main() -> Result<(), sacp_cbor::CborError> {
   let bytes: &[u8] = /* canonical bytes */;
   let limits = DecodeLimits::for_bytes(bytes.len());
 
-  let v = decode_value(bytes, limits)?;
+  let v: CborValue = from_slice(bytes, limits)?;
 
   if let Some(user) = v.at(sacp_cbor::path!("user"))? {
     println!("user is null? {}", user.is_null());
@@ -1053,7 +1053,6 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
   - scalar reads: mostly `O(1)` (text is `O(len)`)
   - container queries: `O(bytes scanned)`
-  - `to_owned` (`alloc`): `O(value_len)`
 
 - `MapRef<'a>`
 
@@ -1065,14 +1064,6 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
   - `get`: `O(bytes scanned up to index)`
   - `iter`: `O(bytes in array)`
-
-### Decoding (`alloc`)
-
-- `decode_value(bytes, limits) -> Result<CborValue, CborError>`
-
-  - Validates canonical then decodes.
-  - Time: `O(n)`
-  - Space: `O(decoded_size)`
 
 ### Encoding (`alloc`)
 
@@ -1105,6 +1096,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 ### Serde (`serde` + `alloc`)
 
 - `to_vec`, `from_slice`, `from_slice_borrowed`
+- `from_canonical_bytes_ref`, `from_canonical_bytes` (for already-validated canonical bytes)
 - `serde_value` helpers for struct fields
 - numeric bignums are limited to `i128/u128` roundtrips through serde
 
@@ -1116,7 +1108,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
   `validate_canonical` → `CborBytesRef` → `at/get/iter`
 
 - **You need an owned representation or want to manipulate values in memory:**
-  `decode_value` → `CborValue` (+ `CborMap`, `CborInteger`)
+  `from_slice::<CborValue>` → `CborValue` (+ `CborMap`, `CborInteger`)
 
 - **You need to *emit* canonical CBOR efficiently:**
   `Encoder` / `cbor_bytes!`
@@ -1127,6 +1119,8 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 - **You need serde:**
   `to_vec/from_slice` (or `from_slice_borrowed` when you want borrows)
+- **You already validated canonical bytes and want struct decode:**
+  `from_canonical_bytes_ref` / `from_canonical_bytes`
 
 ---
 

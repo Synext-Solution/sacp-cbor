@@ -48,15 +48,6 @@ impl BigInt {
     pub fn magnitude(&self) -> &[u8] {
         &self.magnitude
     }
-
-    /// Internal constructor used by the decoder after validation.
-    #[inline]
-    pub(crate) const fn new_unchecked(negative: bool, magnitude: Vec<u8>) -> Self {
-        Self {
-            negative,
-            magnitude,
-        }
-    }
 }
 
 /// A map with text keys sorted by canonical CBOR key ordering.
@@ -108,14 +99,6 @@ impl CborMap {
         Ok(Self {
             entries: entries.into_boxed_slice(),
         })
-    }
-
-    /// Internal constructor used by the decoder; assumes entries are already in canonical order and unique.
-    #[inline]
-    pub(crate) fn from_sorted_entries(entries: Vec<(Box<str>, CborValue)>) -> Self {
-        Self {
-            entries: entries.into_boxed_slice(),
-        }
     }
 
     /// Number of key/value pairs.

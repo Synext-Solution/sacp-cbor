@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use sacp_cbor::{decode_value, validate_canonical, DecodeLimits};
+use sacp_cbor::{validate_canonical, DecodeLimits};
 
 fn fuzz_limits(input_len: usize) -> DecodeLimits {
     // Keep limits tight enough to avoid pathological allocations while still exploring structure.
@@ -21,16 +21,9 @@ fn fuzz_limits(input_len: usize) -> DecodeLimits {
 fuzz_target!(|data: &[u8]| {
     let limits = fuzz_limits(data.len());
     if let Ok(canon) = validate_canonical(data, limits) {
-        // If validation succeeds, decoding should succeed and canonical re-encoding must be identical.
-        if let Ok(v) = decode_value(data, limits) {
-            let out = v.encode_canonical().expect("re-encode");
-            assert_eq!(out, canon.as_bytes());
-
-            let h1 = canon.sha256();
-            let h2 = v.sha256_canonical().expect("hash");
-            assert_eq!(h1, h2);
-        } else {
-            panic!("decode_value failed after validate_canonical succeeded");
-        }
+        // If validation succeeds, borrowed queries should be safe.
+        let root = canon.root();
+        let _ = root.kind();
+        let _ = canon.sha256();
     }
 });

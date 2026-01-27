@@ -66,7 +66,8 @@ impl<'a, const N: usize> SmallStack<'a, N> {
 }
 
 pub fn encode_to_vec(value: &CborValue) -> Result<Vec<u8>, CborError> {
-    let mut sink = VecSink::new();
+    let hint = encoded_len_hint(value)?;
+    let mut sink = VecSink::with_capacity(hint);
     encode_value(&mut sink, value)?;
     Ok(sink.into_vec())
 }
@@ -80,6 +81,10 @@ pub fn encode_to_vec(value: &CborValue) -> Result<Vec<u8>, CborError> {
 /// Returns an error if encoding fails or if the buffer cannot grow.
 pub fn encode_into(value: &CborValue, buf: &mut Vec<u8>) -> Result<(), CborError> {
     buf.clear();
+    let hint = encoded_len_hint(value)?;
+    if hint != 0 {
+        try_reserve(buf, hint, 0)?;
+    }
     let mut sink = VecSinkBorrowed { buf };
     encode_value(&mut sink, value)
 }
@@ -129,14 +134,16 @@ impl VecSink {
         self.buf
     }
 
+    #[inline]
     fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
-        let offset = self.buf.len();
-        let needed = offset
-            .checked_add(additional)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
-        if needed <= self.buf.capacity() {
+        let available = self.buf.capacity().saturating_sub(self.buf.len());
+        if additional <= available {
             return Ok(());
         }
+        let offset = self.buf.len();
+        let _needed = offset
+            .checked_add(additional)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
         try_reserve(&mut self.buf, additional, offset)
     }
 }
@@ -149,7 +156,9 @@ impl Sink for VecSink {
     }
 
     fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
-        self.reserve(1)?;
+        if self.buf.len() == self.buf.capacity() {
+            self.reserve(1)?;
+        }
         self.buf.push(byte);
         Ok(())
     }
@@ -160,14 +169,16 @@ impl Sink for VecSink {
 }
 
 impl VecSinkBorrowed<'_> {
+    #[inline]
     fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
-        let offset = self.buf.len();
-        let needed = offset
-            .checked_add(additional)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
-        if needed <= self.buf.capacity() {
+        let available = self.buf.capacity().saturating_sub(self.buf.len());
+        if additional <= available {
             return Ok(());
         }
+        let offset = self.buf.len();
+        let _needed = offset
+            .checked_add(additional)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
         try_reserve(self.buf, additional, offset)
     }
 }
@@ -180,7 +191,9 @@ impl Sink for VecSinkBorrowed<'_> {
     }
 
     fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
-        self.reserve(1)?;
+        if self.buf.len() == self.buf.capacity() {
+            self.reserve(1)?;
+        }
         self.buf.push(byte);
         Ok(())
     }
@@ -354,6 +367,91 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
     }
     sink.write_u8((major << 5) | 27)?;
     sink.write(&value.to_be_bytes())
+}
+
+fn encoded_len_hint(value: &CborValue) -> Result<usize, CborError> {
+    encoded_len_value(value)
+}
+
+fn encoded_len_value(value: &CborValue) -> Result<usize, CborError> {
+    match value.repr() {
+        ValueRepr::Null | ValueRepr::Bool(_) => Ok(1),
+        ValueRepr::Float(_) => Ok(9),
+        ValueRepr::Integer(i) => encoded_len_integer(i),
+        ValueRepr::Bytes(b) => encoded_len_bytes_len(b.len()),
+        ValueRepr::Text(s) => encoded_len_text_len(s.len()),
+        ValueRepr::Array(items) => {
+            let mut total = encoded_len_major_len(items.len())?;
+            for item in items {
+                total = add_len(total, encoded_len_value(item)?)?;
+            }
+            Ok(total)
+        }
+        ValueRepr::Map(map) => {
+            let mut total = encoded_len_major_len(map.len())?;
+            for (k, v) in map.entries() {
+                total = add_len(total, encoded_len_text_len(k.len())?)?;
+                total = add_len(total, encoded_len_value(v)?)?;
+            }
+            Ok(total)
+        }
+    }
+}
+
+fn encoded_len_integer(value: &CborInteger) -> Result<usize, CborError> {
+    if let Some(v) = value.as_i64() {
+        if v >= 0 {
+            let u = u64::try_from(v).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
+            return Ok(encoded_len_major_uint(u));
+        }
+        let n_i128 = -1_i128 - i128::from(v);
+        let n_u64 =
+            u64::try_from(n_i128).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
+        return Ok(encoded_len_major_uint(n_u64));
+    }
+    let b = value
+        .as_bigint()
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, 0))?;
+    let tag = if b.is_negative() { 3u64 } else { 2u64 };
+    let tag_len = encoded_len_major_uint(tag);
+    let mag_len = encoded_len_bytes_len(b.magnitude().len())?;
+    add_len(tag_len, mag_len)
+}
+
+fn encoded_len_bytes_len(len: usize) -> Result<usize, CborError> {
+    let header = encoded_len_major_len(len)?;
+    add_len(header, len)
+}
+
+fn encoded_len_text_len(len: usize) -> Result<usize, CborError> {
+    let header = encoded_len_major_len(len)?;
+    add_len(header, len)
+}
+
+fn encoded_len_major_len(len: usize) -> Result<usize, CborError> {
+    let len_u64 = u64::try_from(len).map_err(|_| CborError::new(ErrorCode::LengthOverflow, 0))?;
+    Ok(encoded_len_major_uint(len_u64))
+}
+
+fn encoded_len_major_uint(value: u64) -> usize {
+    if value < 24 {
+        return 1;
+    }
+    if u8::try_from(value).is_ok() {
+        return 2;
+    }
+    if u16::try_from(value).is_ok() {
+        return 3;
+    }
+    if u32::try_from(value).is_ok() {
+        return 5;
+    }
+    9
+}
+
+fn add_len(a: usize, b: usize) -> Result<usize, CborError> {
+    a.checked_add(b)
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, 0))
 }
 
 /// Streaming encoder that writes canonical CBOR directly into a `Vec<u8>`.
