@@ -1,6 +1,7 @@
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
+use sacp_cbor::MapEntries;
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -179,5 +180,71 @@ impl<'de> Deserialize<'de> for BenchValue {
         }
 
         deserializer.deserialize_any(BenchValueVisitor)
+    }
+}
+
+#[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
+pub enum BenchValueNative {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Bytes(Vec<u8>),
+    Text(String),
+    Array(Vec<BenchValueNative>),
+    Map(MapEntries<String, BenchValueNative>),
+}
+
+#[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
+pub enum BenchValueBorrowed<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Bytes(&'a [u8]),
+    Text(&'a str),
+    Array(Vec<BenchValueBorrowed<'a>>),
+    Map(MapEntries<&'a str, BenchValueBorrowed<'a>>),
+}
+
+impl BenchValueNative {
+    pub fn from_bench(value: &BenchValue) -> Self {
+        match value {
+            BenchValue::Null => Self::Null,
+            BenchValue::Bool(v) => Self::Bool(*v),
+            BenchValue::Int(v) => Self::Int(*v),
+            BenchValue::Bytes(b) => Self::Bytes(b.clone()),
+            BenchValue::Text(s) => Self::Text(s.clone()),
+            BenchValue::Array(items) => {
+                Self::Array(items.iter().map(Self::from_bench).collect())
+            }
+            BenchValue::Map(entries) => {
+                let mapped = entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::from_bench(v)))
+                    .collect();
+                Self::Map(MapEntries::new(mapped))
+            }
+        }
+    }
+}
+
+impl<'a> BenchValueBorrowed<'a> {
+    pub fn from_bench(value: &'a BenchValue) -> Self {
+        match value {
+            BenchValue::Null => Self::Null,
+            BenchValue::Bool(v) => Self::Bool(*v),
+            BenchValue::Int(v) => Self::Int(*v),
+            BenchValue::Bytes(b) => Self::Bytes(b.as_slice()),
+            BenchValue::Text(s) => Self::Text(s.as_str()),
+            BenchValue::Array(items) => {
+                Self::Array(items.iter().map(Self::from_bench).collect())
+            }
+            BenchValue::Map(entries) => {
+                let mapped = entries
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), Self::from_bench(v)))
+                    .collect();
+                Self::Map(MapEntries::new(mapped))
+            }
+        }
     }
 }

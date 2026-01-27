@@ -827,8 +827,18 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "sacp-cbor"
 version = "0.7.0"
 dependencies = [
+ "sacp-cbor-derive",
  "serde",
  "sha2",
+]
+
+[[package]]
+name = "sacp-cbor-derive"
+version = "0.7.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]

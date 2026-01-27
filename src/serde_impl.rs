@@ -12,10 +12,13 @@ use crate::encode::Encoder;
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
+use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::utf8;
 use crate::wire;
 use crate::{CborError, DecodeLimits, ErrorCode};
+
+const RAW_VALUE_MARKER: &str = "$__sacp_cbor_raw_value";
 
 fn check_map_key_order(
     enc: &mut Encoder,
@@ -195,7 +198,10 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
         if v <= MAX_SAFE_INTEGER {
-            self.enc.int(v as i64).map_err(SerdeError::from)
+            let v = i64::try_from(v).map_err(|_| {
+                SerdeError::from(CborError::new(ErrorCode::LengthOverflow, self.enc.len()))
+            })?;
+            self.enc.int(v).map_err(SerdeError::from)
         } else {
             self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
         }
@@ -881,7 +887,7 @@ impl From<CborError> for DeError {
 impl crate::wire::DecodeError for DeError {
     #[inline]
     fn new(code: ErrorCode, offset: usize) -> Self {
-        DeError::new(code, offset)
+        Self::new(code, offset)
     }
 }
 
@@ -1217,14 +1223,68 @@ impl<'de, const CHECKED: bool> DirectDeserializer<'de, CHECKED> {
 
     fn parse_i64(&mut self) -> Result<i64, DeError> {
         let off = self.pos;
-        let n = self.parse_i128()?;
-        i64::try_from(n).map_err(|_| ser_err(off))
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 => {
+                let v = self.read_uint_arg(ai, off)?;
+                if CHECKED && v > MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                let v = i64::try_from(v).map_err(|_| ser_err(off))?;
+                Ok(v)
+            }
+            1 => {
+                let n = self.read_uint_arg(ai, off)?;
+                if CHECKED && n >= MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                let n = i64::try_from(n).map_err(|_| ser_err(off))?;
+                Ok(-1 - n)
+            }
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                let n = mag_to_u128(mag).ok_or_else(|| ser_err(off))?;
+                if n > i64::MAX as u128 {
+                    return Err(ser_err(off));
+                }
+                let n_i = i64::try_from(n).map_err(|_| ser_err(off))?;
+                if negative {
+                    Ok(-1 - n_i)
+                } else {
+                    Ok(n_i)
+                }
+            }
+            _ => Err(DeError::new(ErrorCode::ExpectedInteger, off)),
+        }
     }
 
     fn parse_u64(&mut self) -> Result<u64, DeError> {
         let off = self.pos;
-        let n = self.parse_u128()?;
-        u64::try_from(n).map_err(|_| ser_err(off))
+        let ib = self.read_u8()?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 => {
+                let v = self.read_uint_arg(ai, off)?;
+                if CHECKED && v > MAX_SAFE_INTEGER {
+                    return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok(v)
+            }
+            1 => Err(ser_err(off)),
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                if negative {
+                    return Err(ser_err(off));
+                }
+                let n = mag_to_u128(mag).ok_or_else(|| ser_err(off))?;
+                let n = u64::try_from(n).map_err(|_| ser_err(off))?;
+                Ok(n)
+            }
+            _ => Err(DeError::new(ErrorCode::ExpectedInteger, off)),
+        }
     }
 
     fn parse_float64(&mut self) -> Result<f64, DeError> {
@@ -1885,12 +1945,19 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut DirectDeserializer
 
     fn deserialize_newtype_struct<V>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
+        if name == RAW_VALUE_MARKER {
+            let start = self.pos;
+            self.skip_one_value()?;
+            let end = self.pos;
+            let raw = &self.input[start..end];
+            return visitor.visit_borrowed_bytes(raw);
+        }
         visitor.visit_newtype_struct(self)
     }
 
@@ -2071,4 +2138,30 @@ where
     T: Deserialize<'de>,
 {
     from_canonical_bytes_ref(canon.as_ref())
+}
+
+impl<'de> Deserialize<'de> for CborValueRef<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct RawCborValueVisitor;
+
+        impl<'de> Visitor<'de> for RawCborValueVisitor {
+            type Value = CborValueRef<'de>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a raw CBOR value")
+            }
+
+            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CborValueRef::new(v, 0, v.len()))
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(RAW_VALUE_MARKER, RawCborValueVisitor)
+    }
 }

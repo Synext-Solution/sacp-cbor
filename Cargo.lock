@@ -276,9 +276,19 @@ name = "sacp-cbor"
 version = "0.7.0"
 dependencies = [
  "proptest",
+ "sacp-cbor-derive",
  "serde",
  "sha2",
  "simdutf8",
+]
+
+[[package]]
+name = "sacp-cbor-derive"
+version = "0.7.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

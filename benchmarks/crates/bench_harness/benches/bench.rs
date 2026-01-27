@@ -6,9 +6,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use bench_harness::adapters::{encode_sacp_stream, Adapter, BenchInput, SacpCbor};
 use bench_harness::datasets::{dataset_root, load_appendix_a, synthetic_datasets};
 use bench_harness::query_edit::sort_map_entries;
-use bench_harness::value::BenchValue;
+use bench_harness::value::{BenchValue, BenchValueBorrowed, BenchValueNative};
 use serde::de::IgnoredAny;
-use sacp_cbor::{ArrayPos, PathElem};
+use sacp_cbor::{decode, encode_to_vec, ArrayPos, DecodeLimits, PathElem};
 
 #[cfg(feature = "adapter-serde_cbor")]
 use bench_harness::adapters::SerdeCbor;
@@ -307,6 +307,38 @@ fn bench_serde_roundtrip(c: &mut Criterion) {
     }
 }
 
+fn bench_native_roundtrip(c: &mut Criterion) {
+    let values = synthetic_values_for_run();
+    let mut group = c.benchmark_group("native_roundtrip/sacp-cbor");
+    for (name, value) in values {
+        let native = BenchValueNative::from_bench(value);
+        group.bench_with_input(BenchmarkId::new("synthetic", name), &native, |b, v| {
+            b.iter(|| {
+                let bytes = encode_to_vec(black_box(v)).unwrap();
+                let _out: BenchValueNative =
+                    decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_native_decode_borrowed(c: &mut Criterion) {
+    let values = synthetic_values_for_run();
+    let mut group = c.benchmark_group("native_decode_borrowed/sacp-cbor");
+    for (name, value) in values {
+        let native = BenchValueNative::from_bench(value);
+        let bytes = encode_to_vec(&native).unwrap();
+        group.bench_with_input(BenchmarkId::new("synthetic", name), &bytes, |b, bytes| {
+            b.iter(|| {
+                let _out: BenchValueBorrowed<'_> =
+                    decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len())).unwrap();
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_synthetic_decode_validated(c: &mut Criterion) {
     let bytes = synthetic_bytes_for_run();
     for adapter in adapters() {
@@ -521,6 +553,8 @@ criterion_group! {
     bench_encode,
     bench_encode_stream,
     bench_serde_roundtrip,
+    bench_native_roundtrip,
+    bench_native_decode_borrowed,
     bench_synthetic_decode_validated,
     bench_synthetic_query_trusted,
     bench_synthetic_decode_canonical_trusted,

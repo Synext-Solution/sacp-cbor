@@ -174,7 +174,7 @@ pub struct CborValueRef<'a> {
 #[allow(clippy::elidable_lifetime_names)]
 impl<'a> CborValueRef<'a> {
     #[inline]
-    const fn new(data: &'a [u8], start: usize, end: usize) -> Self {
+    pub(crate) const fn new(data: &'a [u8], start: usize, end: usize) -> Self {
         Self { data, start, end }
     }
 

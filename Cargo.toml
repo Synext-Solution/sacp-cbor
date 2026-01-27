@@ -11,6 +11,9 @@ categories = ["encoding", "no-std"]
 
 repository = "https://github.com/Synext-Solution/sacp-cbor"
 
+[workspace]
+members = ["sacp-cbor-derive"]
+
 [features]
 # Full-featured default for typical server deployments.
 default = ["std", "alloc", "sha2"]
@@ -36,6 +39,7 @@ unsafe-utf8 = []
 [dependencies]
 sha2 = { version = "0.10", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+sacp-cbor-derive = { path = "sacp-cbor-derive" }
 simdutf8 = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]

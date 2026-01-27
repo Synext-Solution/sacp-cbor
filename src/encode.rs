@@ -1,5 +1,6 @@
 use crate::alloc_util::try_reserve;
 use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
+use crate::codec::CborEncode;
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
 };
@@ -555,6 +556,16 @@ impl ArrayEncoder<'_> {
     pub fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
         self.consume_one()?;
         self.enc.raw_value_ref(v)
+    }
+
+    /// Encode a value using the native `CborEncode` trait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the array length is exceeded or if encoding fails.
+    pub fn value<T: CborEncode>(&mut self, value: &T) -> Result<(), CborError> {
+        self.consume_one()?;
+        value.encode(self.enc)
     }
 
     /// Encode a nested array.
