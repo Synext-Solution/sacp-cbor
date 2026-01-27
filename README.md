@@ -897,10 +897,11 @@ let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 assert_eq!(decoded, msg);
 ```
 
-### Convert Rust types ↔ `CborValue`
+### Borrowed deserialization helpers
 
-- `to_value<T: Serialize>(&T) -> Result<CborValue, CborError>`
-- `from_value_ref<T: Deserialize>(&CborValue) -> Result<T, CborError>`
+- `from_slice_borrowed<T: Deserialize>(bytes, limits) -> Result<T, CborError>`
+- `from_bytes_ref_borrowed<T: Deserialize>(CborBytesRef) -> Result<T, CborError>`
+- `from_value_ref_borrowed<T: Deserialize>(CborValueRef) -> Result<T, CborError>`
 
 ### `serde_value` helper module
 
@@ -934,7 +935,7 @@ struct Wrapper2 {
 
   - Serialization of `CborValue` bignums only succeeds if they fit into `i128` or `u128`.
   - Very large bignums (more than 128 bits) cannot be losslessly represented through serde numeric primitives.
-- Serde errors are returned as `ErrorCode::SerdeError` (offset 0), so you don’t get byte offsets for schema mismatches.
+- Schema mismatches return `ErrorCode::SerdeError` (offset 0); structural parse errors preserve offsets when available.
 
 ---
 
@@ -1105,7 +1106,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Serde (`serde` + `alloc`)
 
-- `to_vec`, `from_slice`, `to_value`, `from_value_ref`
+- `to_vec`, `from_slice`, `from_value_ref` (borrowed)
 - `serde_value` helpers for struct fields
 - numeric bignums are limited to `i128/u128` roundtrips through serde
 
@@ -1127,7 +1128,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
   `CborBytesRef::edit` / `CborBytes::edit`
 
 - **You need serde:**
-  `to_vec/from_slice` or `to_value/from_value_ref`
+  `to_vec/from_slice` (or `from_value_ref` for already-validated bytes)
 
 ---
 

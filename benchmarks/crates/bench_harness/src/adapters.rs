@@ -7,6 +7,9 @@ pub trait Adapter {
     fn name(&self) -> &'static str;
     fn validate(&self, bytes: &[u8]) -> Result<(), String>;
     fn decode_discard(&self, bytes: &[u8]) -> Result<(), String>;
+    fn decode_discard_trusted(&self, bytes: &[u8]) -> Result<(), String> {
+        self.decode_discard(bytes)
+    }
     fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String>;
     fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String>;
 }
@@ -26,6 +29,11 @@ impl Adapter for SacpCbor {
     fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
         let _v = sacp_cbor::decode_value(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
             .map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn decode_discard_trusted(&self, bytes: &[u8]) -> Result<(), String> {
+        let _v = sacp_cbor::decode_value_trusted(bytes).map_err(|e| format!("{e}"))?;
         Ok(())
     }
 
@@ -237,6 +245,62 @@ fn to_cbor4ii_value(v: &BenchValue) -> Cbor4iiValue {
                 .map(|(k, v)| (Cbor4iiValue::Text(k.clone()), to_cbor4ii_value(v)))
                 .collect(),
         ),
+    }
+}
+
+pub fn encode_sacp_stream(value: &BenchValue) -> Result<Vec<u8>, String> {
+    let mut enc = sacp_cbor::Encoder::new();
+    encode_bench_value(&mut enc, value).map_err(|e| format!("{e}"))?;
+    Ok(enc.into_vec())
+}
+
+fn encode_bench_value(
+    enc: &mut sacp_cbor::Encoder,
+    v: &BenchValue,
+) -> Result<(), sacp_cbor::CborError> {
+    match v {
+        BenchValue::Null => enc.null(),
+        BenchValue::Bool(b) => enc.bool(*b),
+        BenchValue::Int(i) => enc.int(*i),
+        BenchValue::Bytes(b) => enc.bytes(b),
+        BenchValue::Text(s) => enc.text(s),
+        BenchValue::Array(items) => enc.array(items.len(), |a| encode_bench_array(a, items)),
+        BenchValue::Map(entries) => enc.map(entries.len(), |m| {
+            for (k, v) in entries {
+                m.entry(k.as_str(), |enc| encode_bench_value(enc, v))?;
+            }
+            Ok(())
+        }),
+    }
+}
+
+fn encode_bench_array(
+    a: &mut sacp_cbor::ArrayEncoder<'_>,
+    items: &[BenchValue],
+) -> Result<(), sacp_cbor::CborError> {
+    for item in items {
+        encode_bench_value_in_array(a, item)?;
+    }
+    Ok(())
+}
+
+fn encode_bench_value_in_array(
+    a: &mut sacp_cbor::ArrayEncoder<'_>,
+    v: &BenchValue,
+) -> Result<(), sacp_cbor::CborError> {
+    match v {
+        BenchValue::Null => a.null(),
+        BenchValue::Bool(b) => a.bool(*b),
+        BenchValue::Int(i) => a.int(*i),
+        BenchValue::Bytes(b) => a.bytes(b),
+        BenchValue::Text(s) => a.text(s),
+        BenchValue::Array(items) => a.array(items.len(), |inner| encode_bench_array(inner, items)),
+        BenchValue::Map(entries) => a.map(entries.len(), |m| {
+            for (k, v) in entries {
+                m.entry(k.as_str(), |enc| encode_bench_value(enc, v))?;
+            }
+            Ok(())
+        }),
     }
 }
 

@@ -46,23 +46,46 @@ fn collect_summary(root: &Path) -> Result<Summary, Box<dyn std::error::Error>> {
     if !root.exists() {
         return Ok(Summary { benches });
     }
+    collect_estimates(root, root, &mut benches)?;
 
-    for entry in fs::read_dir(root)? {
+    Ok(Summary { benches })
+}
+
+fn collect_estimates(
+    root: &Path,
+    dir: &Path,
+    benches: &mut BTreeMap<String, BenchStats>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        if path.is_dir() {
+            collect_estimates(root, &path, benches)?;
             continue;
         }
-        let estimate = path.join("new").join("estimates.json");
-        if !estimate.exists() {
+        if path.file_name().and_then(|s| s.to_str()) != Some("estimates.json") {
             continue;
         }
-        let data = fs::read_to_string(&estimate)?;
+        let parent = match path.parent() {
+            Some(parent) => parent,
+            None => continue,
+        };
+        if parent.file_name().and_then(|s| s.to_str()) != Some("new") {
+            continue;
+        }
+        let bench_dir = match parent.parent() {
+            Some(dir) => dir,
+            None => continue,
+        };
+        let data = fs::read_to_string(&path)?;
         let v: serde_json::Value = serde_json::from_str(&data)?;
         let mean = v["mean"]["point_estimate"].as_f64().unwrap_or(0.0);
         let median = v["median"]["point_estimate"].as_f64().unwrap_or(0.0);
         let std_dev = v["std_dev"]["point_estimate"].as_f64().unwrap_or(0.0);
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let name = bench_dir
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         benches.insert(
             name,
             BenchStats {
@@ -72,8 +95,7 @@ fn collect_summary(root: &Path) -> Result<Summary, Box<dyn std::error::Error>> {
             },
         );
     }
-
-    Ok(Summary { benches })
+    Ok(())
 }
 
 fn render_markdown(summary: &Summary) -> String {

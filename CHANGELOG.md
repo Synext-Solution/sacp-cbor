@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.0
+
+- **Breaking:** removed serde `to_value` / `from_value` conversion helpers; serde now streams directly to `Encoder` and decodes via borrowed `CborValueRef`.
+- Added zero-copy serde deserialization helpers (`from_slice_borrowed`, `from_bytes_ref_borrowed`, `from_value_ref_borrowed`) and `CborRefDeserializer`.
+
 ## 0.6.0
 
 - **Breaking:** `Encoder::into_canonical()` now returns `Result<CborBytes, CborError>` and errors if the buffer does not contain exactly one CBOR item.

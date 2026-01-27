@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::alloc_util::try_reserve;
-use crate::canonical::{CborBytes, CborBytesRef};
+use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
 use crate::encode::{ArrayEncoder, MapEncoder};
 use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
@@ -17,22 +17,32 @@ const fn err(code: ErrorCode, offset: usize) -> CborError {
     CborError::new(code, offset)
 }
 
+#[cold]
+#[inline(never)]
 const fn invalid_query() -> CborError {
     err(ErrorCode::InvalidQuery, 0)
 }
 
+#[cold]
+#[inline(never)]
 const fn patch_conflict() -> CborError {
     err(ErrorCode::PatchConflict, 0)
 }
 
+#[cold]
+#[inline(never)]
 const fn missing_key(offset: usize) -> CborError {
     err(ErrorCode::MissingKey, offset)
 }
 
+#[cold]
+#[inline(never)]
 const fn index_out_of_bounds(offset: usize) -> CborError {
     err(ErrorCode::IndexOutOfBounds, offset)
 }
 
+#[cold]
+#[inline(never)]
 const fn length_overflow(offset: usize) -> CborError {
     err(ErrorCode::LengthOverflow, offset)
 }
@@ -549,34 +559,19 @@ impl<'a> ArraySpliceBuilder<'_, 'a, '_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildKind {
-    Key,
-    Index,
+#[derive(Debug, Clone)]
+enum Children<'a> {
+    None,
+    Keys(Vec<(Box<str>, Node<'a>)>),
+    Indices(Vec<(usize, Node<'a>)>),
 }
 
-impl ChildKind {
-    const fn of(elem: &PathElem<'_>) -> Self {
-        match elem {
-            PathElem::Key(_) => Self::Key,
-            PathElem::Index(_) => Self::Index,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PathElemOwned {
-    Key(Box<str>),
-    Index(usize),
-}
-
-impl PathElemOwned {
-    fn cmp_elem(&self, elem: &PathElem<'_>) -> Ordering {
-        match (self, elem) {
-            (Self::Key(k), PathElem::Key(v)) => cmp_text_keys_canonical(k, v),
-            (Self::Index(a), PathElem::Index(b)) => a.cmp(b),
-            (Self::Key(_), PathElem::Index(_)) => Ordering::Less,
-            (Self::Index(_), PathElem::Key(_)) => Ordering::Greater,
+impl Children<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::None => true,
+            Self::Keys(v) => v.is_empty(),
+            Self::Indices(v) => v.is_empty(),
         }
     }
 }
@@ -610,13 +605,10 @@ fn cmp_array_pos(a: ArrayPos, b: ArrayPos) -> Ordering {
     }
 }
 
-const fn splices_overlap(a_pos: usize, a_del: usize, b_pos: usize, b_del: usize) -> bool {
-    if a_del == 0 || b_del == 0 {
-        return false;
-    }
-    let a_end = a_pos.saturating_add(a_del);
-    let b_end = b_pos.saturating_add(b_del);
-    (a_pos < b_pos && a_end > b_pos) || (b_pos < a_pos && b_end > a_pos)
+fn splice_end(start: usize, delete: usize, offset: usize) -> Result<usize, CborError> {
+    start
+        .checked_add(delete)
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))
 }
 
 #[derive(Debug, Clone)]
@@ -647,11 +639,10 @@ impl<'a> EditValue<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Node<'a> {
     terminal: Option<Terminal<'a>>,
-    children: Vec<(PathElemOwned, Self)>,
-    child_kind: Option<ChildKind>,
+    children: Children<'a>,
     splices: Vec<ArraySplice<'a>>,
 }
 
@@ -659,8 +650,7 @@ impl<'a> Node<'a> {
     const fn new() -> Self {
         Self {
             terminal: None,
-            children: Vec::new(),
-            child_kind: None,
+            children: Children::None,
             splices: Vec::new(),
         }
     }
@@ -677,8 +667,6 @@ impl<'a> Node<'a> {
                 return Err(patch_conflict());
             }
 
-            let kind = ChildKind::of(pe);
-            cur.ensure_child_kind(kind)?;
             let child = cur.child_mut(pe)?;
 
             if idx + 1 == path.len() {
@@ -709,15 +697,13 @@ impl<'a> Node<'a> {
             if cur.terminal.is_some() {
                 return Err(patch_conflict());
             }
-            let kind = ChildKind::of(pe);
-            cur.ensure_child_kind(kind)?;
             cur = cur.child_mut(pe)?;
         }
 
         if cur.terminal.is_some() {
             return Err(patch_conflict());
         }
-        cur.ensure_child_kind(ChildKind::Index)?;
+        cur.ensure_index_context()?;
 
         if matches!(splice.pos, ArrayPos::End) && splice.delete != 0 {
             return Err(invalid_query());
@@ -736,14 +722,16 @@ impl<'a> Node<'a> {
                 .and_then(|idx| cur.splices.get(idx))
             {
                 if let ArrayPos::At(prev_pos) = prev.pos {
-                    if splices_overlap(prev_pos, prev.delete, new_pos, splice.delete) {
+                    let prev_end = splice_end(prev_pos, prev.delete, 0)?;
+                    if new_pos < prev_end {
                         return Err(patch_conflict());
                     }
                 }
             }
             if let Some(next) = cur.splices.get(insert_idx) {
                 if let ArrayPos::At(next_pos) = next.pos {
-                    if splices_overlap(new_pos, splice.delete, next_pos, next.delete) {
+                    let new_end = splice_end(new_pos, splice.delete, 0)?;
+                    if next_pos < new_end {
                         return Err(patch_conflict());
                     }
                 }
@@ -755,48 +743,81 @@ impl<'a> Node<'a> {
         Ok(())
     }
 
-    fn ensure_child_kind(&mut self, kind: ChildKind) -> Result<(), CborError> {
-        match self.child_kind {
-            None => {
-                self.child_kind = Some(kind);
-                Ok(())
-            }
-            Some(existing) if existing == kind => Ok(()),
-            Some(_) => Err(patch_conflict()),
-        }
-    }
-
     fn child_mut(&mut self, elem: &PathElem<'_>) -> Result<&mut Self, CborError> {
-        match self
-            .children
-            .binary_search_by(|(owned, _)| owned.cmp_elem(elem))
-        {
-            Ok(idx) => Ok(&mut self.children[idx].1),
-            Err(idx) => {
-                let owned = match elem {
-                    PathElem::Key(k) => {
-                        checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
-                        PathElemOwned::Key(crate::alloc_util::try_box_str_from_str(k, 0)?)
-                    }
-                    PathElem::Index(i) => PathElemOwned::Index(*i),
+        match elem {
+            PathElem::Key(k) => {
+                checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
+                if matches!(&self.children, Children::None) {
+                    self.children = Children::Keys(Vec::new());
+                } else if matches!(&self.children, Children::Indices(_)) {
+                    return Err(patch_conflict());
+                }
+
+                let Children::Keys(children) = &mut self.children else {
+                    return Err(patch_conflict());
                 };
 
-                try_reserve(&mut self.children, 1, 0)?;
-                self.children.insert(idx, (owned, Node::new()));
-                Ok(&mut self.children[idx].1)
+                match children
+                    .binary_search_by(|(owned, _)| cmp_text_keys_canonical(owned.as_ref(), k))
+                {
+                    Ok(idx) => Ok(&mut children[idx].1),
+                    Err(idx) => {
+                        let owned = crate::alloc_util::try_box_str_from_str(k, 0)?;
+                        try_reserve(children, 1, 0)?;
+                        children.insert(idx, (owned, Node::new()));
+                        Ok(&mut children[idx].1)
+                    }
+                }
+            }
+            PathElem::Index(i) => {
+                if matches!(&self.children, Children::None) {
+                    self.children = Children::Indices(Vec::new());
+                } else if matches!(&self.children, Children::Keys(_)) {
+                    return Err(patch_conflict());
+                }
+
+                let Children::Indices(children) = &mut self.children else {
+                    return Err(patch_conflict());
+                };
+
+                match children.binary_search_by(|(owned, _)| owned.cmp(i)) {
+                    Ok(idx) => Ok(&mut children[idx].1),
+                    Err(idx) => {
+                        try_reserve(children, 1, 0)?;
+                        children.insert(idx, (*i, Node::new()));
+                        Ok(&mut children[idx].1)
+                    }
+                }
             }
         }
     }
-}
 
-struct KeyChild<'a> {
-    key: &'a str,
-    node: &'a Node<'a>,
-}
+    fn ensure_index_context(&mut self) -> Result<(), CborError> {
+        if matches!(&self.children, Children::None) {
+            self.children = Children::Indices(Vec::new());
+            return Ok(());
+        }
+        if matches!(&self.children, Children::Keys(_)) {
+            return Err(patch_conflict());
+        }
+        Ok(())
+    }
 
-struct IndexChild<'a> {
-    index: usize,
-    node: &'a Node<'a>,
+    fn key_children(&self, offset: usize) -> Result<&[(Box<str>, Self)], CborError> {
+        match &self.children {
+            Children::None => Ok(&[]),
+            Children::Keys(children) => Ok(children.as_slice()),
+            Children::Indices(_) => Err(err(ErrorCode::ExpectedMap, offset)),
+        }
+    }
+
+    fn index_children(&self, offset: usize) -> Result<&[(usize, Self)], CborError> {
+        match &self.children {
+            Children::None => Ok(&[]),
+            Children::Indices(children) => Ok(children.as_slice()),
+            Children::Keys(_) => Err(err(ErrorCode::ExpectedArray, offset)),
+        }
+    }
 }
 
 struct ResolvedSplice<'a> {
@@ -916,10 +937,10 @@ fn emit_value<'a, E: ValueEncoder>(
         };
     }
 
-    match node.child_kind {
-        Some(ChildKind::Key) => emit_patched_map(enc, src, node, options),
-        Some(ChildKind::Index) => emit_patched_array(enc, src, node, options),
-        None => enc.raw_value_ref(src),
+    match node.children {
+        Children::None => enc.raw_value_ref(src),
+        Children::Keys(_) => emit_patched_map(enc, src, node, options),
+        Children::Indices(_) => emit_patched_array(enc, src, node, options),
     }
 }
 
@@ -931,15 +952,15 @@ fn emit_patched_map<'a, E: ValueEncoder>(
 ) -> Result<(), CborError> {
     let map = src.map()?;
     let map_off = src.offset();
-    let mods = collect_key_children(node, map_off)?;
+    let mods = node.key_children(map_off)?;
 
     if mods.is_empty() {
         return enc.raw_value_ref(src);
     }
 
-    let out_len = compute_map_len_and_validate(map, &mods, options, map_off)?;
+    let out_len = compute_map_len_and_validate(map, mods, options, map_off)?;
     enc.map(out_len, |menc| {
-        emit_map_entries(menc, map, &mods, options, map_off)
+        emit_map_entries(menc, map, mods, options, map_off)
     })
 }
 
@@ -952,29 +973,29 @@ fn emit_patched_array<'a, E: ValueEncoder>(
     let array = src.array()?;
     let len = array.len();
     let array_off = src.offset();
-    let mods = collect_index_children(node, array_off)?;
+    let mods = node.index_children(array_off)?;
     let splices = collect_splices(node, len, array_off)?;
 
     if mods.is_empty() && splices.is_empty() {
         return enc.raw_value_ref(src);
     }
 
-    if let Some(max) = mods.last().map(|m| m.index) {
+    if let Some(max) = mods.last().map(|m| m.0) {
         if max >= len {
             return Err(index_out_of_bounds(array_off));
         }
     }
 
-    ensure_splice_mod_conflicts(&mods, &splices)?;
+    ensure_splice_mod_conflicts(mods, &splices)?;
     let out_len = compute_array_out_len(len, &splices, array_off)?;
 
     enc.array(out_len, |aenc| {
-        emit_array_items(aenc, array, &mods, &splices, options, array_off, len)
+        emit_array_items(aenc, array, mods, &splices, options, array_off, len)
     })
 }
 
 fn ensure_splice_mod_conflicts<'a>(
-    mods: &[IndexChild<'a>],
+    mods: &[(usize, Node<'a>)],
     splices: &[ResolvedSplice<'a>],
 ) -> Result<(), CborError> {
     if mods.is_empty() || splices.is_empty() {
@@ -986,10 +1007,10 @@ fn ensure_splice_mod_conflicts<'a>(
             continue;
         }
         let end_idx = splice.start.saturating_add(splice.delete);
-        while mod_idx < mods.len() && mods[mod_idx].index < splice.start {
+        while mod_idx < mods.len() && mods[mod_idx].0 < splice.start {
             mod_idx += 1;
         }
-        if mod_idx < mods.len() && mods[mod_idx].index < end_idx {
+        if mod_idx < mods.len() && mods[mod_idx].0 < end_idx {
             return Err(patch_conflict());
         }
     }
@@ -1016,7 +1037,7 @@ fn compute_array_out_len(
 fn emit_array_items<'a, E: ValueEncoder>(
     aenc: &mut E,
     array: crate::query::ArrayRef<'a>,
-    mods: &[IndexChild<'a>],
+    mods: &[(usize, Node<'a>)],
     splices: &[ResolvedSplice<'a>],
     options: EditOptions,
     array_off: usize,
@@ -1052,9 +1073,10 @@ fn emit_array_items<'a, E: ValueEncoder>(
             .next()
             .ok_or_else(|| err(ErrorCode::MalformedCanonical, array_off))??;
         match mods_iter.peek() {
-            Some(m) if m.index == idx => {
-                let m = mods_iter.next().ok_or_else(invalid_query)?;
-                if let Some(term) = m.node.terminal.as_ref() {
+            Some((m_idx, _)) if *m_idx == idx => {
+                let m_entry = mods_iter.next().ok_or_else(invalid_query)?;
+                let m_node = &m_entry.1;
+                if let Some(term) = m_node.terminal.as_ref() {
                     match term {
                         Terminal::Delete { .. } => return Err(invalid_query()),
                         Terminal::Set { mode, value } => {
@@ -1065,7 +1087,7 @@ fn emit_array_items<'a, E: ValueEncoder>(
                         }
                     }
                 } else {
-                    emit_value(aenc, item, m.node, options)?;
+                    emit_value(aenc, item, m_node, options)?;
                 }
             }
             _ => aenc.raw_value_ref(item)?,
@@ -1089,46 +1111,13 @@ fn emit_array_items<'a, E: ValueEncoder>(
     Ok(())
 }
 
-fn collect_key_children<'a>(
-    node: &'a Node<'a>,
-    offset: usize,
-) -> Result<Vec<KeyChild<'a>>, CborError> {
-    let mut out = crate::alloc_util::try_vec_with_capacity(node.children.len(), offset)?;
-    for (elem, child) in &node.children {
-        match elem {
-            PathElemOwned::Key(k) => out.push(KeyChild {
-                key: k.as_ref(),
-                node: child,
-            }),
-            PathElemOwned::Index(_) => return Err(err(ErrorCode::ExpectedMap, offset)),
-        }
-    }
-    Ok(out)
-}
-
-fn collect_index_children<'a>(
-    node: &'a Node<'a>,
-    offset: usize,
-) -> Result<Vec<IndexChild<'a>>, CborError> {
-    let mut out = crate::alloc_util::try_vec_with_capacity(node.children.len(), offset)?;
-    for (elem, child) in &node.children {
-        match elem {
-            PathElemOwned::Index(i) => out.push(IndexChild {
-                index: *i,
-                node: child,
-            }),
-            PathElemOwned::Key(_) => return Err(err(ErrorCode::ExpectedArray, offset)),
-        }
-    }
-    Ok(out)
-}
-
 fn collect_splices<'a>(
     node: &'a Node<'a>,
     len: usize,
     offset: usize,
 ) -> Result<Vec<ResolvedSplice<'a>>, CborError> {
     let mut out = crate::alloc_util::try_vec_with_capacity(node.splices.len(), offset)?;
+    let mut last_start: Option<usize> = None;
     for splice in &node.splices {
         if matches!(splice.pos, ArrayPos::End) && splice.delete != 0 {
             return Err(invalid_query());
@@ -1151,6 +1140,13 @@ fn collect_splices<'a>(
             return Err(index_out_of_bounds(offset));
         }
 
+        if let Some(prev) = last_start {
+            if start <= prev {
+                return Err(patch_conflict());
+            }
+        }
+        last_start = Some(start);
+
         out.push(ResolvedSplice {
             start,
             delete: splice.delete,
@@ -1163,7 +1159,7 @@ fn collect_splices<'a>(
 
 fn compute_map_len_and_validate<'a>(
     map: crate::query::MapRef<'a>,
-    mods: &[KeyChild<'a>],
+    mods: &[(Box<str>, Node<'a>)],
     options: EditOptions,
     map_off: usize,
 ) -> Result<usize, CborError> {
@@ -1175,13 +1171,13 @@ fn compute_map_len_and_validate<'a>(
     while entry.is_some() || mod_idx < mods.len() {
         let cur_mod = mods.get(mod_idx);
         match (entry, cur_mod) {
-            (Some((key, _value)), Some(mod_key)) => {
-                match cmp_text_keys_canonical(key, mod_key.key) {
+            (Some((key, _value)), Some((mod_key, mod_node))) => {
+                match cmp_text_keys_canonical(key, mod_key.as_ref()) {
                     Ordering::Less => {
                         entry = next_map_entry(&mut iter)?;
                     }
                     Ordering::Equal => {
-                        match mod_key.node.terminal.as_ref() {
+                        match mod_node.terminal.as_ref() {
                             Some(Terminal::Delete { .. }) => {
                                 out_len = out_len
                                     .checked_sub(1)
@@ -1199,7 +1195,7 @@ fn compute_map_len_and_validate<'a>(
                         entry = next_map_entry(&mut iter)?;
                     }
                     Ordering::Greater => {
-                        out_len = handle_missing_map_mod(out_len, mod_key, options, map_off)?;
+                        out_len = handle_missing_map_mod(out_len, mod_node, options, map_off)?;
                         mod_idx += 1;
                     }
                 }
@@ -1207,8 +1203,8 @@ fn compute_map_len_and_validate<'a>(
             (Some((_key, _value)), None) => {
                 entry = next_map_entry(&mut iter)?;
             }
-            (None, Some(mod_key)) => {
-                out_len = handle_missing_map_mod(out_len, mod_key, options, map_off)?;
+            (None, Some((_mod_key, mod_node))) => {
+                out_len = handle_missing_map_mod(out_len, mod_node, options, map_off)?;
                 mod_idx += 1;
             }
             (None, None) => break,
@@ -1220,11 +1216,11 @@ fn compute_map_len_and_validate<'a>(
 
 fn handle_missing_map_mod(
     out_len: usize,
-    mod_key: &KeyChild<'_>,
+    mod_node: &Node<'_>,
     options: EditOptions,
     map_off: usize,
 ) -> Result<usize, CborError> {
-    match mod_key.node.terminal.as_ref() {
+    match mod_node.terminal.as_ref() {
         Some(Terminal::Delete {
             mode: DeleteMode::IfPresent,
         }) => Ok(out_len),
@@ -1242,8 +1238,8 @@ fn handle_missing_map_mod(
             .ok_or_else(|| length_overflow(map_off)),
         None => {
             if options.create_missing_maps {
-                match mod_key.node.child_kind {
-                    Some(ChildKind::Key) => out_len
+                match mod_node.children {
+                    Children::Keys(_) => out_len
                         .checked_add(1)
                         .ok_or_else(|| length_overflow(map_off)),
                     _ => Err(err(ErrorCode::InvalidQuery, map_off)),
@@ -1258,7 +1254,7 @@ fn handle_missing_map_mod(
 fn emit_map_entries<'a>(
     menc: &mut MapEncoder<'_>,
     map: crate::query::MapRef<'a>,
-    mods: &[KeyChild<'a>],
+    mods: &[(Box<str>, Node<'a>)],
     options: EditOptions,
     map_off: usize,
 ) -> Result<(), CborError> {
@@ -1269,15 +1265,15 @@ fn emit_map_entries<'a>(
     while entry.is_some() || mod_idx < mods.len() {
         let cur_mod = mods.get(mod_idx);
         match (entry, cur_mod) {
-            (Some((key, key_bytes, value)), Some(mod_key)) => {
-                match cmp_text_keys_canonical(key, mod_key.key) {
+            (Some((key, key_bytes, value)), Some((mod_key, mod_node))) => {
+                match cmp_text_keys_canonical(key, mod_key.as_ref()) {
                     Ordering::Less => {
                         let value_ref = value;
                         menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
                         entry = next_map_entry_encoded(&mut iter)?;
                     }
                     Ordering::Equal => {
-                        match mod_key.node.terminal.as_ref() {
+                        match mod_node.terminal.as_ref() {
                             Some(Terminal::Delete { .. }) => {}
                             Some(Terminal::Set {
                                 mode: SetMode::InsertOnly,
@@ -1291,7 +1287,7 @@ fn emit_map_entries<'a>(
                             None => {
                                 let value_ref = value;
                                 menc.entry_raw_key(key_bytes, |venc| {
-                                    emit_value(venc, value_ref, mod_key.node, options)
+                                    emit_value(venc, value_ref, mod_node, options)
                                 })?;
                             }
                         }
@@ -1299,7 +1295,7 @@ fn emit_map_entries<'a>(
                         entry = next_map_entry_encoded(&mut iter)?;
                     }
                     Ordering::Greater => {
-                        emit_missing_map_entry(menc, mod_key, options, map_off)?;
+                        emit_missing_map_entry(menc, mod_key.as_ref(), mod_node, options, map_off)?;
                         mod_idx += 1;
                     }
                 }
@@ -1309,8 +1305,8 @@ fn emit_map_entries<'a>(
                 menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
                 entry = next_map_entry_encoded(&mut iter)?;
             }
-            (None, Some(mod_key)) => {
-                emit_missing_map_entry(menc, mod_key, options, map_off)?;
+            (None, Some((mod_key, mod_node))) => {
+                emit_missing_map_entry(menc, mod_key.as_ref(), mod_node, options, map_off)?;
                 mod_idx += 1;
             }
             (None, None) => break,
@@ -1322,11 +1318,12 @@ fn emit_map_entries<'a>(
 
 fn emit_missing_map_entry(
     menc: &mut MapEncoder<'_>,
-    mod_key: &KeyChild<'_>,
+    mod_key: &str,
+    mod_node: &Node<'_>,
     options: EditOptions,
     map_off: usize,
 ) -> Result<(), CborError> {
-    match mod_key.node.terminal.as_ref() {
+    match mod_node.terminal.as_ref() {
         Some(Terminal::Delete {
             mode: DeleteMode::IfPresent,
         }) => Ok(()),
@@ -1340,14 +1337,14 @@ fn emit_missing_map_entry(
             },
         ) => Err(missing_key(map_off)),
         Some(Terminal::Set { value, .. }) => {
-            menc.entry(mod_key.key, |venc| write_new_value(venc, value))
+            menc.entry(mod_key, |venc| write_new_value(venc, value))
         }
         None => {
             if options.create_missing_maps {
-                match mod_key.node.child_kind {
-                    Some(ChildKind::Key) => menc.entry(mod_key.key, |venc| {
-                        emit_created_value(venc, mod_key.node, options)
-                    }),
+                match mod_node.children {
+                    Children::Keys(_) => {
+                        menc.entry(mod_key, |venc| emit_created_value(venc, mod_node, options))
+                    }
                     _ => Err(err(ErrorCode::InvalidQuery, map_off)),
                 }
             } else {
@@ -1369,8 +1366,8 @@ fn emit_created_value<E: ValueEncoder>(
         };
     }
 
-    match node.child_kind {
-        Some(ChildKind::Key) => emit_created_map(enc, node, options),
+    match node.children {
+        Children::Keys(_) => emit_created_map(enc, node, options),
         _ => Err(invalid_query()),
     }
 }
@@ -1380,11 +1377,11 @@ fn emit_created_map<E: ValueEncoder>(
     node: &Node<'_>,
     options: EditOptions,
 ) -> Result<(), CborError> {
-    let mods = collect_key_children(node, 0)?;
+    let mods = node.key_children(0)?;
 
     let mut out_len = 0usize;
-    for m in &mods {
-        match m.node.terminal.as_ref() {
+    for (_key, child) in mods {
+        match child.terminal.as_ref() {
             Some(Terminal::Delete { .. }) => return Err(invalid_query()),
             Some(Terminal::Set {
                 mode: SetMode::ReplaceOnly,
@@ -1393,8 +1390,8 @@ fn emit_created_map<E: ValueEncoder>(
             Some(Terminal::Set { .. }) => {
                 out_len = out_len.checked_add(1).ok_or_else(|| length_overflow(0))?;
             }
-            None => match m.node.child_kind {
-                Some(ChildKind::Key) if options.create_missing_maps => {
+            None => match child.children {
+                Children::Keys(_) if options.create_missing_maps => {
                     out_len = out_len.checked_add(1).ok_or_else(|| length_overflow(0))?;
                 }
                 _ => return Err(missing_key(0)),
@@ -1403,14 +1400,16 @@ fn emit_created_map<E: ValueEncoder>(
     }
 
     enc.map(out_len, |menc| {
-        for m in &mods {
-            match m.node.terminal.as_ref() {
+        for (key, child) in mods {
+            match child.terminal.as_ref() {
                 Some(Terminal::Delete { .. }) => return Err(invalid_query()),
                 Some(Terminal::Set { value, .. }) => {
-                    menc.entry(m.key, |venc| write_new_value(venc, value))?;
+                    menc.entry(key.as_ref(), |venc| write_new_value(venc, value))?;
                 }
                 None => {
-                    menc.entry(m.key, |venc| emit_created_value(venc, m.node, options))?;
+                    menc.entry(key.as_ref(), |venc| {
+                        emit_created_value(venc, child, options)
+                    })?;
                 }
             }
         }
@@ -1429,7 +1428,7 @@ where
     }
 }
 
-type EncodedMapEntry<'a> = (&'a str, &'a [u8], CborValueRef<'a>);
+type EncodedMapEntry<'a> = (&'a str, EncodedTextKey<'a>, CborValueRef<'a>);
 
 fn next_map_entry_encoded<'a, I>(iter: &mut I) -> Result<Option<EncodedMapEntry<'a>>, CborError>
 where

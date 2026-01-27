@@ -1,17 +1,16 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 
 use crate::{CborError, ErrorCode};
 
 #[inline]
-fn check_reserve_len(len: usize, additional: usize, offset: usize) -> Result<(), CborError> {
+fn check_reserve_len<T>(len: usize, additional: usize, offset: usize) -> Result<(), CborError> {
     let needed = len
         .checked_add(additional)
         .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
-    if needed > isize::MAX as usize {
-        return Err(CborError::new(ErrorCode::LengthOverflow, offset));
-    }
+    Layout::array::<T>(needed).map_err(|_| CborError::new(ErrorCode::LengthOverflow, offset))?;
     Ok(())
 }
 
@@ -21,14 +20,14 @@ pub fn try_reserve_exact<T>(
     additional: usize,
     offset: usize,
 ) -> Result<(), CborError> {
-    check_reserve_len(v.len(), additional, offset)?;
+    check_reserve_len::<T>(v.len(), additional, offset)?;
     v.try_reserve_exact(additional)
         .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
 }
 
 #[inline]
 pub fn try_reserve<T>(v: &mut Vec<T>, additional: usize, offset: usize) -> Result<(), CborError> {
-    check_reserve_len(v.len(), additional, offset)?;
+    check_reserve_len::<T>(v.len(), additional, offset)?;
     v.try_reserve(additional)
         .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
 }
@@ -39,7 +38,7 @@ pub fn try_reserve_exact_str(
     additional: usize,
     offset: usize,
 ) -> Result<(), CborError> {
-    check_reserve_len(s.len(), additional, offset)?;
+    check_reserve_len::<u8>(s.len(), additional, offset)?;
     s.try_reserve_exact(additional)
         .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
 }

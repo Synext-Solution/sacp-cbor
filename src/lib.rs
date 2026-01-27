@@ -76,7 +76,7 @@ mod edit;
 #[cfg(feature = "alloc")]
 mod int;
 
-pub use crate::canonical::CborBytesRef;
+pub use crate::canonical::{CborBytesRef, EncodedTextKey};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
 pub use crate::parse::{validate, validate_canonical};
@@ -96,7 +96,7 @@ mod value;
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CborBytes;
 #[cfg(feature = "alloc")]
-pub use crate::decode::decode_value;
+pub use crate::decode::{decode_value, decode_value_trusted};
 #[cfg(feature = "alloc")]
 pub use crate::edit::{
     ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
@@ -112,7 +112,10 @@ pub use crate::value::{cbor_equal, BigInt, CborInteger, CborMap, CborValue};
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::serde_value;
 #[cfg(feature = "serde")]
-pub use crate::serde_impl::{from_slice, from_value_ref, to_value, to_vec};
+pub use crate::serde_impl::{
+    from_bytes_ref_borrowed, from_slice, from_slice_borrowed, from_value_ref,
+    from_value_ref_borrowed, to_vec, CborRefDeserializer, DeError,
+};
 
 /// Construct a path slice for query/edit operations.
 #[macro_export]

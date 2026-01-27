@@ -33,3 +33,16 @@ Enabled by default:
 - cbor4ii
 
 Disable adapters with feature flags on `bench_harness`.
+
+## Faster runs
+
+For quick feedback loops you can reduce Criterion's work or trim the synthetic dataset set:
+
+```bash
+# Quick mode + smaller synthetic datasets
+BENCH_FAST=1 cargo bench
+
+# Use Criterion's CLI overrides
+cargo bench -- --quick
+cargo bench -- --sample-size 10 --measurement-time 1 --warm-up-time 0.5
+```

@@ -18,6 +18,8 @@ use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
 use crate::canonical::CborBytes;
+#[cfg(feature = "alloc")]
+use crate::canonical::EncodedTextKey;
 
 #[cfg(feature = "alloc")]
 use crate::value::{CborMap, CborValue};
@@ -625,9 +627,9 @@ impl<'a> MapRef<'a> {
         }
     }
 
-    /// Iterates over `(key, encoded_key_bytes, value)` in canonical order.
+    /// Iterates over `(key, encoded_key, value)` in canonical order.
     ///
-    /// The encoded key bytes are the canonical CBOR encoding of the text key.
+    /// The encoded key is the canonical CBOR encoding of the text key.
     #[cfg(feature = "alloc")]
     pub(crate) fn iter_encoded(
         self,
@@ -1371,7 +1373,7 @@ impl<'a> Iterator for MapIter<'a> {
 }
 
 #[cfg(feature = "alloc")]
-type EncodedMapEntry<'a> = (&'a str, &'a [u8], CborValueRef<'a>);
+type EncodedMapEntry<'a> = (&'a str, EncodedTextKey<'a>, CborValueRef<'a>);
 
 #[cfg(feature = "alloc")]
 struct MapIterEncoded<'a> {
@@ -1414,7 +1416,7 @@ impl<'a> Iterator for MapIterEncoded<'a> {
 
         Some(Ok((
             parsed.s,
-            &self.data[key_start..key_end],
+            EncodedTextKey::new_unchecked(&self.data[key_start..key_end]),
             CborValueRef::new(self.data, value_start, end),
         )))
     }

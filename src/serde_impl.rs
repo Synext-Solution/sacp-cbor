@@ -2,16 +2,75 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use core::marker::PhantomData;
 
-use serde::de::{DeserializeOwned, IntoDeserializer, Visitor};
-use serde::ser::{SerializeMap, SerializeSeq};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::de::{
+    self, Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
+    VariantAccess, Visitor,
+};
+use serde::ser::{self, SerializeMap, SerializeSeq, SerializeStruct};
+use serde::{Deserialize as SerdeDeserialize, Serialize, Serializer};
 
+use crate::encode::Encoder;
 use crate::int::{integer_from_i128, integer_from_u128};
-use crate::profile::{CANONICAL_NAN_BITS, NEGATIVE_ZERO_BITS};
+use crate::profile::is_strictly_increasing_encoded;
+use crate::query::{CborIntegerRef, CborKind, CborValueRef};
 use crate::scalar::F64Bits;
-use crate::value::{BigInt, CborMap, CborValue, ValueRepr};
-use crate::{CborError, DecodeLimits, ErrorCode};
+use crate::value::{CborMap, CborValue, ValueRepr};
+use crate::{CborBytesRef, CborError, DecodeLimits, ErrorCode};
+
+fn check_map_key_order(
+    enc: &mut Encoder,
+    prev_key_range: Option<(usize, usize)>,
+    key_start: usize,
+    key_end: usize,
+    entry_start: usize,
+) -> Result<(), SerdeError> {
+    if let Some((ps, pe)) = prev_key_range {
+        let buf = enc.as_bytes();
+        let prev = &buf[ps..pe];
+        let curr = &buf[key_start..key_end];
+        if prev == curr {
+            enc.truncate(entry_start);
+            return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
+        }
+        if !is_strictly_increasing_encoded(prev, curr) {
+            enc.truncate(entry_start);
+            return Err(SerdeError::with_code(ErrorCode::NonCanonicalMapOrder));
+        }
+    }
+    Ok(())
+}
+
+fn mag_to_u128(mag: &[u8]) -> Option<u128> {
+    if mag.len() > 16 {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    let start = 16 - mag.len();
+    buf[start..].copy_from_slice(mag);
+    Some(u128::from_be_bytes(buf))
+}
+
+fn bigint_to_u128(negative: bool, mag: &[u8]) -> Option<u128> {
+    if negative {
+        return None;
+    }
+    mag_to_u128(mag)
+}
+
+fn bigint_to_i128(negative: bool, mag: &[u8]) -> Option<i128> {
+    let n = mag_to_u128(mag)?;
+    if n > i128::MAX as u128 {
+        return None;
+    }
+    let n_i = i128::try_from(n).ok()?;
+    if negative {
+        Some(-1 - n_i)
+    } else {
+        Some(n_i)
+    }
+}
 
 impl Serialize for CborValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -22,9 +81,9 @@ impl Serialize for CborValue {
                 if let Some(v) = i.as_i64() {
                     serializer.serialize_i64(v)
                 } else if let Some(b) = i.as_bigint() {
-                    if let Some(v) = bigint_to_i128(b) {
+                    if let Some(v) = bigint_to_i128(b.is_negative(), b.magnitude()) {
                         serializer.serialize_i128(v)
-                    } else if let Some(v) = bigint_to_u128(b) {
+                    } else if let Some(v) = bigint_to_u128(b.is_negative(), b.magnitude()) {
                         serializer.serialize_u128(v)
                     } else {
                         Err(serde::ser::Error::custom("bignum out of range"))
@@ -54,7 +113,7 @@ impl Serialize for CborValue {
     }
 }
 
-impl<'de> Deserialize<'de> for CborValue {
+impl<'de> SerdeDeserialize<'de> for CborValue {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(CborValueVisitor)
     }
@@ -247,8 +306,11 @@ impl<'de> Visitor<'de> for CborValueVisitor {
 ///
 /// Returns an error if the value cannot be represented under SACP-CBOR/1 constraints.
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, CborError> {
-    let v = to_value(value)?;
-    v.encode_canonical()
+    let mut enc = Encoder::new();
+    value
+        .serialize(EncoderSerializer::new(&mut enc))
+        .map_err(|err| CborError::new(err.code, 0))?;
+    Ok(enc.into_vec())
 }
 
 /// Deserialize a Rust value from canonical SACP-CBOR/1 bytes.
@@ -256,37 +318,23 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, CborError> {
 /// # Errors
 ///
 /// Returns an error if bytes are invalid or if the decoded value doesn't match the target type.
-pub fn from_slice<T: DeserializeOwned>(bytes: &[u8], limits: DecodeLimits) -> Result<T, CborError> {
-    let v = crate::decode_value(bytes, limits)?;
-    from_value_ref(&v)
+pub fn from_slice<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    limits: DecodeLimits,
+) -> Result<T, CborError> {
+    let canon = crate::validate_canonical(bytes, limits)?;
+    from_value_ref(canon.root())
 }
 
-/// Convert a Rust value into a `CborValue`.
-///
-/// # Errors
-///
-/// Returns an error if the value cannot be represented under SACP-CBOR/1 constraints.
-pub fn to_value<T: Serialize>(value: &T) -> Result<CborValue, CborError> {
-    value
-        .serialize(CborSerializer)
-        .map_err(|err| CborError::new(err.code, 0))
-}
-
-/// Deserialize a Rust value from a `CborValue`.
+/// Deserialize a Rust value from a `CborValueRef`.
 ///
 /// # Errors
 ///
 /// Returns an error if the value doesn't match the target type.
-pub fn from_value_ref<'de, T: Deserialize<'de>>(value: &'de CborValue) -> Result<T, CborError> {
-    T::deserialize(CborDeserializer::new(value))
-        .map_err(|_| CborError::new(ErrorCode::SerdeError, 0))
+pub fn from_value_ref<'de, T: Deserialize<'de>>(value: CborValueRef<'de>) -> Result<T, CborError> {
+    let de = CborRefDeserializer::new(value);
+    T::deserialize(de).map_err(DeError::into_cbor_error)
 }
-
-/// Deserialize a Rust value from a `CborValue`.
-///
-/// # Errors
-///
-/// Returns an error if the value doesn't match the target type.
 
 #[derive(Debug, Clone, Copy)]
 struct SerdeError {
@@ -301,7 +349,8 @@ impl SerdeError {
 
 impl fmt::Display for SerdeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "serde conversion error")
+        let err = CborError::new(self.code, 0);
+        fmt::Display::fmt(&err, f)
     }
 }
 
@@ -314,73 +363,76 @@ impl serde::ser::Error for SerdeError {
     }
 }
 
-impl serde::de::Error for SerdeError {
-    fn custom<T: fmt::Display>(_msg: T) -> Self {
-        Self::with_code(ErrorCode::SerdeError)
+impl From<CborError> for SerdeError {
+    fn from(err: CborError) -> Self {
+        Self::with_code(err.code)
     }
 }
 
-#[inline]
-const fn map_alloc_err(err: CborError) -> SerdeError {
-    SerdeError::with_code(err.code)
+struct EncoderSerializer<'a> {
+    enc: &'a mut Encoder,
 }
 
-struct CborSerializer;
+impl<'a> EncoderSerializer<'a> {
+    fn new(enc: &'a mut Encoder) -> Self {
+        Self { enc }
+    }
+}
 
-impl Serializer for CborSerializer {
-    type Ok = CborValue;
+impl<'a> ser::Serializer for EncoderSerializer<'a> {
+    type Ok = ();
     type Error = SerdeError;
 
-    type SerializeSeq = SeqSerializer;
-    type SerializeTuple = SeqSerializer;
-    type SerializeTupleStruct = SeqSerializer;
-    type SerializeTupleVariant = TupleVariantSerializer;
-    type SerializeMap = MapSerializer;
-    type SerializeStruct = StructSerializer;
-    type SerializeStructVariant = StructVariantSerializer;
+    type SerializeSeq = SeqSerializer<'a>;
+    type SerializeTuple = SeqSerializer<'a>;
+    type SerializeTupleStruct = SeqSerializer<'a>;
+    type SerializeTupleVariant = TupleVariantSerializer<'a>;
+    type SerializeMap = MapSerializer<'a>;
+    type SerializeStruct = StructSerializer<'a>;
+    type SerializeStructVariant = StructVariantSerializer<'a>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::bool(v))
+        self.enc.bool(v).map_err(SerdeError::from)
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        int_to_value(i128::from(v))
+        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        int_to_value(i128::from(v))
+        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        int_to_value(i128::from(v))
+        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        int_to_value(i128::from(v))
+        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-        int_to_value(v)
+        self.enc.int_i128(v).map_err(SerdeError::from)
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        uint_to_value(u128::from(v))
+        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        uint_to_value(u128::from(v))
+        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        uint_to_value(u128::from(v))
+        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        uint_to_value(u128::from(v))
+        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        uint_to_value(v)
+        self.enc.int_u128(v).map_err(SerdeError::from)
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
@@ -388,35 +440,26 @@ impl Serializer for CborSerializer {
     }
 
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        let bits = v.to_bits();
-        if bits == NEGATIVE_ZERO_BITS {
-            return Err(SerdeError::with_code(ErrorCode::NegativeZeroForbidden));
-        }
-        if v.is_nan() {
-            return Ok(CborValue::float(F64Bits::new_unchecked(CANONICAL_NAN_BITS)));
-        }
-        Ok(CborValue::float(F64Bits::new_unchecked(bits)))
+        let bits = F64Bits::try_from_f64(v).map_err(SerdeError::from)?;
+        self.enc.float(bits).map_err(SerdeError::from)
     }
 
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
         let s = v.encode_utf8(&mut buf);
-        let boxed = crate::alloc_util::try_box_str_from_str(s, 0).map_err(map_alloc_err)?;
-        Ok(CborValue::text(boxed))
+        self.enc.text(s).map_err(SerdeError::from)
     }
 
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        let boxed = crate::alloc_util::try_box_str_from_str(v, 0).map_err(map_alloc_err)?;
-        Ok(CborValue::text(boxed))
+        self.enc.text(v).map_err(SerdeError::from)
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        let out = crate::alloc_util::try_vec_from_slice(v, 0).map_err(map_alloc_err)?;
-        Ok(CborValue::bytes(out))
+        self.enc.bytes(v).map_err(SerdeError::from)
     }
 
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::null())
+        self.enc.null().map_err(SerdeError::from)
     }
 
     fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
@@ -424,11 +467,11 @@ impl Serializer for CborSerializer {
     }
 
     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::null())
+        self.enc.null().map_err(SerdeError::from)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::null())
+        self.enc.null().map_err(SerdeError::from)
     }
 
     fn serialize_unit_variant(
@@ -437,7 +480,13 @@ impl Serializer for CborSerializer {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        enum_map(variant, CborValue::null())
+        let start = start_enum_map(self.enc, variant)?;
+        let res = self.enc.null();
+        if let Err(err) = res {
+            self.enc.truncate(start);
+            return Err(SerdeError::from(err));
+        }
+        Ok(())
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
@@ -455,16 +504,23 @@ impl Serializer for CborSerializer {
         variant: &'static str,
         value: &T,
     ) -> Result<Self::Ok, Self::Error> {
-        let inner = value.serialize(Self)?;
-        enum_map(variant, inner)
+        let start = start_enum_map(self.enc, variant)?;
+        if let Err(err) = value.serialize(EncoderSerializer::new(self.enc)) {
+            self.enc.truncate(start);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        SeqSerializer::new(len)
+        let len = len.ok_or_else(|| SerdeError::with_code(ErrorCode::IndefiniteLengthForbidden))?;
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len))
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        SeqSerializer::new(Some(len))
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len))
     }
 
     fn serialize_tuple_struct(
@@ -472,7 +528,8 @@ impl Serializer for CborSerializer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        SeqSerializer::new(Some(len))
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len))
     }
 
     fn serialize_tuple_variant(
@@ -482,11 +539,18 @@ impl Serializer for CborSerializer {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        TupleVariantSerializer::new(variant, Some(len))
+        let start = start_enum_map(self.enc, variant)?;
+        if let Err(err) = self.enc.array_header(len) {
+            self.enc.truncate(start);
+            return Err(SerdeError::from(err));
+        }
+        Ok(TupleVariantSerializer::new(self.enc, len))
     }
 
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        MapSerializer::new(len)
+        let len = len.ok_or_else(|| SerdeError::with_code(ErrorCode::IndefiniteLengthForbidden))?;
+        self.enc.map_header(len).map_err(SerdeError::from)?;
+        Ok(MapSerializer::new(self.enc, len))
     }
 
     fn serialize_struct(
@@ -494,7 +558,8 @@ impl Serializer for CborSerializer {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
-        StructSerializer::new(Some(len))
+        self.enc.map_header(len).map_err(SerdeError::from)?;
+        Ok(StructSerializer::new(self.enc, len))
     }
 
     fn serialize_struct_variant(
@@ -504,252 +569,347 @@ impl Serializer for CborSerializer {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        StructVariantSerializer::new(variant, Some(len))
+        let start = start_enum_map(self.enc, variant)?;
+        if let Err(err) = self.enc.map_header(len) {
+            self.enc.truncate(start);
+            return Err(SerdeError::from(err));
+        }
+        Ok(StructVariantSerializer::new(self.enc, len))
     }
 }
 
-struct SeqSerializer {
-    items: Vec<CborValue>,
+fn start_enum_map(enc: &mut Encoder, variant: &str) -> Result<usize, SerdeError> {
+    let start = enc.buf_len();
+    if let Err(err) = enc.map_header(1) {
+        enc.truncate(start);
+        return Err(SerdeError::from(err));
+    }
+    if let Err(err) = enc.text(variant) {
+        enc.truncate(start);
+        return Err(SerdeError::from(err));
+    }
+    Ok(start)
 }
 
-impl SeqSerializer {
-    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
-        let items = match len {
-            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0).map_err(map_alloc_err)?,
-            None => Vec::new(),
-        };
-        Ok(Self { items })
+struct SeqSerializer<'a> {
+    enc: &'a mut Encoder,
+    remaining: usize,
+}
+
+impl<'a> SeqSerializer<'a> {
+    fn new(enc: &'a mut Encoder, remaining: usize) -> Self {
+        Self { enc, remaining }
     }
 }
 
-impl SerializeSeq for SeqSerializer {
-    type Ok = CborValue;
+impl SerializeSeq for SeqSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
-        crate::alloc_util::try_reserve(&mut self.items, 1, 0).map_err(map_alloc_err)?;
-        self.items.push(value.serialize(CborSerializer)?);
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
+        if self.remaining == 0 {
+            return Err(SerdeError::with_code(ErrorCode::ArrayLenMismatch));
+        }
+        value.serialize(EncoderSerializer::new(self.enc))?;
+        self.remaining -= 1;
         Ok(())
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Ok(CborValue::array(self.items))
+    fn end(self) -> Result<(), SerdeError> {
+        if self.remaining != 0 {
+            return Err(SerdeError::with_code(ErrorCode::ArrayLenMismatch));
+        }
+        Ok(())
     }
 }
 
-impl serde::ser::SerializeTuple for SeqSerializer {
-    type Ok = CborValue;
+impl ser::SerializeTuple for SeqSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
         SerializeSeq::serialize_element(self, value)
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
+    fn end(self) -> Result<(), SerdeError> {
         SerializeSeq::end(self)
     }
 }
 
-impl serde::ser::SerializeTupleStruct for SeqSerializer {
-    type Ok = CborValue;
+impl ser::SerializeTupleStruct for SeqSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
         SerializeSeq::serialize_element(self, value)
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
+    fn end(self) -> Result<(), SerdeError> {
         SerializeSeq::end(self)
     }
 }
 
-struct TupleVariantSerializer {
-    variant: &'static str,
-    items: Vec<CborValue>,
+struct TupleVariantSerializer<'a> {
+    seq: SeqSerializer<'a>,
 }
 
-impl TupleVariantSerializer {
-    fn new(variant: &'static str, len: Option<usize>) -> Result<Self, SerdeError> {
-        let items = match len {
-            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0).map_err(map_alloc_err)?,
-            None => Vec::new(),
-        };
-        Ok(Self { variant, items })
+impl<'a> TupleVariantSerializer<'a> {
+    fn new(enc: &'a mut Encoder, remaining: usize) -> Self {
+        Self {
+            seq: SeqSerializer::new(enc, remaining),
+        }
     }
 }
 
-impl serde::ser::SerializeTupleVariant for TupleVariantSerializer {
-    type Ok = CborValue;
+impl ser::SerializeTupleVariant for TupleVariantSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
-        crate::alloc_util::try_reserve(&mut self.items, 1, 0).map_err(map_alloc_err)?;
-        self.items.push(value.serialize(CborSerializer)?);
-        Ok(())
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
+        self.seq.serialize_element(value)
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        enum_map(self.variant, CborValue::array(self.items))
+    fn end(self) -> Result<(), SerdeError> {
+        self.seq.end()
     }
 }
 
-struct MapSerializer {
-    entries: Vec<(Box<str>, CborValue)>,
-    next_key: Option<Box<str>>,
+struct PendingKey {
+    entry_start: usize,
+    key_start: usize,
+    key_end: usize,
 }
 
-impl MapSerializer {
-    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
-        let entries = match len {
-            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0).map_err(map_alloc_err)?,
-            None => Vec::new(),
-        };
-        Ok(Self {
-            entries,
-            next_key: None,
+struct MapSerializer<'a> {
+    enc: &'a mut Encoder,
+    remaining: usize,
+    prev_key_range: Option<(usize, usize)>,
+    pending: Option<PendingKey>,
+}
+
+impl<'a> MapSerializer<'a> {
+    fn new(enc: &'a mut Encoder, remaining: usize) -> Self {
+        Self {
+            enc,
+            remaining,
+            prev_key_range: None,
+            pending: None,
+        }
+    }
+
+    fn write_pending_key<T: ?Sized + Serialize>(
+        &mut self,
+        key: &T,
+    ) -> Result<PendingKey, SerdeError> {
+        let entry_start = self.enc.buf_len();
+        let (key_start, key_end) = key.serialize(MapKeySerializer::new(self.enc, entry_start))?;
+
+        check_map_key_order(
+            self.enc,
+            self.prev_key_range,
+            key_start,
+            key_end,
+            entry_start,
+        )?;
+
+        Ok(PendingKey {
+            entry_start,
+            key_start,
+            key_end,
         })
     }
 }
 
-impl SerializeMap for MapSerializer {
-    type Ok = CborValue;
+impl SerializeMap for MapSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
-    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
-        let key = key.serialize(KeySerializer)?;
-        self.next_key = Some(key);
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), SerdeError> {
+        if self.pending.is_some() {
+            return Err(SerdeError::with_code(ErrorCode::SerdeError));
+        }
+        if self.remaining == 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+        let pending = self.write_pending_key(key)?;
+        self.pending = Some(pending);
         Ok(())
     }
 
-    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
-        let key = self
-            .next_key
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
+        let pending = self
+            .pending
             .take()
             .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
-        let val = value.serialize(CborSerializer)?;
-        crate::alloc_util::try_reserve(&mut self.entries, 1, 0).map_err(map_alloc_err)?;
-        self.entries.push((key, val));
+
+        if let Err(err) = value.serialize(EncoderSerializer::new(self.enc)) {
+            self.enc.truncate(pending.entry_start);
+            return Err(err);
+        }
+
+        self.prev_key_range = Some((pending.key_start, pending.key_end));
+        self.remaining -= 1;
         Ok(())
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        let map = CborMap::new(self.entries).map_err(|err| SerdeError::with_code(err.code))?;
-        Ok(CborValue::map(map))
+    fn serialize_entry<K: ?Sized + Serialize, V: ?Sized + Serialize>(
+        &mut self,
+        key: &K,
+        value: &V,
+    ) -> Result<(), SerdeError> {
+        if self.remaining == 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+        let pending = self.write_pending_key(key)?;
+        if let Err(err) = value.serialize(EncoderSerializer::new(self.enc)) {
+            self.enc.truncate(pending.entry_start);
+            return Err(err);
+        }
+        self.prev_key_range = Some((pending.key_start, pending.key_end));
+        self.remaining -= 1;
+        Ok(())
+    }
+
+    fn end(self) -> Result<(), SerdeError> {
+        if self.pending.is_some() {
+            return Err(SerdeError::with_code(ErrorCode::SerdeError));
+        }
+        if self.remaining != 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+        Ok(())
     }
 }
 
-impl serde::ser::SerializeStruct for StructSerializer {
-    type Ok = CborValue;
+struct StructSerializer<'a> {
+    enc: &'a mut Encoder,
+    remaining: usize,
+    prev_key_range: Option<(usize, usize)>,
+}
+
+impl<'a> StructSerializer<'a> {
+    fn new(enc: &'a mut Encoder, remaining: usize) -> Self {
+        Self {
+            enc,
+            remaining,
+            prev_key_range: None,
+        }
+    }
+}
+
+impl ser::SerializeStruct for StructSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
         key: &'static str,
         value: &T,
-    ) -> Result<(), Self::Error> {
-        let val = value.serialize(CborSerializer)?;
-        push_struct_entry(&mut self.entries, key, val)
+    ) -> Result<(), SerdeError> {
+        if self.remaining == 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+
+        let entry_start = self.enc.buf_len();
+        if let Err(err) = self.enc.text(key) {
+            self.enc.truncate(entry_start);
+            return Err(SerdeError::from(err));
+        }
+        let key_start = entry_start;
+        let key_end = self.enc.buf_len();
+
+        check_map_key_order(
+            self.enc,
+            self.prev_key_range,
+            key_start,
+            key_end,
+            entry_start,
+        )?;
+
+        if let Err(err) = value.serialize(EncoderSerializer::new(self.enc)) {
+            self.enc.truncate(entry_start);
+            return Err(err);
+        }
+
+        self.prev_key_range = Some((key_start, key_end));
+        self.remaining -= 1;
+        Ok(())
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        let map = CborMap::new(self.entries).map_err(|err| SerdeError::with_code(err.code))?;
-        Ok(CborValue::map(map))
-    }
-}
-
-struct StructSerializer {
-    entries: Vec<(Box<str>, CborValue)>,
-}
-
-fn push_struct_entry(
-    entries: &mut Vec<(Box<str>, CborValue)>,
-    key: &'static str,
-    value: CborValue,
-) -> Result<(), SerdeError> {
-    let key = crate::alloc_util::try_box_str_from_str(key, 0).map_err(map_alloc_err)?;
-    crate::alloc_util::try_reserve(entries, 1, 0).map_err(map_alloc_err)?;
-    entries.push((key, value));
-    Ok(())
-}
-
-impl StructSerializer {
-    fn new(len: Option<usize>) -> Result<Self, SerdeError> {
-        let entries = match len {
-            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0).map_err(map_alloc_err)?,
-            None => Vec::new(),
-        };
-        Ok(Self { entries })
-    }
-}
-
-struct StructVariantSerializer {
-    variant: &'static str,
-    entries: Vec<(Box<str>, CborValue)>,
-}
-
-impl StructVariantSerializer {
-    fn new(variant: &'static str, len: Option<usize>) -> Result<Self, SerdeError> {
-        let entries = match len {
-            Some(cap) => crate::alloc_util::try_vec_with_capacity(cap, 0).map_err(map_alloc_err)?,
-            None => Vec::new(),
-        };
-        Ok(Self { variant, entries })
+    fn end(self) -> Result<(), SerdeError> {
+        if self.remaining != 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+        Ok(())
     }
 }
 
-impl serde::ser::SerializeStructVariant for StructVariantSerializer {
-    type Ok = CborValue;
+struct StructVariantSerializer<'a> {
+    inner: StructSerializer<'a>,
+}
+
+impl<'a> StructVariantSerializer<'a> {
+    fn new(enc: &'a mut Encoder, remaining: usize) -> Self {
+        Self {
+            inner: StructSerializer::new(enc, remaining),
+        }
+    }
+}
+
+impl ser::SerializeStructVariant for StructVariantSerializer<'_> {
+    type Ok = ();
     type Error = SerdeError;
 
     fn serialize_field<T: ?Sized + Serialize>(
         &mut self,
         key: &'static str,
         value: &T,
-    ) -> Result<(), Self::Error> {
-        let val = value.serialize(CborSerializer)?;
-        push_struct_entry(&mut self.entries, key, val)
+    ) -> Result<(), SerdeError> {
+        self.inner.serialize_field(key, value)
     }
 
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        let map = CborMap::new(self.entries).map_err(|err| SerdeError::with_code(err.code))?;
-        enum_map(self.variant, CborValue::map(map))
+    fn end(self) -> Result<(), SerdeError> {
+        self.inner.end()
     }
 }
 
-struct KeySerializer;
+struct MapKeySerializer<'a> {
+    enc: &'a mut Encoder,
+    entry_start: usize,
+}
 
-impl Serializer for KeySerializer {
-    type Ok = Box<str>;
+impl<'a> MapKeySerializer<'a> {
+    fn new(enc: &'a mut Encoder, entry_start: usize) -> Self {
+        Self { enc, entry_start }
+    }
+}
+
+impl ser::Serializer for MapKeySerializer<'_> {
+    type Ok = (usize, usize);
     type Error = SerdeError;
 
-    type SerializeSeq = Impossible<Box<str>, SerdeError>;
-    type SerializeTuple = Impossible<Box<str>, SerdeError>;
-    type SerializeTupleStruct = Impossible<Box<str>, SerdeError>;
-    type SerializeTupleVariant = Impossible<Box<str>, SerdeError>;
-    type SerializeMap = Impossible<Box<str>, SerdeError>;
-    type SerializeStruct = Impossible<Box<str>, SerdeError>;
-    type SerializeStructVariant = Impossible<Box<str>, SerdeError>;
+    type SerializeSeq = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeTuple = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeTupleStruct = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeTupleVariant = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeMap = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeStruct = ser::Impossible<(usize, usize), SerdeError>;
+    type SerializeStructVariant = ser::Impossible<(usize, usize), SerdeError>;
 
-    fn serialize_str(self, value: &str) -> Result<Self::Ok, Self::Error> {
-        crate::alloc_util::try_box_str_from_str(value, 0).map_err(map_alloc_err)
+    fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+        let key_start = self.entry_start;
+        if let Err(err) = self.enc.text(v) {
+            self.enc.truncate(self.entry_start);
+            return Err(SerdeError::from(err));
+        }
+        let key_end = self.enc.buf_len();
+        Ok((key_start, key_end))
     }
 
-    fn serialize_char(self, value: char) -> Result<Self::Ok, Self::Error> {
+    fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
-        let s = value.encode_utf8(&mut buf);
-        crate::alloc_util::try_box_str_from_str(s, 0).map_err(map_alloc_err)
-    }
-
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        value: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        value.serialize(self)
-    }
-
-    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
-        value.serialize(self)
+        let s = v.encode_utf8(&mut buf);
+        self.serialize_str(s)
     }
 
     fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
@@ -812,6 +972,10 @@ impl Serializer for KeySerializer {
         Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
     }
 
+    fn serialize_some<T: ?Sized + Serialize>(self, _value: &T) -> Result<Self::Ok, Self::Error> {
+        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+    }
+
     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
         Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
     }
@@ -825,6 +989,14 @@ impl Serializer for KeySerializer {
         _name: &'static str,
         _variant_index: u32,
         _variant: &'static str,
+    ) -> Result<Self::Ok, Self::Error> {
+        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+    }
+
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        _value: &T,
     ) -> Result<Self::Ok, Self::Error> {
         Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
     }
@@ -888,273 +1060,575 @@ impl Serializer for KeySerializer {
     }
 }
 
-struct CborDeserializer<'de> {
-    value: &'de CborValue,
+/// A serde decoding error that preserves an [`ErrorCode`] plus an input offset.
+///
+/// This is the `serde::Deserializer::Error` type used by [`CborRefDeserializer`].
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeError {
+    /// Error category.
+    pub code: ErrorCode,
+    /// Byte offset within the input where the error was detected.
+    pub offset: usize,
 }
 
-impl<'de> CborDeserializer<'de> {
-    const fn new(value: &'de CborValue) -> Self {
-        Self { value }
+impl DeError {
+    #[inline]
+    #[must_use]
+    /// Construct a new serde error with a code and offset.
+    pub const fn new(code: ErrorCode, offset: usize) -> Self {
+        Self { code, offset }
+    }
+
+    #[inline]
+    #[must_use]
+    /// Convert into the crate's [`CborError`].
+    pub const fn into_cbor_error(self) -> CborError {
+        CborError::new(self.code, self.offset)
     }
 }
 
-impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
-    type Error = SerdeError;
+impl fmt::Display for DeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let e = CborError::new(self.code, self.offset);
+        fmt::Display::fmt(&e, f)
+    }
+}
 
-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+#[cfg(feature = "std")]
+impl std::error::Error for DeError {}
+
+impl serde::de::Error for DeError {
+    fn custom<T: fmt::Display>(_msg: T) -> Self {
+        Self::new(ErrorCode::SerdeError, 0)
+    }
+}
+
+impl From<CborError> for DeError {
+    fn from(e: CborError) -> Self {
+        Self::new(e.code, e.offset)
+    }
+}
+
+#[inline]
+const fn ser_err(off: usize) -> DeError {
+    DeError::new(ErrorCode::SerdeError, off)
+}
+
+/// Validate `bytes` as canonical under `limits`, then deserialize `T` with zero-copy borrows.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or if deserialization fails.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    let canon = crate::validate_canonical(bytes, limits)?;
+    from_bytes_ref_borrowed(canon)
+}
+
+/// Deserialize from already-validated canonical bytes (fast path).
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_bytes_ref_borrowed<'de, T>(canon: CborBytesRef<'de>) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    from_value_ref_borrowed(canon.root())
+}
+
+/// Deserialize directly from a validated [`CborValueRef`].
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub fn from_value_ref_borrowed<'de, T>(value: CborValueRef<'de>) -> Result<T, CborError>
+where
+    T: Deserialize<'de>,
+{
+    let de = CborRefDeserializer::new(value);
+    T::deserialize(de).map_err(DeError::into_cbor_error)
+}
+
+/// A zero-copy `serde::Deserializer` for canonical CBOR, backed by [`CborValueRef<'de>`].
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+#[derive(Debug, Clone, Copy)]
+pub struct CborRefDeserializer<'de> {
+    v: CborValueRef<'de>,
+}
+
+impl<'de> CborRefDeserializer<'de> {
+    #[inline]
+    #[must_use]
+    /// Construct a borrowed deserializer from a validated [`CborValueRef`].
+    pub const fn new(v: CborValueRef<'de>) -> Self {
+        Self { v }
+    }
+
+    #[inline]
+    #[must_use]
+    const fn off(&self) -> usize {
+        self.v.offset()
+    }
+}
+
+#[inline]
+fn parse_i128(v: CborValueRef<'_>) -> Result<i128, DeError> {
+    let off = v.offset();
+    match v.integer().map_err(DeError::from)? {
+        CborIntegerRef::Safe(i) => Ok(i128::from(i)),
+        CborIntegerRef::Big(b) => bigint_to_i128(b.is_negative(), b.magnitude())
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, off)),
+    }
+}
+
+#[inline]
+fn parse_u128(v: CborValueRef<'_>) -> Result<u128, DeError> {
+    let off = v.offset();
+    match v.integer().map_err(DeError::from)? {
+        CborIntegerRef::Safe(i) => {
+            if i < 0 {
+                return Err(DeError::new(ErrorCode::SerdeError, off));
+            }
+            u128::try_from(i).map_err(|_| DeError::new(ErrorCode::SerdeError, off))
+        }
+        CborIntegerRef::Big(b) => bigint_to_u128(b.is_negative(), b.magnitude())
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, off)),
+    }
+}
+
+#[inline]
+fn parse_u64(v: CborValueRef<'_>) -> Result<u64, DeError> {
+    let n = parse_u128(v)?;
+    u64::try_from(n).map_err(|_| DeError::new(ErrorCode::SerdeError, v.offset()))
+}
+
+#[inline]
+fn parse_i64(v: CborValueRef<'_>) -> Result<i64, DeError> {
+    let n = parse_i128(v)?;
+    i64::try_from(n).map_err(|_| DeError::new(ErrorCode::SerdeError, v.offset()))
+}
+
+struct CborSeqAccess<'de, I> {
+    iter: I,
+    remaining: usize,
+    _pd: PhantomData<&'de ()>,
+}
+
+impl<I> CborSeqAccess<'_, I> {
+    const fn new(iter: I, remaining: usize) -> Self {
+        Self {
+            iter,
+            remaining,
+            _pd: PhantomData,
+        }
+    }
+}
+
+impl<'de, I> SeqAccess<'de> for CborSeqAccess<'de, I>
+where
+    I: Iterator<Item = Result<CborValueRef<'de>, CborError>>,
+{
+    type Error = DeError;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, DeError>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        match self.iter.next() {
+            None => {
+                self.remaining = 0;
+                Ok(None)
+            }
+            Some(Err(e)) => Err(DeError::from(e)),
+            Some(Ok(v)) => {
+                self.remaining = self.remaining.saturating_sub(1);
+                seed.deserialize(CborRefDeserializer::new(v)).map(Some)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.remaining)
+    }
+}
+
+struct CborMapAccess<'de, I> {
+    iter: I,
+    remaining: usize,
+    pending_value: Option<CborValueRef<'de>>,
+    map_off: usize,
+    _pd: PhantomData<&'de ()>,
+}
+
+impl<I> CborMapAccess<'_, I> {
+    const fn new(iter: I, remaining: usize, map_off: usize) -> Self {
+        Self {
+            iter,
+            remaining,
+            pending_value: None,
+            map_off,
+            _pd: PhantomData,
+        }
+    }
+}
+
+impl<'de, I> MapAccess<'de> for CborMapAccess<'de, I>
+where
+    I: Iterator<Item = Result<(&'de str, CborValueRef<'de>), CborError>>,
+{
+    type Error = DeError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, DeError>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        let next = match self.iter.next() {
+            None => {
+                self.remaining = 0;
+                return Ok(None);
+            }
+            Some(Err(e)) => return Err(DeError::from(e)),
+            Some(Ok(kv)) => kv,
+        };
+
+        let (k, v) = next;
+        self.pending_value = Some(v);
+        self.remaining = self.remaining.saturating_sub(1);
+        seed.deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(k))
+            .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, DeError>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let v = self
+            .pending_value
+            .take()
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.map_off))?;
+        seed.deserialize(CborRefDeserializer::new(v))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.remaining)
+    }
+}
+
+struct CborEnumAccess<'de> {
+    variant: &'de str,
+    value: Option<CborValueRef<'de>>,
+    off: usize,
+}
+
+impl<'de> EnumAccess<'de> for CborEnumAccess<'de> {
+    type Error = DeError;
+    type Variant = CborVariantAccess<'de>;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), DeError>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let v = seed.deserialize(
+            <&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(self.variant),
+        )?;
+        Ok((
+            v,
+            CborVariantAccess {
+                value: self.value,
+                off: self.off,
+            },
+        ))
+    }
+}
+
+struct CborVariantAccess<'de> {
+    value: Option<CborValueRef<'de>>,
+    off: usize,
+}
+
+impl<'de> VariantAccess<'de> for CborVariantAccess<'de> {
+    type Error = DeError;
+
+    fn unit_variant(self) -> Result<(), DeError> {
+        match self.value {
+            None => Ok(()),
+            Some(v) if v.is_null() => Ok(()),
+            Some(_) => Err(DeError::new(ErrorCode::SerdeError, self.off)),
+        }
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, DeError>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        let v = self
+            .value
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
+        seed.deserialize(CborRefDeserializer::new(v))
+    }
+
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Null => visitor.visit_unit(),
-            ValueRepr::Bool(b) => visitor.visit_bool(*b),
-            ValueRepr::Integer(i) => {
-                if let Some(v) = i.as_i64() {
-                    visitor.visit_i64(v)
-                } else if let Some(b) = i.as_bigint() {
-                    visit_bignum_any(b, visitor)
-                } else {
-                    Err(SerdeError::with_code(ErrorCode::SerdeError))
+        let v = self
+            .value
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
+        let a = v.array().map_err(DeError::from)?;
+        let len = a.len();
+        visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
+    }
+
+    fn struct_variant<V>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let v = self
+            .value
+            .ok_or_else(|| DeError::new(ErrorCode::SerdeError, self.off))?;
+        let m = v.map().map_err(DeError::from)?;
+        let len = m.len();
+        visitor.visit_map(CborMapAccess::new(m.iter(), len, v.offset()))
+    }
+}
+
+impl<'de> de::Deserializer<'de> for CborRefDeserializer<'de> {
+    type Error = DeError;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let kind = self.v.kind().map_err(DeError::from)?;
+        match kind {
+            CborKind::Null => visitor.visit_unit(),
+            CborKind::Bool => visitor.visit_bool(self.v.bool().map_err(DeError::from)?),
+            CborKind::Text => visitor.visit_borrowed_str(self.v.text().map_err(DeError::from)?),
+            CborKind::Bytes => visitor.visit_borrowed_bytes(self.v.bytes().map_err(DeError::from)?),
+            CborKind::Float => visitor.visit_f64(self.v.float64().map_err(DeError::from)?),
+            CborKind::Integer => match self.v.integer().map_err(DeError::from)? {
+                CborIntegerRef::Safe(i) => {
+                    if i >= 0 {
+                        let n = u64::try_from(i).map_err(|_| ser_err(self.off()))?;
+                        visitor.visit_u64(n)
+                    } else {
+                        visitor.visit_i64(i)
+                    }
                 }
-            }
-            ValueRepr::Float(bits) => visitor.visit_f64(bits.to_f64()),
-            ValueRepr::Bytes(b) => visitor.visit_borrowed_bytes(b),
-            ValueRepr::Text(s) => visitor.visit_str(s),
-            ValueRepr::Array(items) => visitor.visit_seq(SeqAccess { items, idx: 0 }),
-            ValueRepr::Map(map) => visitor.visit_map(MapAccess::new(map.iter())),
-        }
-    }
-
-    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Bool(b) => visitor.visit_bool(*b),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_i128(self.value)?;
-        if v < i128::from(i8::MIN) || v > i128::from(i8::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = i8::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_i8(v)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_i128(self.value)?;
-        if v < i128::from(i16::MIN) || v > i128::from(i16::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = i16::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_i16(v)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_i128(self.value)?;
-        if v < i128::from(i32::MIN) || v > i128::from(i32::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = i32::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_i32(v)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_i128(self.value)?;
-        if v < i128::from(i64::MIN) || v > i128::from(i64::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = i64::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_i64(v)
-    }
-
-    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_i128(self.value)?;
-        visitor.visit_i128(v)
-    }
-
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_u128(self.value)?;
-        if v > u128::from(u8::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = u8::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_u8(v)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_u128(self.value)?;
-        if v > u128::from(u16::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = u16::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_u16(v)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_u128(self.value)?;
-        if v > u128::from(u32::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = u32::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_u32(v)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_u128(self.value)?;
-        if v > u128::from(u64::MAX) {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let v = u64::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))?;
-        visitor.visit_u64(v)
-    }
-
-    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        let v = parse_u128(self.value)?;
-        visitor.visit_u128(v)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Float(bits) => {
-                let v = bits.to_f64();
-                let v32 = f64_to_f32(v)?;
-                visitor.visit_f32(v32)
-            }
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Float(bits) => visitor.visit_f64(bits.to_f64()),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Text(s) => {
-                let mut chars = s.chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    visitor.visit_char(c)
-                } else {
-                    Err(SerdeError::with_code(ErrorCode::SerdeError))
+                CborIntegerRef::Big(b) => {
+                    let off = self.off();
+                    if b.is_negative() {
+                        let n = bigint_to_i128(true, b.magnitude()).ok_or_else(|| ser_err(off))?;
+                        visitor.visit_i128(n)
+                    } else {
+                        let n = bigint_to_u128(false, b.magnitude()).ok_or_else(|| ser_err(off))?;
+                        visitor.visit_u128(n)
+                    }
                 }
+            },
+            CborKind::Array => {
+                let a = self.v.array().map_err(DeError::from)?;
+                let len = a.len();
+                visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
             }
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Text(s) => visitor.visit_str(s),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        match self.value.repr() {
-            ValueRepr::Text(s) => {
-                let mut out = String::new();
-                crate::alloc_util::try_reserve_exact_str(&mut out, s.len(), 0)
-                    .map_err(map_alloc_err)?;
-                out.push_str(s.as_ref());
-                visitor.visit_string(out)
+            CborKind::Map => {
+                let m = self.v.map().map_err(DeError::from)?;
+                let len = m.len();
+                visitor.visit_map(CborMapAccess::new(m.iter(), len, self.off()))
             }
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
         }
     }
 
-    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Bytes(b) => visitor.visit_borrowed_bytes(b),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
+        visitor.visit_bool(self.v.bool().map_err(DeError::from)?)
+    }
+
+    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_i128(self.v)?;
+        let out = i8::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_i8(out)
+    }
+
+    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_i128(self.v)?;
+        let out = i16::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_i16(out)
+    }
+
+    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_i128(self.v)?;
+        let out = i32::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_i32(out)
+    }
+
+    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(parse_i64(self.v)?)
+    }
+
+    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i128(parse_i128(self.v)?)
+    }
+
+    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_u128(self.v)?;
+        let out = u8::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_u8(out)
+    }
+
+    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_u128(self.v)?;
+        let out = u16::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_u16(out)
+    }
+
+    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let n = parse_u128(self.v)?;
+        let out = u32::try_from(n).map_err(|_| ser_err(self.off()))?;
+        visitor.visit_u32(out)
+    }
+
+    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u64(parse_u64(self.v)?)
+    }
+
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u128(parse_u128(self.v)?)
+    }
+
+    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let v = self.v.float64().map_err(DeError::from)?;
+        if v.is_nan() {
+            return visitor.visit_f32(f32::NAN);
+        }
+        if v.is_infinite() {
+            return visitor.visit_f32(if v.is_sign_negative() {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            });
+        }
+        if v > f64::from(f32::MAX) || v < f64::from(f32::MIN) {
+            return Err(ser_err(self.off()));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            visitor.visit_f32(v as f32)
         }
     }
 
-    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Bytes(b) => {
-                let out = crate::alloc_util::try_vec_from_slice(b.as_slice(), 0)
-                    .map_err(map_alloc_err)?;
-                visitor.visit_byte_buf(out)
-            }
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
+        visitor.visit_f64(self.v.float64().map_err(DeError::from)?)
+    }
+
+    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        let s = self.v.text().map_err(DeError::from)?;
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => visitor.visit_char(c),
+            _ => Err(ser_err(self.off())),
         }
     }
 
-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Null => visitor.visit_none(),
-            _ => visitor.visit_some(self),
+        visitor.visit_borrowed_str(self.v.text().map_err(DeError::from)?)
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_str(visitor)
+    }
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_borrowed_bytes(self.v.bytes().map_err(DeError::from)?)
+    }
+
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_bytes(visitor)
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, DeError>
+    where
+        V: Visitor<'de>,
+    {
+        if self.v.is_null() {
+            visitor.visit_none()
+        } else {
+            visitor.visit_some(self)
         }
     }
 
-    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Null => visitor.visit_unit(),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
+        if self.v.is_null() {
+            visitor.visit_unit()
+        } else {
+            Err(ser_err(self.off()))
         }
     }
 
@@ -1162,7 +1636,7 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         self,
         _name: &'static str,
         visitor: V,
-    ) -> Result<V::Value, Self::Error>
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
@@ -1173,24 +1647,23 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         self,
         _name: &'static str,
         visitor: V,
-    ) -> Result<V::Value, Self::Error>
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
         visitor.visit_newtype_struct(self)
     }
 
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Array(items) => visitor.visit_seq(SeqAccess { items, idx: 0 }),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
+        let a = self.v.array().map_err(DeError::from)?;
+        let len = a.len();
+        visitor.visit_seq(CborSeqAccess::new(a.iter(), len))
     }
 
-    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
@@ -1202,21 +1675,20 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         _name: &'static str,
         _len: usize,
         visitor: V,
-    ) -> Result<V::Value, Self::Error>
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
         self.deserialize_seq(visitor)
     }
 
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Map(map) => visitor.visit_map(MapAccess::new(map.iter())),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
+        let m = self.v.map().map_err(DeError::from)?;
+        let len = m.len();
+        visitor.visit_map(CborMapAccess::new(m.iter(), len, self.off()))
     }
 
     fn deserialize_struct<V>(
@@ -1224,7 +1696,7 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         _name: &'static str,
         _fields: &'static [&'static str],
         visitor: V,
-    ) -> Result<V::Value, Self::Error>
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
@@ -1236,25 +1708,48 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
         _name: &'static str,
         _variants: &'static [&'static str],
         visitor: V,
-    ) -> Result<V::Value, Self::Error>
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        match self.value.repr() {
-            ValueRepr::Text(variant) => visitor.visit_enum(EnumAccess::unit(variant)),
-            ValueRepr::Map(map) => EnumAccess::from_map(map).and_then(|e| visitor.visit_enum(e)),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
+        let off = self.off();
+        match self.v.kind().map_err(DeError::from)? {
+            CborKind::Text => {
+                let variant = self.v.text().map_err(DeError::from)?;
+                visitor.visit_enum(CborEnumAccess {
+                    variant,
+                    value: None,
+                    off,
+                })
+            }
+            CborKind::Map => {
+                let m = self.v.map().map_err(DeError::from)?;
+                if m.len() != 1 {
+                    return Err(DeError::new(ErrorCode::SerdeError, off));
+                }
+                let (k, v) = m
+                    .iter()
+                    .next()
+                    .ok_or_else(|| DeError::new(ErrorCode::MalformedCanonical, off))?
+                    .map_err(DeError::from)?;
+                visitor.visit_enum(CborEnumAccess {
+                    variant: k,
+                    value: Some(v),
+                    off,
+                })
+            }
+            _ => Err(DeError::new(ErrorCode::SerdeError, off)),
         }
     }
 
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
         self.deserialize_str(visitor)
     }
 
-    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
@@ -1262,407 +1757,14 @@ impl<'de> serde::de::Deserializer<'de> for CborDeserializer<'de> {
     }
 }
 
-struct SeqAccess<'de> {
-    items: &'de [CborValue],
-    idx: usize,
-}
-
-impl<'de> serde::de::SeqAccess<'de> for SeqAccess<'de> {
-    type Error = SerdeError;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: serde::de::DeserializeSeed<'de>,
-    {
-        if self.idx >= self.items.len() {
-            return Ok(None);
-        }
-        let value = &self.items[self.idx];
-        self.idx += 1;
-        seed.deserialize(CborDeserializer::new(value)).map(Some)
-    }
-}
-
-struct MapAccess<'de, I>
-where
-    I: Iterator<Item = (&'de str, &'de CborValue)>,
-{
-    iter: I,
-    pending: Option<(&'de str, &'de CborValue)>,
-}
-
-impl<'de, I> MapAccess<'de, I>
-where
-    I: Iterator<Item = (&'de str, &'de CborValue)>,
-{
-    const fn new(iter: I) -> Self {
-        Self {
-            iter,
-            pending: None,
-        }
-    }
-}
-
-impl<'de, I> serde::de::MapAccess<'de> for MapAccess<'de, I>
-where
-    I: Iterator<Item = (&'de str, &'de CborValue)>,
-{
-    type Error = SerdeError;
-
-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
-    where
-        K: serde::de::DeserializeSeed<'de>,
-    {
-        self.pending = self.iter.next();
-        match self.pending {
-            None => Ok(None),
-            Some((key, _)) => seed.deserialize(key.into_deserializer()).map(Some),
-        }
-    }
-
-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::DeserializeSeed<'de>,
-    {
-        let (_, value) = self
-            .pending
-            .take()
-            .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
-        seed.deserialize(CborDeserializer::new(value))
-    }
-}
-
-struct EnumAccess<'de> {
-    variant: &'de str,
-    value: Option<&'de CborValue>,
-}
-
-impl<'de> EnumAccess<'de> {
-    const fn unit(variant: &'de str) -> Self {
-        Self {
-            variant,
-            value: None,
-        }
-    }
-
-    fn from_map(map: &'de CborMap) -> Result<Self, SerdeError> {
-        if map.len() != 1 {
-            return Err(SerdeError::with_code(ErrorCode::SerdeError));
-        }
-        let (variant, value) = map
-            .iter()
-            .next()
-            .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
-        Ok(Self {
-            variant,
-            value: Some(value),
-        })
-    }
-}
-
-impl<'de> serde::de::EnumAccess<'de> for EnumAccess<'de> {
-    type Error = SerdeError;
-    type Variant = VariantAccess<'de>;
-
-    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
-    where
-        V: serde::de::DeserializeSeed<'de>,
-    {
-        let val = seed.deserialize(self.variant.into_deserializer())?;
-        Ok((val, VariantAccess { value: self.value }))
-    }
-}
-
-struct VariantAccess<'de> {
-    value: Option<&'de CborValue>,
-}
-
-impl<'de> serde::de::VariantAccess<'de> for VariantAccess<'de> {
-    type Error = SerdeError;
-
-    fn unit_variant(self) -> Result<(), Self::Error> {
-        match self.value {
-            None => Ok(()),
-            Some(v) if v.is_null() => Ok(()),
-            _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-        }
-    }
-
-    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
-    where
-        T: serde::de::DeserializeSeed<'de>,
-    {
-        let value = self
-            .value
-            .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
-        seed.deserialize(CborDeserializer::new(value))
-    }
-
-    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.value.and_then(|v| v.as_array()).map_or_else(
-            || Err(SerdeError::with_code(ErrorCode::SerdeError)),
-            |items| visitor.visit_seq(SeqAccess { items, idx: 0 }),
-        )
-    }
-
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.value.and_then(|v| v.as_map()).map_or_else(
-            || Err(SerdeError::with_code(ErrorCode::SerdeError)),
-            |map| visitor.visit_map(MapAccess::new(map.iter())),
-        )
-    }
-}
-
-struct Impossible<Ok, Err> {
-    _ok: core::marker::PhantomData<Ok>,
-    _err: core::marker::PhantomData<Err>,
-}
-
-impl<Ok, Err> serde::ser::SerializeSeq for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeTuple for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_element<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeTupleStruct for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeTupleVariant for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeMap for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_key<T: ?Sized + Serialize>(&mut self, _key: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn serialize_value<T: ?Sized + Serialize>(&mut self, _value: &T) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeStruct for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_field<T: ?Sized + Serialize>(
-        &mut self,
-        _key: &'static str,
-        _value: &T,
-    ) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-impl<Ok, Err> serde::ser::SerializeStructVariant for Impossible<Ok, Err>
-where
-    Err: serde::ser::Error,
-{
-    type Ok = Ok;
-    type Error = Err;
-
-    fn serialize_field<T: ?Sized + Serialize>(
-        &mut self,
-        _key: &'static str,
-        _value: &T,
-    ) -> Result<(), Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-
-    fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(serde::ser::Error::custom("invalid map key"))
-    }
-}
-
-fn enum_map(variant: &str, value: CborValue) -> Result<CborValue, SerdeError> {
-    let key = crate::alloc_util::try_box_str_from_str(variant, 0).map_err(map_alloc_err)?;
-    let mut entries = crate::alloc_util::try_vec_with_capacity(1, 0).map_err(map_alloc_err)?;
-    entries.push((key, value));
-    let map = CborMap::new(entries).map_err(|err| SerdeError::with_code(err.code))?;
-    Ok(CborValue::map(map))
-}
-
 fn int_to_value(v: i128) -> Result<CborValue, SerdeError> {
-    let integer = integer_from_i128(v).map_err(SerdeError::with_code)?;
-    Ok(CborValue::integer(integer))
+    let int = integer_from_i128(v).map_err(SerdeError::with_code)?;
+    Ok(CborValue::integer(int))
 }
 
 fn uint_to_value(v: u128) -> Result<CborValue, SerdeError> {
-    let integer = integer_from_u128(v).map_err(SerdeError::with_code)?;
-    Ok(CborValue::integer(integer))
-}
-
-fn bigint_to_u128(big: &BigInt) -> Option<u128> {
-    if big.is_negative() {
-        return None;
-    }
-    magnitude_to_u128(big.magnitude())
-}
-
-fn bigint_to_i128(big: &BigInt) -> Option<i128> {
-    let n = magnitude_to_u128(big.magnitude())?;
-    if n > i128::MAX as u128 {
-        return None;
-    }
-    let n_i = i128::try_from(n).ok()?;
-    if big.is_negative() {
-        Some(-1 - n_i)
-    } else {
-        Some(n_i)
-    }
-}
-
-fn magnitude_to_u128(magnitude: &[u8]) -> Option<u128> {
-    if magnitude.len() > 16 {
-        return None;
-    }
-    let mut buf = [0u8; 16];
-    let start = 16 - magnitude.len();
-    buf[start..].copy_from_slice(magnitude);
-    Some(u128::from_be_bytes(buf))
-}
-
-fn parse_i128(value: &CborValue) -> Result<i128, SerdeError> {
-    match value.repr() {
-        ValueRepr::Integer(i) => i.as_i64().map_or_else(
-            || {
-                i.as_bigint()
-                    .and_then(bigint_to_i128)
-                    .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))
-            },
-            |v| Ok(i128::from(v)),
-        ),
-        _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-    }
-}
-
-fn parse_u128(value: &CborValue) -> Result<u128, SerdeError> {
-    match value.repr() {
-        ValueRepr::Integer(i) => {
-            if let Some(v) = i.as_i64() {
-                if v < 0 {
-                    return Err(SerdeError::with_code(ErrorCode::SerdeError));
-                }
-                u128::try_from(v).map_err(|_| SerdeError::with_code(ErrorCode::SerdeError))
-            } else if let Some(b) = i.as_bigint() {
-                bigint_to_u128(b).ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))
-            } else {
-                Err(SerdeError::with_code(ErrorCode::SerdeError))
-            }
-        }
-        _ => Err(SerdeError::with_code(ErrorCode::SerdeError)),
-    }
-}
-
-fn visit_bignum_any<'de, V>(big: &BigInt, visitor: V) -> Result<V::Value, SerdeError>
-where
-    V: Visitor<'de>,
-{
-    if let Some(v) = bigint_to_i128(big) {
-        return visitor.visit_i128(v);
-    }
-    if let Some(v) = bigint_to_u128(big) {
-        return visitor.visit_u128(v);
-    }
-    Err(SerdeError::with_code(ErrorCode::SerdeError))
-}
-
-fn f64_to_f32(v: f64) -> Result<f32, SerdeError> {
-    if v.is_nan() {
-        return Ok(f32::NAN);
-    }
-    if v.is_infinite() {
-        return Ok(if v.is_sign_negative() {
-            f32::NEG_INFINITY
-        } else {
-            f32::INFINITY
-        });
-    }
-    if v > f64::from(f32::MAX) || v < f64::from(f32::MIN) {
-        return Err(SerdeError::with_code(ErrorCode::SerdeError));
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        Ok(v as f32)
-    }
+    let int = integer_from_u128(v).map_err(SerdeError::with_code)?;
+    Ok(CborValue::integer(int))
 }
 
 /// Serde helper module for `#[serde(with = "sacp_cbor::serde_value")]`.
@@ -1720,11 +1822,11 @@ pub mod serde_value {
 
 #[cfg(all(test, feature = "serde"))]
 mod serde_value_tests {
-    use super::{from_value_ref, to_value};
-    use crate::{cbor, CborValue};
+    use super::{from_slice, to_vec};
+    use crate::{cbor, DecodeLimits};
 
     #[test]
-    fn cbor_value_serde_roundtrip_via_value() {
+    fn cbor_value_serde_roundtrip_via_bytes() {
         let big = 1u128 << 80;
         let v = cbor!({
             "a": 1,
@@ -1734,10 +1836,8 @@ mod serde_value_tests {
         })
         .unwrap();
 
-        let via = to_value(&v).unwrap();
-        assert_eq!(v, via);
-
-        let de: CborValue = from_value_ref(&v).unwrap();
-        assert_eq!(v, de);
+        let bytes = to_vec(&v).unwrap();
+        let decoded = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+        assert_eq!(v, decoded);
     }
 }

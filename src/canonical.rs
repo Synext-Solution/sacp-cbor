@@ -1,5 +1,4 @@
-#[cfg(feature = "alloc")]
-use crate::{CborError, DecodeLimits};
+use crate::{CborError, DecodeLimits, ErrorCode};
 
 /// A validated canonical SACP-CBOR/1 data item borrowed from an input buffer.
 ///
@@ -81,6 +80,51 @@ impl<'a> CborBytesRef<'a> {
 }
 
 impl AsRef<[u8]> for CborBytesRef<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+/// A validated canonical CBOR-encoded text-string key.
+///
+/// This wraps the exact canonical encoding bytes for a CBOR text string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedTextKey<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> EncodedTextKey<'a> {
+    #[inline]
+    pub(crate) const fn new_unchecked(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Validate and wrap an encoded text key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if `bytes` are not a canonical CBOR text string.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, CborError> {
+        if bytes.is_empty() {
+            return Err(CborError::new(ErrorCode::UnexpectedEof, 0));
+        }
+        let limits = DecodeLimits::for_bytes(bytes.len());
+        crate::validate_canonical(bytes, limits)?;
+        if bytes[0] >> 5 != 3 {
+            return Err(CborError::new(ErrorCode::MapKeyMustBeText, 0));
+        }
+        Ok(Self { bytes })
+    }
+
+    /// Return the canonical encoded bytes.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for EncodedTextKey<'_> {
     fn as_ref(&self) -> &[u8] {
         self.bytes
     }

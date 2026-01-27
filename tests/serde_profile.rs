@@ -1,6 +1,6 @@
 #![cfg(feature = "serde")]
 
-use sacp_cbor::{from_slice, from_value_ref, to_value, to_vec, DecodeLimits, ErrorCode};
+use sacp_cbor::{from_slice, from_value_ref, to_vec, validate_canonical, DecodeLimits, ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -58,8 +58,8 @@ fn serde_large_negative_i128_becomes_bignum() {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct Msg {
-    op: String,
     n: u64,
+    op: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -71,24 +71,24 @@ enum Simple {
 #[test]
 fn serde_roundtrip_struct_and_enum() {
     let m = Msg {
-        op: "ping".to_string(),
         n: 42,
+        op: "ping".to_string(),
     };
 
-    let value = to_value(&m).unwrap();
-    let decoded: Msg = from_value_ref(&value).unwrap();
+    let bytes = to_vec(&m).unwrap();
+    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Msg = from_value_ref(canon.root()).unwrap();
     assert_eq!(decoded, m);
 
-    let bytes = value.encode_canonical().unwrap();
     let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(decoded, m);
 
     let s = Simple::Count(7);
-    let value = to_value(&s).unwrap();
-    let decoded: Simple = from_value_ref(&value).unwrap();
+    let bytes = to_vec(&s).unwrap();
+    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Simple = from_value_ref(canon.root()).unwrap();
     assert_eq!(decoded, s);
 
-    let bytes = value.encode_canonical().unwrap();
     let decoded: Simple = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(decoded, s);
 }

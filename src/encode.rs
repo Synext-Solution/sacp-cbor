@@ -1,5 +1,5 @@
 use crate::alloc_util::try_reserve;
-use crate::canonical::{CborBytes, CborBytesRef};
+use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
 };
@@ -11,14 +11,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy)]
-enum MapPhase {
-    Key,
-    Value,
-}
-
-#[derive(Clone, Copy)]
 enum Frame<'a> {
-    Value(&'a CborValue),
     Array {
         items: &'a [CborValue],
         idx: usize,
@@ -26,7 +19,6 @@ enum Frame<'a> {
     Map {
         entries: &'a [(Box<str>, CborValue)],
         idx: usize,
-        phase: MapPhase,
     },
 }
 
@@ -122,6 +114,12 @@ impl VecSink {
 
     fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
         let offset = self.buf.len();
+        let needed = offset
+            .checked_add(additional)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
+        if needed <= self.buf.capacity() {
+            return Ok(());
+        }
         try_reserve(&mut self.buf, additional, offset)
     }
 }
@@ -175,84 +173,62 @@ impl<D: sha2::Digest> Sink for HashSink<D> {
 
 fn encode_value<S: Sink>(sink: &mut S, value: &CborValue) -> Result<(), CborError> {
     let mut stack = SmallStack::<64>::new();
-    stack.push(Frame::Value(value), sink.position())?;
+    let mut current = Some(value);
 
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Value(v) => match v.repr() {
+    loop {
+        if let Some(v) = current.take() {
+            match v.repr() {
                 ValueRepr::Integer(i) => encode_integer(sink, i)?,
                 ValueRepr::Bytes(b) => encode_bytes(sink, b)?,
                 ValueRepr::Text(s) => encode_text(sink, s)?,
-                ValueRepr::Array(items) => {
-                    encode_major_len(sink, 4, items.len())?;
-                    stack.push(Frame::Array { items, idx: 0 }, sink.position())?;
-                }
-                ValueRepr::Map(map) => {
-                    let entries = map.entries();
-                    encode_major_len(sink, 5, entries.len())?;
-                    stack.push(
-                        Frame::Map {
-                            entries,
-                            idx: 0,
-                            phase: MapPhase::Key,
-                        },
-                        sink.position(),
-                    )?;
-                }
                 ValueRepr::Bool(false) => sink.write_u8(0xf4)?,
                 ValueRepr::Bool(true) => sink.write_u8(0xf5)?,
                 ValueRepr::Null => sink.write_u8(0xf6)?,
                 ValueRepr::Float(bits) => encode_float64(sink, *bits)?,
-            },
-            Frame::Array { items, idx } => {
-                if idx >= items.len() {
-                    continue;
+                ValueRepr::Array(items) => {
+                    encode_major_len(sink, 4, items.len())?;
+                    if !items.is_empty() {
+                        stack.push(Frame::Array { items, idx: 0 }, sink.position())?;
+                        current = Some(&items[0]);
+                    }
                 }
-                stack.push(
-                    Frame::Array {
-                        items,
-                        idx: idx + 1,
-                    },
-                    sink.position(),
-                )?;
-                stack.push(Frame::Value(&items[idx]), sink.position())?;
+                ValueRepr::Map(map) => {
+                    let entries = map.entries();
+                    encode_major_len(sink, 5, entries.len())?;
+                    if !entries.is_empty() {
+                        encode_text(sink, entries[0].0.as_ref())?;
+                        stack.push(Frame::Map { entries, idx: 0 }, sink.position())?;
+                        current = Some(&entries[0].1);
+                    }
+                }
             }
-            Frame::Map {
-                entries,
-                idx,
-                phase,
-            } => {
-                if idx >= entries.len() {
-                    continue;
+
+            if current.is_some() {
+                continue;
+            }
+        }
+
+        let Some(frame) = stack.pop() else {
+            return Ok(());
+        };
+        match frame {
+            Frame::Array { items, idx } => {
+                let next = idx + 1;
+                if next < items.len() {
+                    stack.push(Frame::Array { items, idx: next }, sink.position())?;
+                    current = Some(&items[next]);
                 }
-                match phase {
-                    MapPhase::Key => {
-                        encode_text(sink, entries[idx].0.as_ref())?;
-                        stack.push(
-                            Frame::Map {
-                                entries,
-                                idx,
-                                phase: MapPhase::Value,
-                            },
-                            sink.position(),
-                        )?;
-                    }
-                    MapPhase::Value => {
-                        stack.push(
-                            Frame::Map {
-                                entries,
-                                idx: idx + 1,
-                                phase: MapPhase::Key,
-                            },
-                            sink.position(),
-                        )?;
-                        stack.push(Frame::Value(&entries[idx].1), sink.position())?;
-                    }
+            }
+            Frame::Map { entries, idx } => {
+                let next = idx + 1;
+                if next < entries.len() {
+                    encode_text(sink, entries[next].0.as_ref())?;
+                    stack.push(Frame::Map { entries, idx: next }, sink.position())?;
+                    current = Some(&entries[next].1);
                 }
             }
         }
     }
-    Ok(())
 }
 
 fn err_at<S: Sink>(sink: &S, code: ErrorCode) -> CborError {
@@ -366,13 +342,11 @@ impl Encoder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the buffer does not contain exactly one CBOR item.
+    /// Returns an error if the buffer does not contain exactly one canonical CBOR item.
     pub fn into_canonical(self) -> Result<CborBytes, CborError> {
         let bytes = self.into_vec();
-        let end = crate::parse::value_end_trusted(&bytes, 0)?;
-        if end != bytes.len() {
-            return Err(CborError::new(ErrorCode::TrailingBytes, end));
-        }
+        let limits = crate::DecodeLimits::for_bytes(bytes.len());
+        crate::validate_canonical(&bytes, limits)?;
         Ok(CborBytes::new_unchecked(bytes))
     }
 
@@ -380,6 +354,14 @@ impl Encoder {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.sink.buf
+    }
+
+    pub(crate) fn buf_len(&self) -> usize {
+        self.sink.buf.len()
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.sink.buf.truncate(len);
     }
 
     /// Encode CBOR null.
@@ -555,6 +537,10 @@ impl Encoder {
         Ok(())
     }
 
+    pub(crate) fn array_header(&mut self, len: usize) -> Result<(), CborError> {
+        encode_major_len(&mut self.sink, 4, len)
+    }
+
     /// Encode a definite-length map and fill it via the provided builder.
     ///
     /// # Errors
@@ -584,6 +570,10 @@ impl Encoder {
             return Err(err);
         }
         Ok(())
+    }
+
+    pub(crate) fn map_header(&mut self, len: usize) -> Result<(), CborError> {
+        encode_major_len(&mut self.sink, 5, len)
     }
 
     /// Internal hook used by `cbor_bytes!` for `$expr` values.
@@ -768,16 +758,20 @@ pub struct MapEncoder<'a> {
 
 #[allow(missing_docs)]
 impl MapEncoder<'_> {
-    fn insert_entry<F>(
-        &mut self,
-        entry_start: usize,
-        key_start: usize,
-        key_end: usize,
-        f: F,
-    ) -> Result<(), CborError>
+    fn write_entry<K, F>(&mut self, write_key: K, f: F) -> Result<(), CborError>
     where
+        K: FnOnce(&mut VecSink) -> Result<(), CborError>,
         F: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
+        if self.remaining == 0 {
+            return Err(CborError::new(
+                ErrorCode::MapLenMismatch,
+                self.enc.sink.position(),
+            ));
+        }
+
+        let entry_start = self.enc.sink.buf.len();
+        let (key_start, key_end) = self.write_key(entry_start, write_key)?;
         self.enforce_key_order(entry_start, key_start, key_end)?;
         let res = f(self.enc);
         self.finish_entry(entry_start, key_start, key_end, res)
@@ -792,18 +786,8 @@ impl MapEncoder<'_> {
         if let Some((ps, pe)) = self.prev_key_range {
             let prev = &self.enc.sink.buf[ps..pe];
             let curr = &self.enc.sink.buf[key_start..key_end];
-
-            if prev == curr {
-                return self.fail_entry(
-                    entry_start,
-                    CborError::new(ErrorCode::DuplicateMapKey, key_start),
-                );
-            }
-            if !is_strictly_increasing_encoded(prev, curr) {
-                return self.fail_entry(
-                    entry_start,
-                    CborError::new(ErrorCode::NonCanonicalMapOrder, key_start),
-                );
+            if let Err(err) = check_map_key_order(prev, curr, key_start) {
+                return self.fail_entry(entry_start, err);
             }
         }
         Ok(())
@@ -848,47 +832,31 @@ impl MapEncoder<'_> {
     where
         F: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
-        if self.remaining == 0 {
-            return Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.enc.sink.position(),
-            ));
-        }
-
-        let entry_start = self.enc.sink.buf.len();
-        let (key_start, key_end) = self.write_key(entry_start, |sink| encode_text(sink, key))?;
-
-        self.insert_entry(entry_start, key_start, key_end, f)
+        self.write_entry(|sink| encode_text(sink, key), f)
     }
 
     /// Insert a map entry using a pre-encoded canonical text key.
     ///
-    /// This avoids re-encoding keys when splicing from validated canonical bytes. The caller must
-    /// ensure `key_bytes` is the canonical CBOR encoding of a text string.
+    /// This avoids re-encoding keys when splicing from validated canonical bytes.
     ///
     /// # Errors
     ///
     /// Returns an error if encoding fails, if keys are out of order, or if duplicates are found.
-    pub fn entry_raw_key<F>(&mut self, key_bytes: &[u8], f: F) -> Result<(), CborError>
+    pub fn entry_raw_key<F>(&mut self, key: EncodedTextKey<'_>, f: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
-        if self.remaining == 0 {
-            return Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.enc.sink.position(),
-            ));
-        }
-        if key_bytes.is_empty() {
-            return Err(CborError::new(
-                ErrorCode::MalformedCanonical,
-                self.enc.sink.position(),
-            ));
-        }
-
-        let entry_start = self.enc.sink.buf.len();
-        let (key_start, key_end) = self.write_key(entry_start, |sink| sink.write(key_bytes))?;
-
-        self.insert_entry(entry_start, key_start, key_end, f)
+        let key_bytes = key.as_bytes();
+        self.write_entry(|sink| sink.write(key_bytes), f)
     }
+}
+
+fn check_map_key_order(prev: &[u8], curr: &[u8], key_start: usize) -> Result<(), CborError> {
+    if prev == curr {
+        return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+    }
+    if !is_strictly_increasing_encoded(prev, curr) {
+        return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+    }
+    Ok(())
 }
