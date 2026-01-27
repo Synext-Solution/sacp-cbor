@@ -1,0 +1,266 @@
+use crate::value::BenchValue;
+
+#[cfg(feature = "adapter-cbor4ii")]
+use cbor4ii::core::Value as Cbor4iiValue;
+
+pub trait Adapter {
+    fn name(&self) -> &'static str;
+    fn validate(&self, bytes: &[u8]) -> Result<(), String>;
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String>;
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String>;
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String>;
+}
+
+pub struct SacpCbor;
+
+impl Adapter for SacpCbor {
+    fn name(&self) -> &'static str {
+        "sacp-cbor"
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), String> {
+        sacp_cbor::validate(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+            .map_err(|e| format!("{e}"))
+    }
+
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
+        let _v = sacp_cbor::decode_value(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+            .map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
+        let v = from_bench_value(value)?;
+        v.encode_canonical().map_err(|e| format!("{e}"))
+    }
+
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
+        let bytes = sacp_cbor::to_vec(value).map_err(|e| format!("{e}"))?;
+        let _out: BenchValue = sacp_cbor::from_slice(
+            &bytes,
+            sacp_cbor::DecodeLimits::for_bytes(bytes.len()),
+        )
+        .map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "adapter-serde_cbor")]
+pub struct SerdeCbor;
+
+#[cfg(feature = "adapter-serde_cbor")]
+impl Adapter for SerdeCbor {
+    fn name(&self) -> &'static str {
+        "serde_cbor"
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), String> {
+        let _: serde_cbor::Value = serde_cbor::from_slice(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
+        let _: serde_cbor::Value = serde_cbor::from_slice(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
+        let v = to_serde_cbor_value(value);
+        serde_cbor::to_vec(&v).map_err(|e| format!("{e}"))
+    }
+
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
+        let bytes = serde_cbor::to_vec(value).map_err(|e| format!("{e}"))?;
+        let _out: BenchValue = serde_cbor::from_slice(&bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "adapter-ciborium")]
+pub struct Ciborium;
+
+#[cfg(feature = "adapter-ciborium")]
+impl Adapter for Ciborium {
+    fn name(&self) -> &'static str {
+        "ciborium"
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut slice = bytes;
+        let _: ciborium::value::Value =
+            ciborium::de::from_reader(&mut slice).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut slice = bytes;
+        let _: ciborium::value::Value =
+            ciborium::de::from_reader(&mut slice).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
+        let v = to_ciborium_value(value);
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(&v, &mut out).map_err(|e| format!("{e}"))?;
+        Ok(out)
+    }
+
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
+        let mut out = Vec::new();
+        ciborium::ser::into_writer(value, &mut out).map_err(|e| format!("{e}"))?;
+        let mut slice = out.as_slice();
+        let _out: BenchValue = ciborium::de::from_reader(&mut slice).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "adapter-minicbor")]
+pub struct Minicbor;
+
+#[cfg(feature = "adapter-minicbor")]
+impl Adapter for Minicbor {
+    fn name(&self) -> &'static str {
+        "minicbor"
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), String> {
+        let _: BenchValue = minicbor::decode(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
+        let _: BenchValue = minicbor::decode(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
+        minicbor::to_vec(value).map_err(|e| format!("{e}"))
+    }
+
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
+        let bytes = minicbor::to_vec(value).map_err(|e| format!("{e}"))?;
+        let _out: BenchValue = minicbor::decode(&bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "adapter-cbor4ii")]
+pub struct Cbor4ii;
+
+#[cfg(feature = "adapter-cbor4ii")]
+impl Adapter for Cbor4ii {
+    fn name(&self) -> &'static str {
+        "cbor4ii"
+    }
+
+    fn validate(&self, bytes: &[u8]) -> Result<(), String> {
+        let _out: Cbor4iiValue =
+            cbor4ii::serde::from_slice(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
+        let _out: Cbor4iiValue =
+            cbor4ii::serde::from_slice(bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
+    fn encode(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
+        let v = to_cbor4ii_value(value);
+        cbor4ii::serde::to_vec(Vec::new(), &v).map_err(|e| format!("{e}"))
+    }
+
+    fn serde_roundtrip(&self, value: &BenchValue) -> Result<(), String> {
+        let v = to_cbor4ii_value(value);
+        let bytes = cbor4ii::serde::to_vec(Vec::new(), &v).map_err(|e| format!("{e}"))?;
+        let _out: Cbor4iiValue =
+            cbor4ii::serde::from_slice(&bytes).map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "adapter-serde_cbor")]
+fn to_serde_cbor_value(v: &BenchValue) -> serde_cbor::Value {
+    match v {
+        BenchValue::Null => serde_cbor::Value::Null,
+        BenchValue::Bool(b) => serde_cbor::Value::Bool(*b),
+        BenchValue::Int(i) => serde_cbor::Value::Integer(i128::from(*i)),
+        BenchValue::Bytes(b) => serde_cbor::Value::Bytes(b.clone()),
+        BenchValue::Text(s) => serde_cbor::Value::Text(s.clone()),
+        BenchValue::Array(items) => {
+            serde_cbor::Value::Array(items.iter().map(to_serde_cbor_value).collect())
+        }
+        BenchValue::Map(entries) => serde_cbor::Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (serde_cbor::Value::Text(k.clone()), to_serde_cbor_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "adapter-ciborium")]
+fn to_ciborium_value(v: &BenchValue) -> ciborium::value::Value {
+    match v {
+        BenchValue::Null => ciborium::value::Value::Null,
+        BenchValue::Bool(b) => ciborium::value::Value::Bool(*b),
+        BenchValue::Int(i) => ciborium::value::Value::Integer((*i).into()),
+        BenchValue::Bytes(b) => ciborium::value::Value::Bytes(b.clone()),
+        BenchValue::Text(s) => ciborium::value::Value::Text(s.clone()),
+        BenchValue::Array(items) => {
+            ciborium::value::Value::Array(items.iter().map(to_ciborium_value).collect())
+        }
+        BenchValue::Map(entries) => ciborium::value::Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (ciborium::value::Value::Text(k.clone()), to_ciborium_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "adapter-cbor4ii")]
+fn to_cbor4ii_value(v: &BenchValue) -> Cbor4iiValue {
+    match v {
+        BenchValue::Null => Cbor4iiValue::Null,
+        BenchValue::Bool(b) => Cbor4iiValue::Bool(*b),
+        BenchValue::Int(i) => Cbor4iiValue::Integer(i128::from(*i)),
+        BenchValue::Bytes(b) => Cbor4iiValue::Bytes(b.clone()),
+        BenchValue::Text(s) => Cbor4iiValue::Text(s.clone()),
+        BenchValue::Array(items) => {
+            Cbor4iiValue::Array(items.iter().map(to_cbor4ii_value).collect())
+        }
+        BenchValue::Map(entries) => Cbor4iiValue::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (Cbor4iiValue::Text(k.clone()), to_cbor4ii_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn from_bench_value(v: &BenchValue) -> Result<sacp_cbor::CborValue, String> {
+    match v {
+        BenchValue::Null => Ok(sacp_cbor::CborValue::null()),
+        BenchValue::Bool(b) => Ok(sacp_cbor::CborValue::bool(*b)),
+        BenchValue::Int(i) => sacp_cbor::CborValue::int(*i).map_err(|e| format!("{e}")),
+        BenchValue::Bytes(b) => Ok(sacp_cbor::CborValue::bytes(b.clone())),
+        BenchValue::Text(s) => Ok(sacp_cbor::CborValue::text(s.clone())),
+        BenchValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(from_bench_value(item)?);
+            }
+            Ok(sacp_cbor::CborValue::array(out))
+        }
+        BenchValue::Map(entries) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.push((k.clone().into_boxed_str(), from_bench_value(v)?));
+            }
+            let map = sacp_cbor::CborMap::new(out).map_err(|e| format!("{e}"))?;
+            Ok(sacp_cbor::CborValue::map(map))
+        }
+    }
+}

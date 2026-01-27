@@ -794,12 +794,16 @@ impl MapEncoder<'_> {
             let curr = &self.enc.sink.buf[key_start..key_end];
 
             if prev == curr {
-                self.enc.sink.buf.truncate(entry_start);
-                return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+                return self.fail_entry(
+                    entry_start,
+                    CborError::new(ErrorCode::DuplicateMapKey, key_start),
+                );
             }
             if !is_strictly_increasing_encoded(prev, curr) {
-                self.enc.sink.buf.truncate(entry_start);
-                return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+                return self.fail_entry(
+                    entry_start,
+                    CborError::new(ErrorCode::NonCanonicalMapOrder, key_start),
+                );
             }
         }
         Ok(())
@@ -813,12 +817,26 @@ impl MapEncoder<'_> {
         res: Result<(), CborError>,
     ) -> Result<(), CborError> {
         if let Err(err) = res {
-            self.enc.sink.buf.truncate(entry_start);
-            return Err(err);
+            return self.fail_entry(entry_start, err);
         }
         self.prev_key_range = Some((key_start, key_end));
         self.remaining -= 1;
         Ok(())
+    }
+
+    fn write_key<F>(&mut self, entry_start: usize, write: F) -> Result<(usize, usize), CborError>
+    where
+        F: FnOnce(&mut VecSink) -> Result<(), CborError>,
+    {
+        if let Err(err) = write(&mut self.enc.sink) {
+            return self.fail_entry(entry_start, err);
+        }
+        Ok((entry_start, self.enc.sink.buf.len()))
+    }
+
+    fn fail_entry<T>(&mut self, entry_start: usize, err: CborError) -> Result<T, CborError> {
+        self.enc.sink.buf.truncate(entry_start);
+        Err(err)
     }
 
     /// Insert a map entry. Keys must be in canonical order; duplicates are rejected.
@@ -838,12 +856,7 @@ impl MapEncoder<'_> {
         }
 
         let entry_start = self.enc.sink.buf.len();
-        encode_text(&mut self.enc.sink, key).map_err(|err| {
-            self.enc.sink.buf.truncate(entry_start);
-            err
-        })?;
-        let key_start = entry_start;
-        let key_end = self.enc.sink.buf.len();
+        let (key_start, key_end) = self.write_key(entry_start, |sink| encode_text(sink, key))?;
 
         self.insert_entry(entry_start, key_start, key_end, f)
     }
@@ -874,13 +887,7 @@ impl MapEncoder<'_> {
         }
 
         let entry_start = self.enc.sink.buf.len();
-        let res = self.enc.sink.write(key_bytes);
-        if let Err(err) = res {
-            self.enc.sink.buf.truncate(entry_start);
-            return Err(err);
-        }
-        let key_start = entry_start;
-        let key_end = self.enc.sink.buf.len();
+        let (key_start, key_end) = self.write_key(entry_start, |sink| sink.write(key_bytes))?;
 
         self.insert_entry(entry_start, key_start, key_end, f)
     }

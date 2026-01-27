@@ -1,0 +1,36 @@
+[package]
+name = "bench_harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+base64 = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sacp-cbor = { path = "../../..", features = ["serde", "alloc", "std"] }
+
+serde_cbor = { version = "0.11", optional = true }
+ciborium = { version = "0.2", optional = true }
+minicbor = { version = "0.20", optional = true, features = ["std", "alloc"] }
+cbor4ii = { version = "0.3", optional = true, features = ["serde1"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = [
+  "adapter-serde_cbor",
+  "adapter-ciborium",
+  "adapter-minicbor",
+  "adapter-cbor4ii",
+]
+
+adapter-serde_cbor = ["serde_cbor"]
+adapter-ciborium = ["ciborium"]
+adapter-minicbor = ["minicbor"]
+adapter-cbor4ii = ["cbor4ii"]
+
+[[bench]]
+name = "bench"
+harness = false

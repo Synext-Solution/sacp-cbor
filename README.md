@@ -1136,3 +1136,10 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 - `unsafe` is forbidden (`#![forbid(unsafe_code)]`).
 - The validator is intentionally strict and rejects many CBOR features by design.
 - All offset-bearing errors aim to point at the byte position where the violation is detected (serde conversions generally return offset 0).
+
+---
+
+## Benchmarks
+
+A separate benchmark workspace lives under `benchmarks/` and runs cross-crate CBOR benchmarks
+with shared datasets. See `benchmarks/README.md` for setup and usage.

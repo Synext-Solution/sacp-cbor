@@ -1,6 +1,8 @@
 /target
 /coverage
 **/*.rs.bk
+/benchmarks/target
+/benchmarks/reports/latest
 
 # cargo-fuzz
 fuzz/artifacts
