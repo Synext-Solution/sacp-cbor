@@ -597,7 +597,7 @@ pub enum EditValue<'a> {
 #[derive(Debug)]
 struct Node<'a> {
     terminal: Option<Terminal<'a>>,
-    children: Vec<(PathElemOwned, Node<'a>)>,
+    children: Vec<(PathElemOwned, Self)>,
     child_kind: Option<ChildKind>,
     splices: Vec<ArraySplice<'a>>,
 }
