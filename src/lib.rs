@@ -36,10 +36,13 @@
 //! - `std` *(default)*: implements `std::error::Error` for [`CborError`].
 //! - `alloc` *(default)*: enables owned types (`CborValue`, `CborMap`, `CborBytes`) and encoding.
 //! - `sha2` *(default)*: enables SHA-256 hashing helpers for canonical bytes.
+//! - `simdutf8`: enables SIMD-accelerated UTF-8 validation where supported.
+//! - `unsafe-utf8`: allows unchecked UTF-8 for canonical-trusted inputs.
 //!
 //! ## Safety
 //!
-//! This crate forbids `unsafe` code.
+//! This crate forbids `unsafe` code by default. Enabling the `unsafe-utf8` feature allows
+//! unchecked UTF-8 conversion on canonical-trusted inputs.
 //!
 //! ## `no_std`
 //!
@@ -49,7 +52,7 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "unsafe-utf8"), forbid(unsafe_code))]
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
@@ -67,6 +70,7 @@ mod query;
 mod scalar;
 #[cfg(feature = "serde")]
 mod serde_impl;
+pub(crate) mod utf8;
 mod wire;
 
 #[cfg(feature = "alloc")]

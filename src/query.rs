@@ -13,6 +13,7 @@ use core::cmp::Ordering;
 use crate::canonical::CborBytesRef;
 use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
+use crate::utf8;
 use crate::wire;
 use crate::{CborError, ErrorCode};
 
@@ -388,7 +389,7 @@ impl<'a> CborValueRef<'a> {
 
         let len = read_len_trusted(self.data, &mut pos, ai, off)?;
         let bytes = read_exact_trusted(self.data, &mut pos, len)?;
-        let s = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
+        let s = utf8::trusted(bytes).map_err(|()| malformed(off))?;
         Ok(s)
     }
 
@@ -1217,7 +1218,7 @@ fn read_text<'a>(data: &'a [u8], pos: &mut usize) -> Result<ParsedText<'a>, Cbor
 
     let len = read_len_trusted(data, pos, ai, off)?;
     let bytes = read_exact_trusted(data, pos, len)?;
-    let text = core::str::from_utf8(bytes).map_err(|_| malformed(off))?;
+    let text = utf8::trusted(bytes).map_err(|()| malformed(off))?;
     Ok(ParsedText { s: text, bytes })
 }
 

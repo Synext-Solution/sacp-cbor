@@ -55,6 +55,8 @@ This crate is `no_std` by default unless `std` is enabled.
 | `alloc` | Owned types + encoding + editor + macros | Required for `CborBytes`, `CborValue`, `Encoder`, `Editor`, `cbor!`, `cbor_bytes!` |
 | `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice; enables owned decoding via `from_slice` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
+| `simdutf8` | Faster UTF-8 validation | Optional SIMD validation, same semantics |
+| `unsafe-utf8` | Unchecked UTF-8 for canonical-trusted reads | Uses `unsafe` only for canonical-validated inputs |
 
 ### Recommended dependency configs
 

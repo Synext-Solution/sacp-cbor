@@ -2,6 +2,7 @@ use crate::canonical::CborBytesRef;
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::MAX_SAFE_INTEGER;
 use crate::profile::{is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits};
+use crate::utf8;
 use crate::wire;
 use crate::{CborError, DecodeLimits, ErrorCode};
 
@@ -248,8 +249,7 @@ impl<'a> Parser<'a> {
             )?;
         }
         let bytes = wire::read_exact(self.data, &mut self.pos, len)?;
-        core::str::from_utf8(bytes)
-            .map_err(|_| CborError::new(ErrorCode::Utf8Invalid, key_start))?;
+        utf8::validate(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, key_start))?;
         let key_end = self.pos;
         let curr = &self.data[key_start..key_end];
 
@@ -327,7 +327,7 @@ impl<'a> Parser<'a> {
             )?;
         }
         let bytes = wire::read_exact(self.data, &mut self.pos, len)?;
-        core::str::from_utf8(bytes).map_err(|_| CborError::new(ErrorCode::Utf8Invalid, off))?;
+        utf8::validate(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?;
         Ok(None)
     }
 

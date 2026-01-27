@@ -16,6 +16,7 @@ use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
 use crate::scalar::F64Bits;
+use crate::utf8;
 use crate::value::{CborMap, CborValue, ValueRepr};
 use crate::{CborError, DecodeLimits, ErrorCode};
 
@@ -1318,8 +1319,14 @@ impl<'de> DirectDeserializer<'de> {
             off,
         )?;
         let bytes = self.read_exact(len)?;
-        let s =
-            core::str::from_utf8(bytes).map_err(|_| DeError::new(ErrorCode::Utf8Invalid, off))?;
+        let s = match self.mode {
+            Mode::Checked => {
+                utf8::validate(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
+            }
+            Mode::CanonicalTrusted => {
+                utf8::trusted(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
+            }
+        };
         Ok(s)
     }
 
