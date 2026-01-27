@@ -184,6 +184,7 @@ impl<'de> Deserialize<'de> for BenchValue {
 }
 
 #[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
+#[cbor(untagged)]
 pub enum BenchValueNative {
     Null,
     Bool(bool),
@@ -195,6 +196,7 @@ pub enum BenchValueNative {
 }
 
 #[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
+#[cbor(untagged)]
 pub enum BenchValueBorrowed<'a> {
     Null,
     Bool(bool),

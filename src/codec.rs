@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 
 use crate::canonical::CborBytesRef;
 use crate::parse::validate_canonical;
-use crate::query::{CborIntegerRef, CborValueRef};
+use crate::query::{CborKind, CborValueRef};
+use crate::wire::{self, Cursor};
 use crate::{CborError, DecodeLimits, ErrorCode};
 
 #[cfg(feature = "alloc")]
@@ -27,15 +28,307 @@ impl<K, V> MapEntries<K, V> {
     }
 }
 
-/// Decode a value from a `CborValueRef` without allocating strings/bytes unless required by `T`.
+/// Streaming decoder over canonical CBOR bytes.
+pub struct Decoder<'de> {
+    cursor: Cursor<'de, CborError>,
+    limits: DecodeLimits,
+    depth: usize,
+    items_seen: usize,
+}
+
+impl<'de> Decoder<'de> {
+    /// Construct a decoder over canonical bytes with the provided limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
+    pub const fn new(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        if bytes.len() > limits.max_input_bytes {
+            return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
+        }
+        Ok(Self {
+            cursor: Cursor::with_pos(bytes, 0),
+            limits,
+            depth: 0,
+            items_seen: 0,
+        })
+    }
+
+    /// Return the current byte offset in the input.
+    #[must_use]
+    #[inline]
+    pub const fn position(&self) -> usize {
+        self.cursor.position()
+    }
+
+    #[inline]
+    const fn data(&self) -> &'de [u8] {
+        self.cursor.data()
+    }
+
+    #[inline]
+    fn peek_u8(&self) -> Result<u8, CborError> {
+        let off = self.cursor.position();
+        self.data()
+            .get(off)
+            .copied()
+            .ok_or_else(|| CborError::new(ErrorCode::UnexpectedEof, off))
+    }
+
+    #[inline]
+    fn read_header(&mut self) -> Result<(u8, u8, usize), CborError> {
+        let off = self.cursor.position();
+        let ib = self.cursor.read_u8()?;
+        Ok((ib >> 5, ib & 0x1f, off))
+    }
+
+    #[inline]
+    fn read_uint_arg(&mut self, ai: u8, off: usize) -> Result<u64, CborError> {
+        wire::read_uint_arg::<false, CborError>(&mut self.cursor, ai, off)
+    }
+
+    #[inline]
+    fn read_len(&mut self, ai: u8, off: usize) -> Result<usize, CborError> {
+        wire::read_len::<false, CborError>(&mut self.cursor, ai, off)
+    }
+
+    #[inline]
+    fn bump_items(&mut self, add: usize, off: usize) -> Result<(), CborError> {
+        self.items_seen = self
+            .items_seen
+            .checked_add(add)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+        if self.items_seen > self.limits.max_total_items {
+            return Err(CborError::new(ErrorCode::TotalItemsLimitExceeded, off));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn enter_container(&mut self, len: usize, off: usize) -> Result<bool, CborError> {
+        if len == 0 {
+            return Ok(false);
+        }
+        let next_depth = self.depth + 1;
+        if next_depth > self.limits.max_depth {
+            return Err(CborError::new(ErrorCode::DepthLimitExceeded, off));
+        }
+        self.depth = next_depth;
+        Ok(true)
+    }
+
+    /// Exit a container entered by `parse_array_len` or `parse_map_len`.
+    #[inline]
+    pub fn exit_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    #[inline]
+    fn parse_text_from_header(&mut self, off: usize, ai: u8) -> Result<&'de str, CborError> {
+        wire::parse_text_from_header::<false, CborError>(
+            &mut self.cursor,
+            Some(&self.limits),
+            off,
+            ai,
+        )
+    }
+
+    #[inline]
+    fn parse_bytes_from_header(&mut self, off: usize, ai: u8) -> Result<&'de [u8], CborError> {
+        let len = self.read_len(ai, off)?;
+        if len > self.limits.max_bytes_len {
+            return Err(CborError::new(ErrorCode::BytesLenLimitExceeded, off));
+        }
+        self.cursor.read_exact(len)
+    }
+
+    #[inline]
+    fn parse_bignum(&mut self, off: usize, ai: u8) -> Result<(bool, &'de [u8]), CborError> {
+        wire::parse_bignum::<false, CborError>(&mut self.cursor, Some(&self.limits), off, ai)
+    }
+
+    fn parse_safe_i64(&mut self) -> Result<i64, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        match major {
+            0 => {
+                let v = self.read_uint_arg(ai, off)?;
+                i64::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
+            }
+            1 => {
+                let n = self.read_uint_arg(ai, off)?;
+                let n = i64::try_from(n)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                Ok(-1 - n)
+            }
+            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
+        }
+    }
+
+    fn parse_safe_u64(&mut self) -> Result<u64, CborError> {
+        let off = self.position();
+        let v = self.parse_safe_i64()?;
+        u64::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
+    }
+
+    fn parse_float64(&mut self) -> Result<f64, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 7 || ai != 27 {
+            return Err(CborError::new(ErrorCode::ExpectedFloat, off));
+        }
+        let bits = self.cursor.read_be_u64()?;
+        Ok(f64::from_bits(bits))
+    }
+
+    fn parse_bool(&mut self) -> Result<bool, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 7 {
+            return Err(CborError::new(ErrorCode::ExpectedBool, off));
+        }
+        match ai {
+            20 => Ok(false),
+            21 => Ok(true),
+            _ => Err(CborError::new(ErrorCode::ExpectedBool, off)),
+        }
+    }
+
+    fn parse_null(&mut self) -> Result<(), CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major == 7 && ai == 22 {
+            Ok(())
+        } else {
+            Err(CborError::new(ErrorCode::ExpectedNull, off))
+        }
+    }
+
+    fn parse_bytes(&mut self) -> Result<&'de [u8], CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 2 {
+            return Err(CborError::new(ErrorCode::ExpectedBytes, off));
+        }
+        self.parse_bytes_from_header(off, ai)
+    }
+
+    fn parse_text(&mut self) -> Result<&'de str, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 3 {
+            return Err(CborError::new(ErrorCode::ExpectedText, off));
+        }
+        self.parse_text_from_header(off, ai)
+    }
+
+    /// Decode an array header and return `(len, entered_container)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExpectedArray` if the next value is not an array, or a limit error.
+    pub fn parse_array_len(&mut self) -> Result<(usize, bool), CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 4 {
+            return Err(CborError::new(ErrorCode::ExpectedArray, off));
+        }
+        let len = self.read_len(ai, off)?;
+        if len > self.limits.max_array_len {
+            return Err(CborError::new(ErrorCode::ArrayLenLimitExceeded, off));
+        }
+        self.bump_items(len, off)?;
+        let entered = self.enter_container(len, off)?;
+        Ok((len, entered))
+    }
+
+    /// Decode a map header and return `(len, entered_container)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExpectedMap` if the next value is not a map, or a limit error.
+    pub fn parse_map_len(&mut self) -> Result<(usize, bool), CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 5 {
+            return Err(CborError::new(ErrorCode::ExpectedMap, off));
+        }
+        let len = self.read_len(ai, off)?;
+        if len > self.limits.max_map_len {
+            return Err(CborError::new(ErrorCode::MapLenLimitExceeded, off));
+        }
+        let items = len
+            .checked_mul(2)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+        self.bump_items(items, off)?;
+        let entered = self.enter_container(len, off)?;
+        Ok((len, entered))
+    }
+
+    /// Decode the next map key as a text string.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MapKeyMustBeText` if the next key is not a text string.
+    pub fn parse_text_key(&mut self) -> Result<&'de str, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 3 {
+            return Err(CborError::new(ErrorCode::MapKeyMustBeText, off));
+        }
+        self.parse_text_from_header(off, ai)
+    }
+
+    /// Skip exactly one CBOR value while enforcing decode limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error if the value is malformed or violates limits.
+    pub fn skip_value(&mut self) -> Result<(), CborError> {
+        wire::skip_one_value::<false, CborError>(
+            &mut self.cursor,
+            Some(&self.limits),
+            &mut self.items_seen,
+            self.depth,
+        )
+    }
+
+    /// Peek at the kind of the next CBOR value without consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error if the header is malformed.
+    pub fn peek_kind(&self) -> Result<CborKind, CborError> {
+        let mut pos = self.cursor.position();
+        let off = pos;
+        let ib = wire::read_u8(self.data(), &mut pos)?;
+        let major = ib >> 5;
+        let ai = ib & 0x1f;
+        match major {
+            0 | 1 => Ok(CborKind::Integer),
+            2 => Ok(CborKind::Bytes),
+            3 => Ok(CborKind::Text),
+            4 => Ok(CborKind::Array),
+            5 => Ok(CborKind::Map),
+            6 => {
+                let tag =
+                    wire::read_uint_arg_at::<false, CborError>(self.data(), &mut pos, ai, off)?;
+                match tag {
+                    2 | 3 => Ok(CborKind::Integer),
+                    _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
+                }
+            }
+            7 => match ai {
+                20 | 21 => Ok(CborKind::Bool),
+                22 => Ok(CborKind::Null),
+                27 => Ok(CborKind::Float),
+                _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
+            },
+            _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
+        }
+    }
+}
+
+/// Decode a value from a streaming decoder.
 pub trait CborDecode<'de>: Sized {
-    /// Decode `Self` from a canonical CBOR value reference.
+    /// Decode `Self` from a streaming decoder.
     ///
     /// # Errors
     ///
     /// Returns an error if the CBOR value does not match the expected type or violates profile
     /// constraints.
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError>;
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError>;
 }
 
 #[cfg(feature = "alloc")]
@@ -63,7 +356,13 @@ pub fn decode<'de, T: CborDecode<'de>>(
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
     let canon = validate_canonical(bytes, limits)?;
-    decode_canonical(canon)
+    let bytes = canon.as_bytes();
+    let mut decoder = Decoder::new(bytes, limits)?;
+    let value = T::decode(&mut decoder)?;
+    if decoder.position() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
+    }
+    Ok(value)
 }
 
 /// Decode a value from validated canonical bytes.
@@ -73,8 +372,13 @@ pub fn decode<'de, T: CborDecode<'de>>(
 /// Returns an error if decoding fails.
 pub fn decode_canonical<'de, T: CborDecode<'de>>(canon: CborBytesRef<'de>) -> Result<T, CborError> {
     let bytes = canon.as_bytes();
-    let value = CborValueRef::new(bytes, 0, bytes.len());
-    T::decode(value)
+    let limits = DecodeLimits::for_bytes(bytes.len());
+    let mut decoder = Decoder::new(bytes, limits)?;
+    let value = T::decode(&mut decoder)?;
+    if decoder.position() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
+    }
+    Ok(value)
 }
 
 /// Decode a value from owned canonical bytes.
@@ -113,18 +417,6 @@ pub fn encode_to_canonical<T: CborEncode>(value: &T) -> Result<CborBytes, CborEr
     enc.into_canonical()
 }
 
-fn decode_safe_i64(value: CborValueRef<'_>) -> Result<i64, CborError> {
-    match value.integer()? {
-        CborIntegerRef::Safe(v) => Ok(v),
-        CborIntegerRef::Big(_) => Err(CborError::new(ErrorCode::ExpectedInteger, value.offset())),
-    }
-}
-
-fn decode_safe_u64(value: CborValueRef<'_>) -> Result<u64, CborError> {
-    let v = decode_safe_i64(value)?;
-    u64::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
-}
-
 fn mag_to_u128(mag: &[u8]) -> Option<u128> {
     if mag.len() > 16 {
         return None;
@@ -136,140 +428,159 @@ fn mag_to_u128(mag: &[u8]) -> Option<u128> {
 }
 
 impl<'de> CborDecode<'de> for () {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        if value.is_null() {
-            Ok(())
-        } else {
-            Err(CborError::new(ErrorCode::ExpectedNull, value.offset()))
-        }
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_null()
     }
 }
 
 impl<'de> CborDecode<'de> for bool {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        value.bool()
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_bool()
     }
 }
 
 impl<'de> CborDecode<'de> for i64 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        decode_safe_i64(value)
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_safe_i64()
     }
 }
 
 impl<'de> CborDecode<'de> for i32 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_i64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_i64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for i16 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_i64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_i64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for i8 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_i64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_i64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for isize {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_i64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_i64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for i128 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        match value.integer()? {
-            CborIntegerRef::Safe(v) => Ok(Self::from(v)),
-            CborIntegerRef::Big(b) => {
-                let mag = mag_to_u128(b.magnitude())
-                    .ok_or_else(|| CborError::new(ErrorCode::ExpectedInteger, value.offset()))?;
-                let n = Self::try_from(mag)
-                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))?;
-                if b.is_negative() {
-                    Ok(-1 - n)
-                } else {
-                    Ok(n)
-                }
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let (major, ai, off) = decoder.read_header()?;
+        match major {
+            0 => {
+                let v = decoder.read_uint_arg(ai, off)?;
+                let v_i = i64::try_from(v)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                Ok(Self::from(v_i))
             }
+            1 => {
+                let n = decoder.read_uint_arg(ai, off)?;
+                let n_i = i64::try_from(n)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                Ok(Self::from(-1 - n_i))
+            }
+            6 => {
+                let (negative, mag) = decoder.parse_bignum(off, ai)?;
+                let n = mag_to_u128(mag)
+                    .ok_or_else(|| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                let n_i = Self::try_from(n)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                Ok(if negative { -1 - n_i } else { n_i })
+            }
+            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
         }
     }
 }
 
 impl<'de> CborDecode<'de> for u64 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        decode_safe_u64(value)
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_safe_u64()
     }
 }
 
 impl<'de> CborDecode<'de> for u32 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_u64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_u64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for u16 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_u64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_u64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for u8 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_u64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_u64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for usize {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = decode_safe_u64(value)?;
-        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_safe_u64()?;
+        Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
     }
 }
 
 impl<'de> CborDecode<'de> for u128 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        match value.integer()? {
-            CborIntegerRef::Safe(v) => {
-                let v_u64 = u64::try_from(v)
-                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, value.offset()))?;
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let (major, ai, off) = decoder.read_header()?;
+        match major {
+            0 => {
+                let v = decoder.read_uint_arg(ai, off)?;
+                let v_i = i64::try_from(v)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
+                let v_u64 = u64::try_from(v_i)
+                    .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Ok(Self::from(v_u64))
             }
-            CborIntegerRef::Big(b) => {
-                if b.is_negative() {
-                    return Err(CborError::new(ErrorCode::ExpectedInteger, value.offset()));
+            6 => {
+                let (negative, mag) = decoder.parse_bignum(off, ai)?;
+                if negative {
+                    return Err(CborError::new(ErrorCode::ExpectedInteger, off));
                 }
-                mag_to_u128(b.magnitude())
-                    .ok_or_else(|| CborError::new(ErrorCode::ExpectedInteger, value.offset()))
+                mag_to_u128(mag).ok_or_else(|| CborError::new(ErrorCode::ExpectedInteger, off))
             }
+            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
         }
     }
 }
 
 impl<'de> CborDecode<'de> for f64 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        value.float64()
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_float64()
     }
 }
 
 impl<'de> CborDecode<'de> for f32 {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let v = value.float64()?;
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let v = decoder.parse_float64()?;
         if v.is_nan() {
             return Ok(Self::NAN);
         }
-        let off = value.offset();
         let bits = v.to_bits();
         let sign = ((bits >> 63) as u32) << 31;
         let exp = ((bits >> 52) & 0x7ff) as i32;
@@ -323,40 +634,47 @@ impl<'de> CborDecode<'de> for f32 {
 }
 
 impl<'de> CborDecode<'de> for &'de str {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        value.text()
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_text()
     }
 }
 
 impl<'de> CborDecode<'de> for &'de [u8] {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        value.bytes()
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        decoder.parse_bytes()
     }
 }
 
 impl<'de> CborDecode<'de> for CborValueRef<'de> {
-    fn decode(value: Self) -> Result<Self, CborError> {
-        Ok(value)
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let start = decoder.position();
+        decoder.skip_value()?;
+        let end = decoder.position();
+        Ok(CborValueRef::new(decoder.data(), start, end))
     }
 }
 
 impl<'de, T: CborDecode<'de>> CborDecode<'de> for Option<T> {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        if value.is_null() {
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        if decoder.peek_u8()? == 0xf6 {
+            decoder.parse_null()?;
             Ok(None)
         } else {
-            T::decode(value).map(Some)
+            T::decode(decoder).map(Some)
         }
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<'de, T: CborDecode<'de> + CborArrayElem> CborDecode<'de> for Vec<T> {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let arr = value.array()?;
-        let mut out = Self::with_capacity(arr.len());
-        for item in arr.iter() {
-            out.push(T::decode(item?)?);
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let (len, entered) = decoder.parse_array_len()?;
+        let mut out = Self::with_capacity(len);
+        for _ in 0..len {
+            out.push(T::decode(decoder)?);
+        }
+        if entered {
+            decoder.exit_container();
         }
         Ok(out)
     }
@@ -364,12 +682,16 @@ impl<'de, T: CborDecode<'de> + CborArrayElem> CborDecode<'de> for Vec<T> {
 
 #[cfg(feature = "alloc")]
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let map = value.map()?;
-        let mut out = Vec::with_capacity(map.len());
-        for entry in map.iter() {
-            let (k, v) = entry?;
-            out.push((k, V::decode(v)?));
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let (len, entered) = decoder.parse_map_len()?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let key = decoder.parse_text_key()?;
+            let value = V::decode(decoder)?;
+            out.push((key, value));
+        }
+        if entered {
+            decoder.exit_container();
         }
         Ok(Self(out))
     }
@@ -377,12 +699,16 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
 
 #[cfg(feature = "alloc")]
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
-    fn decode(value: CborValueRef<'de>) -> Result<Self, CborError> {
-        let map = value.map()?;
-        let mut out = Vec::with_capacity(map.len());
-        for entry in map.iter() {
-            let (k, v) = entry?;
-            out.push((k.to_string(), V::decode(v)?));
+    fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
+        let (len, entered) = decoder.parse_map_len()?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let key = decoder.parse_text_key()?;
+            let value = V::decode(decoder)?;
+            out.push((key.to_string(), value));
+        }
+        if entered {
+            decoder.exit_container();
         }
         Ok(Self(out))
     }
@@ -390,15 +716,15 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
 
 #[cfg(feature = "alloc")]
 impl CborDecode<'_> for String {
-    fn decode(value: CborValueRef<'_>) -> Result<Self, CborError> {
-        value.text().map(str::to_string)
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, CborError> {
+        decoder.parse_text().map(str::to_string)
     }
 }
 
 #[cfg(feature = "alloc")]
 impl CborDecode<'_> for Vec<u8> {
-    fn decode(value: CborValueRef<'_>) -> Result<Self, CborError> {
-        value.bytes().map(<[u8]>::to_vec)
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, CborError> {
+        decoder.parse_bytes().map(<[u8]>::to_vec)
     }
 }
 

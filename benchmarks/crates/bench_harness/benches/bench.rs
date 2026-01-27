@@ -8,7 +8,7 @@ use bench_harness::datasets::{dataset_root, load_appendix_a, synthetic_datasets}
 use bench_harness::query_edit::sort_map_entries;
 use bench_harness::value::{BenchValue, BenchValueBorrowed, BenchValueNative};
 use serde::de::IgnoredAny;
-use sacp_cbor::{decode, encode_to_vec, ArrayPos, DecodeLimits, PathElem};
+use sacp_cbor::{decode_canonical_owned, encode_to_canonical, ArrayPos, PathElem};
 
 #[cfg(feature = "adapter-serde_cbor")]
 use bench_harness::adapters::SerdeCbor;
@@ -314,9 +314,8 @@ fn bench_native_roundtrip(c: &mut Criterion) {
         let native = BenchValueNative::from_bench(value);
         group.bench_with_input(BenchmarkId::new("synthetic", name), &native, |b, v| {
             b.iter(|| {
-                let bytes = encode_to_vec(black_box(v)).unwrap();
-                let _out: BenchValueNative =
-                    decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+                let bytes = encode_to_canonical(black_box(v)).unwrap();
+                let _out: BenchValueNative = decode_canonical_owned(&bytes).unwrap();
             })
         });
     }
@@ -328,11 +327,10 @@ fn bench_native_decode_borrowed(c: &mut Criterion) {
     let mut group = c.benchmark_group("native_decode_borrowed/sacp-cbor");
     for (name, value) in values {
         let native = BenchValueNative::from_bench(value);
-        let bytes = encode_to_vec(&native).unwrap();
+        let bytes = encode_to_canonical(&native).unwrap();
         group.bench_with_input(BenchmarkId::new("synthetic", name), &bytes, |b, bytes| {
             b.iter(|| {
-                let _out: BenchValueBorrowed<'_> =
-                    decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len())).unwrap();
+                let _out: BenchValueBorrowed<'_> = decode_canonical_owned(black_box(bytes)).unwrap();
             })
         });
     }

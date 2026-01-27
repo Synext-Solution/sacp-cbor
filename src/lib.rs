@@ -83,7 +83,7 @@ mod edit;
 mod int;
 
 pub use crate::canonical::{CborBytesRef, EncodedTextKey};
-pub use crate::codec::{decode, decode_canonical, CborDecode};
+pub use crate::codec::{decode, decode_canonical, CborDecode, Decoder};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
 pub use crate::parse::{validate, validate_canonical};
