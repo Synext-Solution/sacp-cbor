@@ -936,8 +936,7 @@ fn read_uint_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result
 
 #[inline]
 fn read_len_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result<usize, CborError> {
-    let n = wire::read_len_trusted(data, pos, ai, off).map_err(map_trusted_err)?;
-    usize::try_from(n).map_err(|_| malformed(off))
+    wire::read_len_trusted(data, pos, ai, off).map_err(map_trusted_err)
 }
 
 #[derive(Clone, Copy)]

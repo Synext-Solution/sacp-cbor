@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 use serde::de::{
-    self, Deserialize, DeserializeSeed, EnumAccess, IgnoredAny, IntoDeserializer, MapAccess,
-    SeqAccess, VariantAccess, Visitor,
+    self, Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
+    VariantAccess, Visitor,
 };
 use serde::ser::{self, SerializeMap, SerializeSeq, SerializeStruct};
 use serde::Serialize;
@@ -14,6 +14,7 @@ use crate::profile::{
 };
 use crate::scalar::F64Bits;
 use crate::utf8;
+use crate::wire;
 use crate::{CborError, DecodeLimits, ErrorCode};
 
 fn check_map_key_order(
@@ -93,7 +94,7 @@ pub fn from_slice<'de, T: Deserialize<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let mut de = DirectDeserializer::new_checked(bytes, limits)?;
+    let mut de = DirectDeserializer::<true>::new(bytes, limits)?;
     let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
     if de.offset() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
@@ -161,19 +162,19 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_i128(i128::from(v)).map_err(SerdeError::from)
+        self.enc.int(v).map_err(SerdeError::from)
     }
 
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
@@ -181,19 +182,23 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
+        self.enc.int(i64::from(v)).map_err(SerdeError::from)
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
+        if v <= MAX_SAFE_INTEGER {
+            self.enc.int(v as i64).map_err(SerdeError::from)
+        } else {
+            self.enc.int_u128(u128::from(v)).map_err(SerdeError::from)
+        }
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
@@ -873,36 +878,28 @@ impl From<CborError> for DeError {
     }
 }
 
+impl crate::wire::DecodeError for DeError {
+    #[inline]
+    fn new(code: ErrorCode, offset: usize) -> Self {
+        DeError::new(code, offset)
+    }
+}
+
 #[inline]
 const fn ser_err(off: usize) -> DeError {
     DeError::new(ErrorCode::SerdeError, off)
 }
 
-struct DirectDeserializer<'de> {
+struct DirectDeserializer<'de, const CHECKED: bool> {
     input: &'de [u8],
     pos: usize,
     limits: DecodeLimits,
     items_seen: usize,
     depth: usize,
-    mode: Mode,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Checked,
-    CanonicalTrusted,
-}
-
-impl<'de> DirectDeserializer<'de> {
-    const fn new_checked(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
-        Self::new(input, limits, Mode::Checked)
-    }
-
-    const fn new_trusted(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
-        Self::new(input, limits, Mode::CanonicalTrusted)
-    }
-
-    const fn new(input: &'de [u8], limits: DecodeLimits, mode: Mode) -> Result<Self, CborError> {
+impl<'de, const CHECKED: bool> DirectDeserializer<'de, CHECKED> {
+    const fn new(input: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
         if input.len() > limits.max_input_bytes {
             return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
         }
@@ -912,7 +909,6 @@ impl<'de> DirectDeserializer<'de> {
             limits,
             items_seen: 0,
             depth: 0,
-            mode,
         })
     }
 
@@ -1020,9 +1016,10 @@ impl<'de> DirectDeserializer<'de> {
 
     #[inline]
     fn read_uint_arg(&mut self, ai: u8, off: usize) -> Result<u64, DeError> {
-        match self.mode {
-            Mode::Checked => self.read_uint_arg_checked(ai, off),
-            Mode::CanonicalTrusted => self.read_uint_arg_trusted(ai, off),
+        if CHECKED {
+            self.read_uint_arg_checked(ai, off)
+        } else {
+            self.read_uint_arg_trusted(ai, off)
         }
     }
 
@@ -1043,9 +1040,10 @@ impl<'de> DirectDeserializer<'de> {
     }
 
     fn read_len(&mut self, ai: u8, off: usize) -> Result<usize, DeError> {
-        match self.mode {
-            Mode::Checked => self.read_len_checked(ai, off),
-            Mode::CanonicalTrusted => self.read_len_trusted(ai, off),
+        if CHECKED {
+            self.read_len_checked(ai, off)
+        } else {
+            self.read_len_trusted(ai, off)
         }
     }
 
@@ -1088,13 +1086,10 @@ impl<'de> DirectDeserializer<'de> {
             off,
         )?;
         let bytes = self.read_exact(len)?;
-        let s = match self.mode {
-            Mode::Checked => {
-                utf8::validate(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
-            }
-            Mode::CanonicalTrusted => {
-                utf8::trusted(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
-            }
+        let s = if CHECKED {
+            utf8::validate(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
+        } else {
+            utf8::trusted(bytes).map_err(|()| DeError::new(ErrorCode::Utf8Invalid, off))?
         };
         Ok(s)
     }
@@ -1123,7 +1118,7 @@ impl<'de> DirectDeserializer<'de> {
         }
         let s = self.parse_text_from_header(key_start, ai)?;
         let key_end = self.pos;
-        if self.mode == Mode::Checked {
+        if CHECKED {
             if let Some((ps, pe)) = *prev_key_range {
                 let prev = &self.input[ps..pe];
                 let curr = &self.input[key_start..key_end];
@@ -1161,7 +1156,7 @@ impl<'de> DirectDeserializer<'de> {
             m_off,
         )?;
         let mag = self.read_exact(m_len)?;
-        if self.mode == Mode::Checked {
+        if CHECKED {
             validate_bignum_bytes(negative, mag).map_err(|code| DeError::new(code, m_off))?;
         }
         Ok((negative, mag))
@@ -1175,14 +1170,14 @@ impl<'de> DirectDeserializer<'de> {
         match major {
             0 => {
                 let v = self.read_uint_arg(ai, off)?;
-                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
+                if CHECKED && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(i128::from(v))
             }
             1 => {
                 let n = self.read_uint_arg(ai, off)?;
-                if self.mode == Mode::Checked && n >= MAX_SAFE_INTEGER {
+                if CHECKED && n >= MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(-1 - i128::from(n))
@@ -1203,7 +1198,7 @@ impl<'de> DirectDeserializer<'de> {
         match major {
             0 => {
                 let v = self.read_uint_arg(ai, off)?;
-                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
+                if CHECKED && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 Ok(u128::from(v))
@@ -1322,16 +1317,32 @@ impl<'de> DirectDeserializer<'de> {
     fn exit_container(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
+
+    fn skip_one_value(&mut self) -> Result<(), DeError> {
+        let mut cursor = wire::Cursor::<DeError>::with_pos(self.input, self.pos);
+        wire::skip_one_value::<CHECKED, DeError>(
+            &mut cursor,
+            Some(&self.limits),
+            &mut self.items_seen,
+            self.depth,
+        )?;
+        self.pos = cursor.position();
+        Ok(())
+    }
 }
 
-struct DirectSeqAccess<'a, 'de> {
-    de: &'a mut DirectDeserializer<'de>,
+struct DirectSeqAccess<'a, 'de, const CHECKED: bool> {
+    de: &'a mut DirectDeserializer<'de, CHECKED>,
     remaining: usize,
     depth_entered: bool,
 }
 
-impl<'a, 'de> DirectSeqAccess<'a, 'de> {
-    fn new(de: &'a mut DirectDeserializer<'de>, remaining: usize, depth_entered: bool) -> Self {
+impl<'a, 'de, const CHECKED: bool> DirectSeqAccess<'a, 'de, CHECKED> {
+    fn new(
+        de: &'a mut DirectDeserializer<'de, CHECKED>,
+        remaining: usize,
+        depth_entered: bool,
+    ) -> Self {
         Self {
             de,
             remaining,
@@ -1340,7 +1351,7 @@ impl<'a, 'de> DirectSeqAccess<'a, 'de> {
     }
 }
 
-impl<'de> SeqAccess<'de> for DirectSeqAccess<'_, 'de> {
+impl<'de, const CHECKED: bool> SeqAccess<'de> for DirectSeqAccess<'_, 'de, CHECKED> {
     type Error = DeError;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, DeError>
@@ -1366,17 +1377,17 @@ impl<'de> SeqAccess<'de> for DirectSeqAccess<'_, 'de> {
     }
 }
 
-struct DirectMapAccess<'a, 'de> {
-    de: &'a mut DirectDeserializer<'de>,
+struct DirectMapAccess<'a, 'de, const CHECKED: bool> {
+    de: &'a mut DirectDeserializer<'de, CHECKED>,
     remaining_pairs: usize,
     depth_entered: bool,
     pending_key: bool,
     prev_key_range: Option<(usize, usize)>,
 }
 
-impl<'a, 'de> DirectMapAccess<'a, 'de> {
+impl<'a, 'de, const CHECKED: bool> DirectMapAccess<'a, 'de, CHECKED> {
     fn new(
-        de: &'a mut DirectDeserializer<'de>,
+        de: &'a mut DirectDeserializer<'de, CHECKED>,
         remaining_pairs: usize,
         depth_entered: bool,
     ) -> Self {
@@ -1390,7 +1401,7 @@ impl<'a, 'de> DirectMapAccess<'a, 'de> {
     }
 }
 
-impl<'de> MapAccess<'de> for DirectMapAccess<'_, 'de> {
+impl<'de, const CHECKED: bool> MapAccess<'de> for DirectMapAccess<'_, 'de, CHECKED> {
     type Error = DeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, DeError>
@@ -1435,16 +1446,16 @@ impl<'de> MapAccess<'de> for DirectMapAccess<'_, 'de> {
     }
 }
 
-struct DirectEnumAccess<'a, 'de> {
-    de: &'a mut DirectDeserializer<'de>,
+struct DirectEnumAccess<'a, 'de, const CHECKED: bool> {
+    de: &'a mut DirectDeserializer<'de, CHECKED>,
     variant: &'de str,
     has_value: bool,
     off: usize,
 }
 
-impl<'a, 'de> EnumAccess<'de> for DirectEnumAccess<'a, 'de> {
+impl<'a, 'de, const CHECKED: bool> EnumAccess<'de> for DirectEnumAccess<'a, 'de, CHECKED> {
     type Error = DeError;
-    type Variant = DirectVariantAccess<'a, 'de>;
+    type Variant = DirectVariantAccess<'a, 'de, CHECKED>;
 
     fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), DeError>
     where
@@ -1464,13 +1475,13 @@ impl<'a, 'de> EnumAccess<'de> for DirectEnumAccess<'a, 'de> {
     }
 }
 
-struct DirectVariantAccess<'a, 'de> {
-    de: &'a mut DirectDeserializer<'de>,
+struct DirectVariantAccess<'a, 'de, const CHECKED: bool> {
+    de: &'a mut DirectDeserializer<'de, CHECKED>,
     has_value: bool,
     off: usize,
 }
 
-impl<'de> VariantAccess<'de> for DirectVariantAccess<'_, 'de> {
+impl<'de, const CHECKED: bool> VariantAccess<'de> for DirectVariantAccess<'_, 'de, CHECKED> {
     type Error = DeError;
 
     fn unit_variant(self) -> Result<(), DeError> {
@@ -1527,7 +1538,7 @@ impl<'de> VariantAccess<'de> for DirectVariantAccess<'_, 'de> {
     }
 }
 
-impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
+impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut DirectDeserializer<'de, CHECKED> {
     type Error = DeError;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -1544,7 +1555,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
                     return visitor.visit_u64(u64::from(ai));
                 }
                 let v = self.read_uint_arg(ai, off)?;
-                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
+                if CHECKED && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 visitor.visit_u64(v)
@@ -1555,7 +1566,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
                     return visitor.visit_i64(out);
                 }
                 let n = self.read_uint_arg(ai, off)?;
-                if self.mode == Mode::Checked && n >= MAX_SAFE_INTEGER {
+                if CHECKED && n >= MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 let v = -1 - i128::from(n);
@@ -2002,96 +2013,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        struct IgnoreVisitor;
-
-        impl<'de> Visitor<'de> for IgnoreVisitor {
-            type Value = ();
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("any SACP-CBOR value")
-            }
-
-            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_borrowed_str<E>(self, _v: &'de str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_borrowed_bytes<E>(self, _v: &'de [u8]) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(())
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                while let Some(_ignored) = seq.next_element::<IgnoredAny>()? {}
-                Ok(())
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                while let Some((_k, _v)) = map.next_entry::<IgnoredAny, IgnoredAny>()? {}
-                Ok(())
-            }
-        }
-
-        self.deserialize_any(IgnoreVisitor)?;
+        self.skip_one_value()?;
         visitor.visit_unit()
     }
 }
@@ -2106,7 +2028,7 @@ pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Re
 where
     T: Deserialize<'de>,
 {
-    let mut de = DirectDeserializer::new_checked(bytes, limits)?;
+    let mut de = DirectDeserializer::<true>::new(bytes, limits)?;
     let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
     if de.offset() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
@@ -2128,7 +2050,7 @@ where
 {
     let bytes = canon.as_bytes();
     let limits = DecodeLimits::for_bytes(bytes.len());
-    let mut de = DirectDeserializer::new_trusted(bytes, limits)?;
+    let mut de = DirectDeserializer::<false>::new(bytes, limits)?;
     let value = T::deserialize(&mut de).map_err(DeError::into_cbor_error)?;
     if de.offset() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, de.offset()));
