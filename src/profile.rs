@@ -89,7 +89,8 @@ fn cmp_big_endian(a: &[u8], b: &[u8]) -> Ordering {
 /// 1) shorter encoded byte string sorts first, then
 /// 2) lexicographic byte comparison.
 ///
-/// This is used by the validator when it already has the encoded key slices.
+/// This is used by the validator when it already has the encoded key slices. For text keys, this
+/// matches [`cmp_text_keys_canonical`] on the decoded strings.
 #[inline]
 #[must_use]
 pub fn cmp_encoded_key_bytes(a: &[u8], b: &[u8]) -> Ordering {
@@ -114,11 +115,11 @@ pub fn is_strictly_increasing_encoded(prev: &[u8], curr: &[u8]) -> bool {
 /// 1) shorter encoded key sorts first (this includes the header bytes), then
 /// 2) lexicographic ordering of the encoded key bytes.
 ///
-/// For text strings, encoded length is strictly monotone in payload length, so this reduces to
-/// comparing payload lengths and then the UTF-8 bytes.
+/// For text strings, the encoded length is strictly monotone in payload length, so the ordering is
+/// exactly the same as comparing payload lengths and then the UTF-8 bytes.
 #[inline]
 #[must_use]
-pub fn cmp_text_keys_by_canonical_encoding(a: &str, b: &str) -> Ordering {
+pub fn cmp_text_keys_canonical(a: &str, b: &str) -> Ordering {
     match a.len().cmp(&b.len()) {
         Ordering::Equal => a.as_bytes().cmp(b.as_bytes()),
         other => other,

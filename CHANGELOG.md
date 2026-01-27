@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- **Breaking:** `Encoder::into_canonical()` now returns `Result<CborBytes, CborError>` and errors if the buffer does not contain exactly one CBOR item.
+- **Breaking:** `EditEncode` is now sealed; only the built-in edit value types are supported.
+- **Breaking:** `EditValue` is now an opaque type (no public constructors), preventing invariant-violating edits.
+- Added `MapEncoder::entry_raw_key` and optimized editor map splicing to reuse encoded key bytes.
+- Centralized fallible allocation and tightened error reporting (length overflow vs allocation failure) across alloc paths.
+- Editor now maintains ordered children/splices on insertion, removing per-emit sorting and duplicate scans.
+
 ## 0.5.0
 
 - **Breaking:** renamed canonical owned/borrowed bytes to `CborBytes`/`CborBytesRef` and encoder/editor to `Encoder`/`Editor`.

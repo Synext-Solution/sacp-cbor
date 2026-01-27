@@ -5,15 +5,49 @@ use alloc::vec::Vec;
 use crate::{CborError, ErrorCode};
 
 #[inline]
-pub const fn alloc_failed(offset: usize) -> CborError {
-    CborError::new(ErrorCode::AllocationFailed, offset)
+fn check_reserve_len(len: usize, additional: usize, offset: usize) -> Result<(), CborError> {
+    let needed = len
+        .checked_add(additional)
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
+    if needed > isize::MAX as usize {
+        return Err(CborError::new(ErrorCode::LengthOverflow, offset));
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn try_reserve_exact<T>(
+    v: &mut Vec<T>,
+    additional: usize,
+    offset: usize,
+) -> Result<(), CborError> {
+    check_reserve_len(v.len(), additional, offset)?;
+    v.try_reserve_exact(additional)
+        .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
+}
+
+#[inline]
+pub fn try_reserve<T>(v: &mut Vec<T>, additional: usize, offset: usize) -> Result<(), CborError> {
+    check_reserve_len(v.len(), additional, offset)?;
+    v.try_reserve(additional)
+        .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
+}
+
+#[inline]
+pub fn try_reserve_exact_str(
+    s: &mut String,
+    additional: usize,
+    offset: usize,
+) -> Result<(), CborError> {
+    check_reserve_len(s.len(), additional, offset)?;
+    s.try_reserve_exact(additional)
+        .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))
 }
 
 #[inline]
 pub fn try_vec_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborError> {
     let mut v = Vec::new();
-    v.try_reserve_exact(bytes.len())
-        .map_err(|_| alloc_failed(offset))?;
+    try_reserve_exact(&mut v, bytes.len(), offset)?;
     v.extend_from_slice(bytes);
     Ok(v)
 }
@@ -21,8 +55,7 @@ pub fn try_vec_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborEr
 #[inline]
 pub fn try_box_str_from_str(s: &str, offset: usize) -> Result<Box<str>, CborError> {
     let mut out = String::new();
-    out.try_reserve_exact(s.len())
-        .map_err(|_| alloc_failed(offset))?;
+    try_reserve_exact_str(&mut out, s.len(), offset)?;
     out.push_str(s);
     Ok(out.into_boxed_str())
 }
@@ -30,7 +63,7 @@ pub fn try_box_str_from_str(s: &str, offset: usize) -> Result<Box<str>, CborErro
 #[inline]
 pub fn try_vec_with_capacity<T>(cap: usize, offset: usize) -> Result<Vec<T>, CborError> {
     let mut v: Vec<T> = Vec::new();
-    v.try_reserve_exact(cap).map_err(|_| alloc_failed(offset))?;
+    try_reserve_exact(&mut v, cap, offset)?;
     Ok(v)
 }
 
@@ -41,9 +74,7 @@ pub fn try_vec_repeat_copy<T: Copy>(
     offset: usize,
 ) -> Result<Vec<T>, CborError> {
     let mut v = Vec::new();
-    v.try_reserve_exact(n).map_err(|_| alloc_failed(offset))?;
-    for _ in 0..n {
-        v.push(value);
-    }
+    try_reserve_exact(&mut v, n, offset)?;
+    v.resize(n, value);
     Ok(v)
 }

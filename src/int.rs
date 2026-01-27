@@ -1,10 +1,10 @@
-use alloc::vec::Vec;
-
+use crate::alloc_util::try_reserve_exact;
 #[cfg(feature = "serde")]
 use crate::profile::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
 #[cfg(feature = "serde")]
 use crate::value::{BigInt, CborInteger};
 use crate::ErrorCode;
+use alloc::vec::Vec;
 
 #[cfg(feature = "serde")]
 pub fn integer_from_u128(v: u128) -> Result<CborInteger, ErrorCode> {
@@ -49,8 +49,7 @@ pub fn magnitude_from_u128(n: u128) -> Result<Vec<u8>, ErrorCode> {
     let leading = (n.leading_zeros() / 8) as usize;
     let raw = n.to_be_bytes();
     let mut out = Vec::new();
-    out.try_reserve_exact(raw.len().saturating_sub(leading))
-        .map_err(|_| ErrorCode::AllocationFailed)?;
+    try_reserve_exact(&mut out, raw.len().saturating_sub(leading), 0).map_err(|err| err.code)?;
     out.extend_from_slice(&raw[leading..]);
     Ok(out)
 }

@@ -3,10 +3,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+use crate::alloc_util::try_reserve;
 use crate::canonical::{CborBytes, CborBytesRef};
 use crate::encode::{ArrayEncoder, MapEncoder};
 use crate::parse;
-use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding};
+use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::query::{CborValueRef, PathElem};
 use crate::scalar::F64Bits;
 use crate::value::CborValue;
@@ -216,7 +217,7 @@ impl<'a> Editor<'a> {
             path,
             Terminal::Set {
                 mode: SetMode::Upsert,
-                value: EditValue::Raw(value),
+                value: EditValue::raw(value),
             },
         )
     }
@@ -235,7 +236,7 @@ impl<'a> Editor<'a> {
             path,
             Terminal::Set {
                 mode: SetMode::Upsert,
-                value: EditValue::BytesOwned(bytes),
+                value: EditValue::bytes_owned(bytes),
             },
         )
     }
@@ -280,7 +281,7 @@ impl<'a> Editor<'a> {
     pub fn apply(self) -> Result<CborBytes, CborError> {
         let mut enc = Encoder::with_capacity(self.root.len());
         emit_value(&mut enc, self.root, &self.ops, self.options)?;
-        Ok(enc.into_canonical())
+        enc.into_canonical()
     }
 
     fn set_with_mode<T: EditEncode<'a>>(
@@ -340,9 +341,13 @@ impl<'a> Editor<'a> {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// Encodes a single canonical CBOR value into an `Encoder`.
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-pub trait EditEncode<'a> {
+pub trait EditEncode<'a>: sealed::Sealed {
     /// Encode this value into a canonical CBOR item ready for patching.
     ///
     /// # Errors
@@ -350,6 +355,25 @@ pub trait EditEncode<'a> {
     /// Returns `CborError` if encoding fails or produces invalid canonical CBOR.
     fn into_value(self) -> Result<EditValue<'a>, CborError>;
 }
+
+impl sealed::Sealed for bool {}
+impl sealed::Sealed for () {}
+impl sealed::Sealed for &str {}
+impl sealed::Sealed for String {}
+impl sealed::Sealed for &[u8] {}
+impl sealed::Sealed for Vec<u8> {}
+impl sealed::Sealed for F64Bits {}
+impl sealed::Sealed for f64 {}
+impl sealed::Sealed for f32 {}
+impl sealed::Sealed for i64 {}
+impl sealed::Sealed for u64 {}
+impl sealed::Sealed for i128 {}
+impl sealed::Sealed for u128 {}
+impl sealed::Sealed for CborValue {}
+impl sealed::Sealed for &CborValue {}
+impl sealed::Sealed for CborBytesRef<'_> {}
+impl sealed::Sealed for CborBytes {}
+impl sealed::Sealed for &CborBytes {}
 
 impl<'a> EditEncode<'a> for bool {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
@@ -443,19 +467,19 @@ impl<'a> EditEncode<'a> for &CborValue {
 
 impl<'a> EditEncode<'a> for CborBytesRef<'a> {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        Ok(EditValue::BytesRef(self))
+        Ok(EditValue::bytes_ref(self))
     }
 }
 
 impl<'a> EditEncode<'a> for CborBytes {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        Ok(EditValue::BytesOwned(self.into_bytes()))
+        Ok(EditValue::bytes_owned(self.into_bytes()))
     }
 }
 
 impl<'a> EditEncode<'a> for &'a CborBytes {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        Ok(EditValue::BytesRef(CborBytesRef::new(self.as_bytes())))
+        Ok(EditValue::bytes_ref(CborBytesRef::new(self.as_bytes())))
     }
 }
 
@@ -478,9 +502,7 @@ impl<'a> ArraySpliceBuilder<'_, 'a, '_> {
     /// Returns `CborError` if encoding fails.
     pub fn insert<T: EditEncode<'a>>(mut self, value: T) -> Result<Self, CborError> {
         let value = value.into_value()?;
-        self.inserts
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        try_reserve(&mut self.inserts, 1, 0)?;
         self.inserts.push(value);
         Ok(self)
     }
@@ -491,10 +513,8 @@ impl<'a> ArraySpliceBuilder<'_, 'a, '_> {
     ///
     /// Returns `CborError` on allocation failure.
     pub fn insert_raw(mut self, value: CborValueRef<'a>) -> Result<Self, CborError> {
-        self.inserts
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
-        self.inserts.push(EditValue::Raw(value));
+        try_reserve(&mut self.inserts, 1, 0)?;
+        self.inserts.push(EditValue::raw(value));
         Ok(self)
     }
 
@@ -508,10 +528,8 @@ impl<'a> ArraySpliceBuilder<'_, 'a, '_> {
         F: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
         let bytes = encode_with(f)?;
-        self.inserts
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
-        self.inserts.push(EditValue::BytesOwned(bytes));
+        try_reserve(&mut self.inserts, 1, 0)?;
+        self.inserts.push(EditValue::bytes_owned(bytes));
         Ok(self)
     }
 
@@ -553,11 +571,12 @@ enum PathElemOwned {
 }
 
 impl PathElemOwned {
-    fn matches(&self, elem: &PathElem<'_>) -> bool {
+    fn cmp_elem(&self, elem: &PathElem<'_>) -> Ordering {
         match (self, elem) {
-            (Self::Key(k), PathElem::Key(v)) => k.as_ref() == *v,
-            (Self::Index(a), PathElem::Index(b)) => a == b,
-            _ => false,
+            (Self::Key(k), PathElem::Key(v)) => cmp_text_keys_canonical(k, v),
+            (Self::Index(a), PathElem::Index(b)) => a.cmp(b),
+            (Self::Key(_), PathElem::Index(_)) => Ordering::Less,
+            (Self::Index(_), PathElem::Key(_)) => Ordering::Greater,
         }
     }
 }
@@ -582,16 +601,50 @@ struct ArraySplice<'a> {
     bounds: BoundsMode,
 }
 
+fn cmp_array_pos(a: ArrayPos, b: ArrayPos) -> Ordering {
+    match (a, b) {
+        (ArrayPos::At(x), ArrayPos::At(y)) => x.cmp(&y),
+        (ArrayPos::At(_), ArrayPos::End) => Ordering::Less,
+        (ArrayPos::End, ArrayPos::At(_)) => Ordering::Greater,
+        (ArrayPos::End, ArrayPos::End) => Ordering::Equal,
+    }
+}
+
+const fn splices_overlap(a_pos: usize, a_del: usize, b_pos: usize, b_del: usize) -> bool {
+    if a_del == 0 || b_del == 0 {
+        return false;
+    }
+    let a_end = a_pos.saturating_add(a_del);
+    let b_end = b_pos.saturating_add(b_del);
+    (a_pos < b_pos && a_end > b_pos) || (b_pos < a_pos && b_end > a_pos)
+}
+
 #[derive(Debug, Clone)]
 /// Encoded edit value used by the editor.
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-pub enum EditValue<'a> {
+pub struct EditValue<'a>(EditValueInner<'a>);
+
+#[derive(Debug, Clone)]
+enum EditValueInner<'a> {
     /// Splice an existing canonical value reference.
     Raw(CborValueRef<'a>),
     /// Splice canonical bytes by reference.
     BytesRef(CborBytesRef<'a>),
     /// Splice owned canonical bytes.
     BytesOwned(Vec<u8>),
+}
+
+impl<'a> EditValue<'a> {
+    pub(crate) const fn raw(value: CborValueRef<'a>) -> Self {
+        Self(EditValueInner::Raw(value))
+    }
+
+    pub(crate) const fn bytes_ref(value: CborBytesRef<'a>) -> Self {
+        Self(EditValueInner::BytesRef(value))
+    }
+
+    pub(crate) const fn bytes_owned(value: Vec<u8>) -> Self {
+        Self(EditValueInner::BytesOwned(value))
+    }
 }
 
 #[derive(Debug)]
@@ -670,23 +723,35 @@ impl<'a> Node<'a> {
             return Err(invalid_query());
         }
 
-        for existing in &cur.splices {
-            if existing.pos == splice.pos {
-                return Err(patch_conflict());
+        let Err(insert_idx) = cur
+            .splices
+            .binary_search_by(|s| cmp_array_pos(s.pos, splice.pos))
+        else {
+            return Err(patch_conflict());
+        };
+
+        if let ArrayPos::At(new_pos) = splice.pos {
+            if let Some(prev) = insert_idx
+                .checked_sub(1)
+                .and_then(|idx| cur.splices.get(idx))
+            {
+                if let ArrayPos::At(prev_pos) = prev.pos {
+                    if splices_overlap(prev_pos, prev.delete, new_pos, splice.delete) {
+                        return Err(patch_conflict());
+                    }
+                }
             }
-            if let (ArrayPos::At(a), ArrayPos::At(b)) = (existing.pos, splice.pos) {
-                let a_end = a.saturating_add(existing.delete);
-                let b_end = b.saturating_add(splice.delete);
-                if (a < b && a_end > b) || (b < a && b_end > a) {
-                    return Err(patch_conflict());
+            if let Some(next) = cur.splices.get(insert_idx) {
+                if let ArrayPos::At(next_pos) = next.pos {
+                    if splices_overlap(new_pos, splice.delete, next_pos, next.delete) {
+                        return Err(patch_conflict());
+                    }
                 }
             }
         }
 
-        cur.splices
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
-        cur.splices.push(splice);
+        try_reserve(&mut cur.splices, 1, 0)?;
+        cur.splices.insert(insert_idx, splice);
         Ok(())
     }
 
@@ -702,28 +767,25 @@ impl<'a> Node<'a> {
     }
 
     fn child_mut(&mut self, elem: &PathElem<'_>) -> Result<&mut Self, CborError> {
-        if let Some(idx) = self
+        match self
             .children
-            .iter()
-            .position(|(owned, _)| owned.matches(elem))
+            .binary_search_by(|(owned, _)| owned.cmp_elem(elem))
         {
-            return Ok(&mut self.children[idx].1);
-        }
+            Ok(idx) => Ok(&mut self.children[idx].1),
+            Err(idx) => {
+                let owned = match elem {
+                    PathElem::Key(k) => {
+                        checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
+                        PathElemOwned::Key(crate::alloc_util::try_box_str_from_str(k, 0)?)
+                    }
+                    PathElem::Index(i) => PathElemOwned::Index(*i),
+                };
 
-        let owned = match elem {
-            PathElem::Key(k) => {
-                checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
-                PathElemOwned::Key(boxed_str(k)?)
+                try_reserve(&mut self.children, 1, 0)?;
+                self.children.insert(idx, (owned, Node::new()));
+                Ok(&mut self.children[idx].1)
             }
-            PathElem::Index(i) => PathElemOwned::Index(*i),
-        };
-
-        self.children
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
-        self.children.push((owned, Node::new()));
-        let idx = self.children.len() - 1;
-        Ok(&mut self.children[idx].1)
+        }
     }
 }
 
@@ -741,14 +803,6 @@ struct ResolvedSplice<'a> {
     start: usize,
     delete: usize,
     inserts: &'a [EditValue<'a>],
-}
-
-fn boxed_str(s: &str) -> Result<Box<str>, CborError> {
-    let mut out = String::new();
-    out.try_reserve_exact(s.len())
-        .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
-    out.push_str(s);
-    Ok(out.into_boxed_str())
 }
 
 fn encode_with<F>(f: F) -> Result<Vec<u8>, CborError>
@@ -775,7 +829,7 @@ where
     F: FnOnce(&mut Encoder) -> Result<(), CborError>,
 {
     let bytes = encode_with(f)?;
-    Ok(EditValue::BytesOwned(bytes))
+    Ok(EditValue::bytes_owned(bytes))
 }
 
 trait ValueEncoder {
@@ -838,10 +892,10 @@ impl ValueEncoder for ArrayEncoder<'_> {
 }
 
 fn write_new_value<E: ValueEncoder>(enc: &mut E, value: &EditValue<'_>) -> Result<(), CborError> {
-    match value {
-        EditValue::Raw(v) => enc.raw_value_ref(*v),
-        EditValue::BytesRef(b) => enc.raw_cbor(*b),
-        EditValue::BytesOwned(b) => enc.raw_cbor(CborBytesRef::new(b.as_slice())),
+    match &value.0 {
+        EditValueInner::Raw(v) => enc.raw_value_ref(*v),
+        EditValueInner::BytesRef(b) => enc.raw_cbor(*b),
+        EditValueInner::BytesOwned(b) => enc.raw_cbor(CborBytesRef::new(b.as_slice())),
     }
 }
 
@@ -877,17 +931,10 @@ fn emit_patched_map<'a, E: ValueEncoder>(
 ) -> Result<(), CborError> {
     let map = src.map()?;
     let map_off = src.offset();
-    let mut mods = collect_key_children(node, map_off)?;
+    let mods = collect_key_children(node, map_off)?;
 
     if mods.is_empty() {
         return enc.raw_value_ref(src);
-    }
-
-    mods.sort_by(|a, b| cmp_text_keys_by_canonical_encoding(a.key, b.key));
-    for w in mods.windows(2) {
-        if w[0].key == w[1].key {
-            return Err(patch_conflict());
-        }
     }
 
     let out_len = compute_map_len_and_validate(map, &mods, options, map_off)?;
@@ -905,18 +952,11 @@ fn emit_patched_array<'a, E: ValueEncoder>(
     let array = src.array()?;
     let len = array.len();
     let array_off = src.offset();
-    let mut mods = collect_index_children(node, array_off)?;
+    let mods = collect_index_children(node, array_off)?;
     let splices = collect_splices(node, len, array_off)?;
 
     if mods.is_empty() && splices.is_empty() {
         return enc.raw_value_ref(src);
-    }
-
-    mods.sort_by(|a, b| a.index.cmp(&b.index));
-    for w in mods.windows(2) {
-        if w[0].index == w[1].index {
-            return Err(patch_conflict());
-        }
     }
 
     if let Some(max) = mods.last().map(|m| m.index) {
@@ -1118,17 +1158,6 @@ fn collect_splices<'a>(
         });
     }
 
-    out.sort_by(|a, b| a.start.cmp(&b.start));
-    for w in out.windows(2) {
-        if w[0].start == w[1].start {
-            return Err(patch_conflict());
-        }
-        let end = w[0].start.saturating_add(w[0].delete);
-        if end > w[1].start {
-            return Err(patch_conflict());
-        }
-    }
-
     Ok(out)
 }
 
@@ -1147,7 +1176,7 @@ fn compute_map_len_and_validate<'a>(
         let cur_mod = mods.get(mod_idx);
         match (entry, cur_mod) {
             (Some((key, _value)), Some(mod_key)) => {
-                match cmp_text_keys_by_canonical_encoding(key, mod_key.key) {
+                match cmp_text_keys_canonical(key, mod_key.key) {
                     Ordering::Less => {
                         entry = next_map_entry(&mut iter)?;
                     }
@@ -1234,18 +1263,18 @@ fn emit_map_entries<'a>(
     map_off: usize,
 ) -> Result<(), CborError> {
     let mut mod_idx = 0usize;
-    let mut iter = map.iter();
-    let mut entry = next_map_entry(&mut iter)?;
+    let mut iter = map.iter_encoded();
+    let mut entry = next_map_entry_encoded(&mut iter)?;
 
     while entry.is_some() || mod_idx < mods.len() {
         let cur_mod = mods.get(mod_idx);
         match (entry, cur_mod) {
-            (Some((key, value)), Some(mod_key)) => {
-                match cmp_text_keys_by_canonical_encoding(key, mod_key.key) {
+            (Some((key, key_bytes, value)), Some(mod_key)) => {
+                match cmp_text_keys_canonical(key, mod_key.key) {
                     Ordering::Less => {
                         let value_ref = value;
-                        menc.entry(key, |venc| venc.raw_value_ref(value_ref))?;
-                        entry = next_map_entry(&mut iter)?;
+                        menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
+                        entry = next_map_entry_encoded(&mut iter)?;
                     }
                     Ordering::Equal => {
                         match mod_key.node.terminal.as_ref() {
@@ -1257,17 +1286,17 @@ fn emit_map_entries<'a>(
                                 return Err(err(ErrorCode::InvalidQuery, map_off));
                             }
                             Some(Terminal::Set { value, .. }) => {
-                                menc.entry(key, |venc| write_new_value(venc, value))?;
+                                menc.entry_raw_key(key_bytes, |venc| write_new_value(venc, value))?;
                             }
                             None => {
                                 let value_ref = value;
-                                menc.entry(key, |venc| {
+                                menc.entry_raw_key(key_bytes, |venc| {
                                     emit_value(venc, value_ref, mod_key.node, options)
                                 })?;
                             }
                         }
                         mod_idx += 1;
-                        entry = next_map_entry(&mut iter)?;
+                        entry = next_map_entry_encoded(&mut iter)?;
                     }
                     Ordering::Greater => {
                         emit_missing_map_entry(menc, mod_key, options, map_off)?;
@@ -1275,10 +1304,10 @@ fn emit_map_entries<'a>(
                     }
                 }
             }
-            (Some((key, value)), None) => {
+            (Some((_key, key_bytes, value)), None) => {
                 let value_ref = value;
-                menc.entry(key, |venc| venc.raw_value_ref(value_ref))?;
-                entry = next_map_entry(&mut iter)?;
+                menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
+                entry = next_map_entry_encoded(&mut iter)?;
             }
             (None, Some(mod_key)) => {
                 emit_missing_map_entry(menc, mod_key, options, map_off)?;
@@ -1351,13 +1380,7 @@ fn emit_created_map<E: ValueEncoder>(
     node: &Node<'_>,
     options: EditOptions,
 ) -> Result<(), CborError> {
-    let mut mods = collect_key_children(node, 0)?;
-    mods.sort_by(|a, b| cmp_text_keys_by_canonical_encoding(a.key, b.key));
-    for w in mods.windows(2) {
-        if w[0].key == w[1].key {
-            return Err(patch_conflict());
-        }
-    }
+    let mods = collect_key_children(node, 0)?;
 
     let mut out_len = 0usize;
     for m in &mods {
@@ -1398,6 +1421,19 @@ fn emit_created_map<E: ValueEncoder>(
 fn next_map_entry<'a, I>(iter: &mut I) -> Result<Option<(&'a str, CborValueRef<'a>)>, CborError>
 where
     I: Iterator<Item = Result<(&'a str, CborValueRef<'a>), CborError>>,
+{
+    match iter.next() {
+        None => Ok(None),
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => Err(e),
+    }
+}
+
+type EncodedMapEntry<'a> = (&'a str, &'a [u8], CborValueRef<'a>);
+
+fn next_map_entry_encoded<'a, I>(iter: &mut I) -> Result<Option<EncodedMapEntry<'a>>, CborError>
+where
+    I: Iterator<Item = Result<EncodedMapEntry<'a>, CborError>>,
 {
     match iter.next() {
         None => Ok(None),

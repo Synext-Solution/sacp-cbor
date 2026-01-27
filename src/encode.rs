@@ -1,3 +1,4 @@
+use crate::alloc_util::try_reserve;
 use crate::canonical::{CborBytes, CborBytesRef};
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
@@ -46,9 +47,7 @@ impl<'a, const N: usize> SmallStack<'a, N> {
 
     fn push(&mut self, frame: Frame<'a>, offset: usize) -> Result<(), CborError> {
         if !self.overflow.is_empty() {
-            self.overflow
-                .try_reserve(1)
-                .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))?;
+            try_reserve(&mut self.overflow, 1, offset)?;
             self.overflow.push(frame);
             return Ok(());
         }
@@ -57,9 +56,7 @@ impl<'a, const N: usize> SmallStack<'a, N> {
             self.len += 1;
             return Ok(());
         }
-        self.overflow
-            .try_reserve(1)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, offset))?;
+        try_reserve(&mut self.overflow, 1, offset)?;
         self.overflow.push(frame);
         Ok(())
     }
@@ -124,10 +121,8 @@ impl VecSink {
     }
 
     fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
-        self.buf
-            .try_reserve(additional)
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, self.buf.len()))?;
-        Ok(())
+        let offset = self.buf.len();
+        try_reserve(&mut self.buf, additional, offset)
     }
 }
 
@@ -368,9 +363,17 @@ impl Encoder {
     }
 
     /// Consume and return canonical bytes as a `CborBytes`.
-    #[must_use]
-    pub fn into_canonical(self) -> CborBytes {
-        CborBytes::new_unchecked(self.into_vec())
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer does not contain exactly one CBOR item.
+    pub fn into_canonical(self) -> Result<CborBytes, CborError> {
+        let bytes = self.into_vec();
+        let end = crate::parse::value_end_trusted(&bytes, 0)?;
+        if end != bytes.len() {
+            return Err(CborError::new(ErrorCode::TrailingBytes, end));
+        }
+        Ok(CborBytes::new_unchecked(bytes))
     }
 
     /// Borrow the bytes emitted so far.
@@ -765,6 +768,59 @@ pub struct MapEncoder<'a> {
 
 #[allow(missing_docs)]
 impl MapEncoder<'_> {
+    fn insert_entry<F>(
+        &mut self,
+        entry_start: usize,
+        key_start: usize,
+        key_end: usize,
+        f: F,
+    ) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        self.enforce_key_order(entry_start, key_start, key_end)?;
+        let res = f(self.enc);
+        self.finish_entry(entry_start, key_start, key_end, res)
+    }
+
+    fn enforce_key_order(
+        &mut self,
+        entry_start: usize,
+        key_start: usize,
+        key_end: usize,
+    ) -> Result<(), CborError> {
+        if let Some((ps, pe)) = self.prev_key_range {
+            let prev = &self.enc.sink.buf[ps..pe];
+            let curr = &self.enc.sink.buf[key_start..key_end];
+
+            if prev == curr {
+                self.enc.sink.buf.truncate(entry_start);
+                return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+            }
+            if !is_strictly_increasing_encoded(prev, curr) {
+                self.enc.sink.buf.truncate(entry_start);
+                return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_entry(
+        &mut self,
+        entry_start: usize,
+        key_start: usize,
+        key_end: usize,
+        res: Result<(), CborError>,
+    ) -> Result<(), CborError> {
+        if let Err(err) = res {
+            self.enc.sink.buf.truncate(entry_start);
+            return Err(err);
+        }
+        self.prev_key_range = Some((key_start, key_end));
+        self.remaining -= 1;
+        Ok(())
+    }
+
     /// Insert a map entry. Keys must be in canonical order; duplicates are rejected.
     ///
     /// # Errors
@@ -789,27 +845,43 @@ impl MapEncoder<'_> {
         let key_start = entry_start;
         let key_end = self.enc.sink.buf.len();
 
-        if let Some((ps, pe)) = self.prev_key_range {
-            let prev = &self.enc.sink.buf[ps..pe];
-            let curr = &self.enc.sink.buf[key_start..key_end];
+        self.insert_entry(entry_start, key_start, key_end, f)
+    }
 
-            if prev == curr {
-                self.enc.sink.buf.truncate(entry_start);
-                return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
-            }
-            if !is_strictly_increasing_encoded(prev, curr) {
-                self.enc.sink.buf.truncate(entry_start);
-                return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
-            }
+    /// Insert a map entry using a pre-encoded canonical text key.
+    ///
+    /// This avoids re-encoding keys when splicing from validated canonical bytes. The caller must
+    /// ensure `key_bytes` is the canonical CBOR encoding of a text string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if encoding fails, if keys are out of order, or if duplicates are found.
+    pub fn entry_raw_key<F>(&mut self, key_bytes: &[u8], f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        if self.remaining == 0 {
+            return Err(CborError::new(
+                ErrorCode::MapLenMismatch,
+                self.enc.sink.position(),
+            ));
+        }
+        if key_bytes.is_empty() {
+            return Err(CborError::new(
+                ErrorCode::MalformedCanonical,
+                self.enc.sink.position(),
+            ));
         }
 
-        let res = f(self.enc);
+        let entry_start = self.enc.sink.buf.len();
+        let res = self.enc.sink.write(key_bytes);
         if let Err(err) = res {
             self.enc.sink.buf.truncate(entry_start);
             return Err(err);
         }
-        self.prev_key_range = Some((key_start, key_end));
-        self.remaining -= 1;
-        Ok(())
+        let key_start = entry_start;
+        let key_end = self.enc.sink.buf.len();
+
+        self.insert_entry(entry_start, key_start, key_end, f)
     }
 }

@@ -114,7 +114,7 @@ macro_rules! cbor_bytes {
         (|| -> ::core::result::Result<$crate::CborBytes, $crate::CborError> {
             let mut __enc = $crate::Encoder::new();
             $crate::__cbor_bytes_into!(&mut __enc, $($tt)+)?;
-            ::core::result::Result::Ok(__enc.into_canonical())
+            __enc.into_canonical()
         })()
     }};
 }
@@ -212,33 +212,20 @@ pub mod __cbor_macro {
     };
 
     #[inline]
-    const fn alloc_failed() -> CborError {
-        CborError::new(ErrorCode::AllocationFailed, 0)
-    }
-
-    #[inline]
     const fn overflow() -> CborError {
         CborError::new(ErrorCode::LengthOverflow, 0)
     }
 
     pub fn try_reserve_exact<T>(v: &mut Vec<T>, additional: usize) -> Result<(), CborError> {
-        v.try_reserve_exact(additional)
-            .map_err(|_| alloc_failed())?;
-        Ok(())
+        crate::alloc_util::try_reserve_exact(v, additional, 0)
     }
 
     pub fn boxed_str_from_str(s: &str) -> Result<Box<str>, CborError> {
-        let mut out = String::new();
-        out.try_reserve_exact(s.len()).map_err(|_| alloc_failed())?;
-        out.push_str(s);
-        Ok(out.into_boxed_str())
+        crate::alloc_util::try_box_str_from_str(s, 0)
     }
 
     pub fn bytes_from_slice(b: &[u8]) -> Result<Vec<u8>, CborError> {
-        let mut out: Vec<u8> = Vec::new();
-        out.try_reserve_exact(b.len()).map_err(|_| alloc_failed())?;
-        out.extend_from_slice(b);
-        Ok(out)
+        crate::alloc_util::try_vec_from_slice(b, 0)
     }
 
     fn u128_to_min_be_bytes_nonzero(n: u128) -> Result<Vec<u8>, CborError> {
@@ -310,7 +297,7 @@ pub mod __cbor_macro {
     impl IntoCborKey for char {
         fn into_cbor_key(self) -> Result<Box<str>, CborError> {
             let mut out = String::new();
-            out.try_reserve_exact(4).map_err(|_| alloc_failed())?;
+            crate::alloc_util::try_reserve_exact_str(&mut out, 4, 0)?;
             out.push(self);
             Ok(out.into_boxed_str())
         }
@@ -388,13 +375,15 @@ pub mod __cbor_macro {
 
     impl IntoCborValue for &String {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::text(self.as_str()))
+            let boxed = boxed_str_from_str(self.as_str())?;
+            Ok(CborValue::text(boxed))
         }
     }
 
     impl IntoCborValue for &str {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
-            Ok(CborValue::text(self))
+            let boxed = boxed_str_from_str(self)?;
+            Ok(CborValue::text(boxed))
         }
     }
 
@@ -431,8 +420,7 @@ pub mod __cbor_macro {
     impl IntoCborValue for &[CborValue] {
         fn into_cbor_value(self) -> Result<CborValue, CborError> {
             let mut out: Vec<CborValue> = Vec::new();
-            out.try_reserve_exact(self.len())
-                .map_err(|_| alloc_failed())?;
+            crate::alloc_util::try_reserve_exact(&mut out, self.len(), 0)?;
             out.extend_from_slice(self);
             Ok(CborValue::array(out))
         }

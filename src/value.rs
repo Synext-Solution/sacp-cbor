@@ -3,8 +3,7 @@ use alloc::vec::Vec;
 
 use crate::encode;
 use crate::profile::{
-    checked_text_len, cmp_text_keys_by_canonical_encoding, validate_bignum_bytes,
-    validate_int_safe_i64,
+    checked_text_len, cmp_text_keys_canonical, validate_bignum_bytes, validate_int_safe_i64,
 };
 use crate::scalar::F64Bits;
 use crate::{CborError, ErrorCode};
@@ -82,7 +81,7 @@ impl CborMap {
         for (k, _) in &entries {
             checked_text_len(k.len()).map_err(|code| CborError::new(code, 0))?;
         }
-        entries.sort_by(|(ka, _), (kb, _)| cmp_text_keys_by_canonical_encoding(ka, kb));
+        entries.sort_by(|(ka, _), (kb, _)| cmp_text_keys_canonical(ka, kb));
 
         for w in entries.windows(2) {
             if w[0].0 == w[1].0 {
@@ -133,7 +132,7 @@ impl CborMap {
     pub fn get(&self, key: &str) -> Option<&CborValue> {
         let idx = self
             .entries
-            .binary_search_by(|(k, _)| cmp_text_keys_by_canonical_encoding(k, key))
+            .binary_search_by(|(k, _)| cmp_text_keys_canonical(k, key))
             .ok()?;
         Some(&self.entries[idx].1)
     }

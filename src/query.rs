@@ -12,7 +12,7 @@ use core::cmp::Ordering;
 
 use crate::canonical::CborBytesRef;
 use crate::parse;
-use crate::profile::{checked_text_len, cmp_text_keys_by_canonical_encoding};
+use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::stream::CborStream;
 use crate::{CborError, ErrorCode};
 
@@ -582,7 +582,7 @@ impl<'a> MapRef<'a> {
         }
 
         let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
 
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
@@ -619,6 +619,20 @@ impl<'a> MapRef<'a> {
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
     pub fn iter(self) -> impl Iterator<Item = Result<(&'a str, CborValueRef<'a>), CborError>> + 'a {
         MapIter {
+            data: self.data,
+            pos: self.entries_start,
+            remaining: self.len,
+        }
+    }
+
+    /// Iterates over `(key, encoded_key_bytes, value)` in canonical order.
+    ///
+    /// The encoded key bytes are the canonical CBOR encoding of the text key.
+    #[cfg(feature = "alloc")]
+    pub(crate) fn iter_encoded(
+        self,
+    ) -> impl Iterator<Item = Result<EncodedMapEntry<'a>, CborError>> + 'a {
+        MapIterEncoded {
             data: self.data,
             pos: self.entries_start,
             remaining: self.len,
@@ -694,7 +708,7 @@ impl<'a> MapRef<'a> {
         for idx in 0..used_keys.len() {
             idxs.push(idx);
         }
-        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(used_keys[i], used_keys[j]));
+        idxs.sort_by(|&i, &j| cmp_text_keys_canonical(used_keys[i], used_keys[j]));
         for w in idxs.windows(2) {
             if used_keys[w[0]] == used_keys[w[1]] {
                 return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
@@ -772,8 +786,11 @@ impl<'a> MapRef<'a> {
         }
 
         // Sort indices by canonical ordering of the corresponding keys.
-        let mut idxs: Vec<usize> = (0..keys.len()).collect();
-        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        let mut idxs = crate::alloc_util::try_vec_with_capacity(keys.len(), self.map_off)?;
+        for i in 0..keys.len() {
+            idxs.push(i);
+        }
+        idxs.sort_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
 
         // Detect duplicate query keys.
         for w in idxs.windows(2) {
@@ -959,7 +976,7 @@ impl CborMap {
         }
 
         let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
 
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
@@ -1001,8 +1018,11 @@ impl CborMap {
             return Ok(());
         }
 
-        let mut idxs: Vec<usize> = (0..keys.len()).collect();
-        idxs.sort_by(|&i, &j| cmp_text_keys_by_canonical_encoding(keys[i], keys[j]));
+        let mut idxs = crate::alloc_util::try_vec_with_capacity(keys.len(), 0)?;
+        for i in 0..keys.len() {
+            idxs.push(i);
+        }
+        idxs.sort_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
 
         for w in idxs.windows(2) {
             if keys[w[0]] == keys[w[1]] {
@@ -1177,7 +1197,7 @@ fn scan_sorted_iter<'a, I, V>(
                 break;
             };
 
-            match cmp_text_keys_by_canonical_encoding(mk, qk) {
+            match cmp_text_keys_canonical(mk, qk) {
                 Ordering::Less => {
                     iter.next();
                 }
@@ -1262,7 +1282,7 @@ fn ensure_strictly_increasing_keys(keys: &[&str], err_off: usize) -> Result<(), 
 
     for &k in keys {
         if let Some(p) = prev {
-            match cmp_text_keys_by_canonical_encoding(p, k) {
+            match cmp_text_keys_canonical(p, k) {
                 Ordering::Less => {}
                 Ordering::Equal | Ordering::Greater => {
                     return Err(CborError::new(ErrorCode::InvalidQuery, err_off));
@@ -1291,14 +1311,12 @@ impl<'a> Iterator for ExtrasIter<'a, '_> {
                 Err(e) => Some(Err(e)),
                 Ok((k, v)) => {
                     while self.idx < self.used.len()
-                        && cmp_text_keys_by_canonical_encoding(self.used[self.idx], k)
-                            == Ordering::Less
+                        && cmp_text_keys_canonical(self.used[self.idx], k) == Ordering::Less
                     {
                         self.idx += 1;
                     }
                     if self.idx < self.used.len()
-                        && cmp_text_keys_by_canonical_encoding(self.used[self.idx], k)
-                            == Ordering::Equal
+                        && cmp_text_keys_canonical(self.used[self.idx], k) == Ordering::Equal
                     {
                         self.idx += 1;
                         continue;
@@ -1347,6 +1365,56 @@ impl<'a> Iterator for MapIter<'a> {
 
         Some(Ok((
             parsed.s,
+            CborValueRef::new(self.data, value_start, end),
+        )))
+    }
+}
+
+#[cfg(feature = "alloc")]
+type EncodedMapEntry<'a> = (&'a str, &'a [u8], CborValueRef<'a>);
+
+#[cfg(feature = "alloc")]
+struct MapIterEncoded<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl<'a> Iterator for MapIterEncoded<'a> {
+    type Item = Result<EncodedMapEntry<'a>, CborError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let key_start = self.pos;
+        let mut s = CborStream::new(self.data, self.pos);
+        let parsed = match read_text(&mut s) {
+            Ok(v) => v,
+            Err(e) => {
+                self.remaining = 0;
+                return Some(Err(e));
+            }
+        };
+        let key_end = s.position();
+
+        let value_start = key_end;
+        let end = match value_end(self.data, value_start) {
+            Ok(e) => e,
+            Err(e) => {
+                self.remaining = 0;
+                return Some(Err(e));
+            }
+        };
+
+        self.pos = end;
+        self.remaining -= 1;
+
+        Some(Ok((
+            parsed.s,
+            &self.data[key_start..key_end],
             CborValueRef::new(self.data, value_start, end),
         )))
     }

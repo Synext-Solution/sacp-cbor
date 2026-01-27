@@ -5,6 +5,8 @@ use crate::profile::{is_strictly_increasing_encoded, validate_bignum_bytes, vali
 use crate::{CborError, DecodeLimits, ErrorCode};
 
 #[cfg(feature = "alloc")]
+use crate::alloc_util::try_reserve;
+#[cfg(feature = "alloc")]
 use crate::scalar::F64Bits;
 #[cfg(feature = "alloc")]
 use crate::value::{BigInt, CborInteger, CborMap, CborValue};
@@ -98,8 +100,9 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[cfg(feature = "alloc")]
-    fn push(&mut self, frame: Frame, _off: usize) -> Result<(), CborError> {
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         if !self.overflow.is_empty() {
+            try_reserve(&mut self.overflow, 1, off)?;
             self.overflow.push(frame);
             return Ok(());
         }
@@ -108,9 +111,10 @@ impl<const N: usize> FrameStack<N> {
             self.inline[idx] = Some(frame);
             self.len = idx
                 .checked_add(1)
-                .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, _off))?;
+                .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
             return Ok(());
         }
+        try_reserve(&mut self.overflow, 1, off)?;
         self.overflow.push(frame);
         Ok(())
     }
@@ -735,7 +739,7 @@ enum BuildFrame {
 
 #[cfg(feature = "alloc")]
 fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, usize), CborError> {
-    use crate::alloc_util::{alloc_failed, try_vec_with_capacity};
+    use crate::alloc_util::try_vec_with_capacity;
 
     let mut p = Parser::new(data, start, None, Mode::Trusted);
     let mut stack: Vec<BuildFrame> = Vec::new();
@@ -795,7 +799,7 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                 if len == 0 {
                     pending = Some(CborValue::array(Vec::new()));
                 } else {
-                    stack.try_reserve(1).map_err(|_| alloc_failed(p.pos))?;
+                    try_reserve(&mut stack, 1, p.pos)?;
                     stack.push(BuildFrame::Array {
                         items: try_vec_with_capacity(len, p.pos)?,
                         remaining: len,
@@ -806,7 +810,7 @@ fn decode_value_trusted_inner(data: &[u8], start: usize) -> Result<(CborValue, u
                 if len == 0 {
                     pending = Some(CborValue::map(CborMap::from_sorted_entries(Vec::new())));
                 } else {
-                    stack.try_reserve(1).map_err(|_| alloc_failed(p.pos))?;
+                    try_reserve(&mut stack, 1, p.pos)?;
                     stack.push(BuildFrame::Map {
                         entries: try_vec_with_capacity(len, p.pos)?,
                         remaining_pairs: len,
