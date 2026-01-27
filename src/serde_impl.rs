@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 use serde::de::{
-    self, Deserialize, DeserializeSeed, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
-    VariantAccess, Visitor,
+    self, Deserialize, DeserializeSeed, EnumAccess, IgnoredAny, IntoDeserializer, MapAccess,
+    SeqAccess, VariantAccess, Visitor,
 };
 use serde::ser::{self, SerializeMap, SerializeSeq, SerializeStruct};
 use serde::Serialize;
@@ -921,6 +921,7 @@ impl<'de> DirectDeserializer<'de> {
         self.pos
     }
 
+    #[inline]
     fn peek_u8(&self) -> Result<u8, DeError> {
         let off = self.pos;
         self.input
@@ -929,6 +930,7 @@ impl<'de> DirectDeserializer<'de> {
             .ok_or_else(|| DeError::new(ErrorCode::UnexpectedEof, off))
     }
 
+    #[inline]
     fn read_u8(&mut self) -> Result<u8, DeError> {
         let off = self.pos;
         let b = *self
@@ -1016,6 +1018,7 @@ impl<'de> DirectDeserializer<'de> {
         }
     }
 
+    #[inline]
     fn read_uint_arg(&mut self, ai: u8, off: usize) -> Result<u64, DeError> {
         match self.mode {
             Mode::Checked => self.read_uint_arg_checked(ai, off),
@@ -1537,15 +1540,22 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
         let ai = ib & 0x1f;
         match major {
             0 => {
-                let v = self.read_uint_arg_checked(ai, off)?;
-                if v > MAX_SAFE_INTEGER {
+                if ai < 24 {
+                    return visitor.visit_u64(u64::from(ai));
+                }
+                let v = self.read_uint_arg(ai, off)?;
+                if self.mode == Mode::Checked && v > MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 visitor.visit_u64(v)
             }
             1 => {
-                let n = self.read_uint_arg_checked(ai, off)?;
-                if n >= MAX_SAFE_INTEGER {
+                if ai < 24 {
+                    let out = -1 - i64::from(ai);
+                    return visitor.visit_i64(out);
+                }
+                let n = self.read_uint_arg(ai, off)?;
+                if self.mode == Mode::Checked && n >= MAX_SAFE_INTEGER {
                     return Err(DeError::new(ErrorCode::IntegerOutsideSafeRange, off));
                 }
                 let v = -1 - i128::from(n);
@@ -1561,12 +1571,12 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
                 visitor.visit_borrowed_str(s)
             }
             4 => {
-                let len = self.read_len_checked(ai, off)?;
+                let len = self.read_len(ai, off)?;
                 let depth_entered = self.enter_array(len, off)?;
                 visitor.visit_seq(DirectSeqAccess::new(self, len, depth_entered))
             }
             5 => {
-                let len = self.read_len_checked(ai, off)?;
+                let len = self.read_len(ai, off)?;
                 let depth_entered = self.enter_map(len, off)?;
                 visitor.visit_map(DirectMapAccess::new(self, len, depth_entered))
             }
@@ -1884,7 +1894,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
         if major != 4 {
             return Err(DeError::new(ErrorCode::ExpectedArray, off));
         }
-        let len = self.read_len_checked(ai, off)?;
+        let len = self.read_len(ai, off)?;
         let depth_entered = self.enter_array(len, off)?;
         visitor.visit_seq(DirectSeqAccess::new(self, len, depth_entered))
     }
@@ -1919,7 +1929,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
         if major != 5 {
             return Err(DeError::new(ErrorCode::ExpectedMap, off));
         }
-        let len = self.read_len_checked(ai, off)?;
+        let len = self.read_len(ai, off)?;
         let depth_entered = self.enter_map(len, off)?;
         visitor.visit_map(DirectMapAccess::new(self, len, depth_entered))
     }
@@ -1960,7 +1970,7 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
                 })
             }
             5 => {
-                let len = self.read_len_checked(ai, off)?;
+                let len = self.read_len(ai, off)?;
                 if len != 1 {
                     return Err(ser_err(off));
                 }
@@ -1992,7 +2002,96 @@ impl<'de> de::Deserializer<'de> for &mut DirectDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        let _ = serde::de::IgnoredAny::deserialize(self)?;
+        struct IgnoreVisitor;
+
+        impl<'de> Visitor<'de> for IgnoreVisitor {
+            type Value = ();
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any SACP-CBOR value")
+            }
+
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_i128<E>(self, _v: i128) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_u128<E>(self, _v: u128) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_borrowed_str<E>(self, _v: &'de str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_borrowed_bytes<E>(self, _v: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(())
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while let Some(_ignored) = seq.next_element::<IgnoredAny>()? {}
+                Ok(())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while let Some((_k, _v)) = map.next_entry::<IgnoredAny, IgnoredAny>()? {}
+                Ok(())
+            }
+        }
+
+        self.deserialize_any(IgnoreVisitor)?;
         visitor.visit_unit()
     }
 }

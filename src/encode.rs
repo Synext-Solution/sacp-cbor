@@ -44,9 +44,6 @@ impl VecSink {
             return Ok(());
         }
         let offset = self.buf.len();
-        let _needed = offset
-            .checked_add(additional)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
         try_reserve(&mut self.buf, additional, offset)
     }
 }
@@ -350,6 +347,10 @@ impl Encoder {
             self.sink.buf.truncate(start);
             return Err(err);
         }
+        if let Err(err) = self.reserve_min_array_items(len) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
         let mut a = ArrayEncoder {
             enc: self,
             remaining: len,
@@ -368,7 +369,8 @@ impl Encoder {
 
     #[cfg(feature = "serde")]
     pub(crate) fn array_header(&mut self, len: usize) -> Result<(), CborError> {
-        encode_major_len(&mut self.sink, 4, len)
+        encode_major_len(&mut self.sink, 4, len)?;
+        self.reserve_min_array_items(len)
     }
 
     /// Encode a definite-length map and fill it via the provided builder.
@@ -382,6 +384,10 @@ impl Encoder {
     {
         let start = self.sink.buf.len();
         if let Err(err) = encode_major_len(&mut self.sink, 5, len) {
+            self.sink.buf.truncate(start);
+            return Err(err);
+        }
+        if let Err(err) = self.reserve_min_map_items(len) {
             self.sink.buf.truncate(start);
             return Err(err);
         }
@@ -404,7 +410,8 @@ impl Encoder {
 
     #[cfg(feature = "serde")]
     pub(crate) fn map_header(&mut self, len: usize) -> Result<(), CborError> {
-        encode_major_len(&mut self.sink, 5, len)
+        encode_major_len(&mut self.sink, 5, len)?;
+        self.reserve_min_map_items(len)
     }
 
     /// Internal hook used by `cbor_bytes!` for `$expr` values.
@@ -415,6 +422,23 @@ impl Encoder {
         T: crate::__cbor_macro::IntoCborBytes,
     {
         crate::__cbor_macro::IntoCborBytes::into_cbor_bytes(v, self)
+    }
+
+    fn reserve_min_array_items(&mut self, len: usize) -> Result<(), CborError> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.sink.reserve(len)
+    }
+
+    fn reserve_min_map_items(&mut self, len: usize) -> Result<(), CborError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let items = len
+            .checked_mul(2)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
+        self.sink.reserve(items)
     }
 }
 

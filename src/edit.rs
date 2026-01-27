@@ -971,7 +971,7 @@ fn emit_patched_array<'a, E: ValueEncoder>(
         }
     }
 
-    ensure_splice_mod_conflicts(mods, &splices)?;
+    ensure_splice_mod_conflicts(mods, &splices, array_off)?;
     let out_len = compute_array_out_len(len, &splices, array_off)?;
 
     enc.array(out_len, |aenc| {
@@ -982,6 +982,7 @@ fn emit_patched_array<'a, E: ValueEncoder>(
 fn ensure_splice_mod_conflicts<'a>(
     mods: &[(usize, Node<'a>)],
     splices: &[ResolvedSplice<'a>],
+    offset: usize,
 ) -> Result<(), CborError> {
     if mods.is_empty() || splices.is_empty() {
         return Ok(());
@@ -991,7 +992,10 @@ fn ensure_splice_mod_conflicts<'a>(
         if splice.delete == 0 {
             continue;
         }
-        let end_idx = splice.start.saturating_add(splice.delete);
+        let end_idx = splice
+            .start
+            .checked_add(splice.delete)
+            .ok_or_else(|| length_overflow(offset))?;
         while mod_idx < mods.len() && mods[mod_idx].0 < splice.start {
             mod_idx += 1;
         }
@@ -1048,7 +1052,9 @@ fn emit_array_items<'a, E: ValueEncoder>(
                             .ok_or_else(|| err(ErrorCode::MalformedCanonical, array_off))??;
                         let _ = item;
                     }
-                    idx = idx.saturating_add(delete);
+                    idx = idx
+                        .checked_add(delete)
+                        .ok_or_else(|| length_overflow(array_off))?;
                     continue;
                 }
             }
@@ -1121,7 +1127,10 @@ fn collect_splices<'a>(
             }
         }
 
-        if splice.delete > len.saturating_sub(start) {
+        let remaining = len
+            .checked_sub(start)
+            .ok_or_else(|| index_out_of_bounds(offset))?;
+        if splice.delete > remaining {
             return Err(index_out_of_bounds(offset));
         }
 

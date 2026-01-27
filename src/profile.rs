@@ -1,3 +1,34 @@
+//! Canonical profile definition for SACP-CBOR/1.
+//!
+//! A byte sequence is **canonical for this crate** iff:
+//!
+//! - It encodes exactly one CBOR data item (no trailing bytes).
+//! - Definite lengths only (no indefinite-length encodings).
+//! - Integers:
+//!   - Major types 0/1 are restricted to safe integers in
+//!     `[-(2^53-1), +(2^53-1)]`.
+//!   - Larger integers must be tags 2/3 bignums with canonical magnitudes:
+//!     non-empty, no leading zero, and *outside* the safe range in the correct direction.
+//! - Bytes (major 2): definite length.
+//! - Text (major 3): definite length, valid UTF-8.
+//! - Arrays/maps (majors 4/5): definite length.
+//! - Maps: keys are text strings, canonical order, and unique.
+//! - Simple values: only `false`, `true`, `null` (major 7, ai 20..=22).
+//! - Floats: only float64 (major 7, ai=27), forbid negative zero, and require the
+//!   canonical NaN bit pattern.
+//!
+//! **Canonical map order** compares the *encoded key bytes* by:
+//! 1) encoded length (shorter first), then
+//! 2) lexicographic byte order.
+//!
+//! For canonical text keys, this is equivalent to comparing `(payload_len, payload_bytes)` because
+//! the canonical header length is a strictly monotone function of the payload length.
+//!
+//! ## Trust boundary
+//! [`CborBytesRef`](crate::CborBytesRef) is the only public witness that a byte slice is canonical.
+//! All canonical-trusted parsing (query/edit/serde trusted mode) assumes this witness was produced
+//! by [`validate_canonical`](crate::validate_canonical) or constructed internally.
+
 use core::cmp::Ordering;
 
 use crate::ErrorCode;

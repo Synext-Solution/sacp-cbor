@@ -45,59 +45,61 @@ impl Frame {
     }
 }
 
+#[cfg(feature = "alloc")]
+struct FrameStack {
+    items: Vec<Frame>,
+}
+
+#[cfg(feature = "alloc")]
+impl FrameStack {
+    fn new() -> Self {
+        Self {
+            items: Vec::with_capacity(INLINE_STACK),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
+        try_reserve(&mut self.items, 1, off)?;
+        self.items.push(frame);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<Frame> {
+        self.items.pop()
+    }
+
+    fn peek(&self) -> Option<Frame> {
+        self.items.last().copied()
+    }
+
+    fn peek_mut(&mut self) -> Option<&mut Frame> {
+        self.items.last_mut()
+    }
+}
+
+#[cfg(not(feature = "alloc"))]
 struct FrameStack<const N: usize> {
     inline: [Option<Frame>; N],
     len: usize,
-    #[cfg(feature = "alloc")]
-    overflow: Vec<Frame>,
 }
 
+#[cfg(not(feature = "alloc"))]
 impl<const N: usize> FrameStack<N> {
     const fn new() -> Self {
         Self {
             inline: [None; N],
             len: 0,
-            #[cfg(feature = "alloc")]
-            overflow: Vec::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        #[cfg(feature = "alloc")]
-        {
-            self.len + self.overflow.len()
-        }
-        #[cfg(not(feature = "alloc"))]
-        {
-            self.len
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 
-    #[cfg(feature = "alloc")]
-    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
-        if !self.overflow.is_empty() {
-            try_reserve(&mut self.overflow, 1, off)?;
-            self.overflow.push(frame);
-            return Ok(());
-        }
-        let idx = self.len;
-        if idx < N {
-            self.inline[idx] = Some(frame);
-            self.len = idx
-                .checked_add(1)
-                .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
-            return Ok(());
-        }
-        try_reserve(&mut self.overflow, 1, off)?;
-        self.overflow.push(frame);
-        Ok(())
-    }
-
-    #[cfg(not(feature = "alloc"))]
     fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         if self.len < N {
             self.inline[self.len] = Some(frame);
@@ -109,12 +111,6 @@ impl<const N: usize> FrameStack<N> {
     }
 
     fn pop(&mut self) -> Option<Frame> {
-        #[cfg(feature = "alloc")]
-        {
-            if let Some(frame) = self.overflow.pop() {
-                return Some(frame);
-            }
-        }
         if self.len == 0 {
             return None;
         }
@@ -123,12 +119,6 @@ impl<const N: usize> FrameStack<N> {
     }
 
     fn peek(&self) -> Option<Frame> {
-        #[cfg(feature = "alloc")]
-        {
-            if let Some(frame) = self.overflow.last() {
-                return Some(*frame);
-            }
-        }
         if self.len == 0 {
             return None;
         }
@@ -136,12 +126,6 @@ impl<const N: usize> FrameStack<N> {
     }
 
     fn peek_mut(&mut self) -> Option<&mut Frame> {
-        #[cfg(feature = "alloc")]
-        {
-            if let Some(frame) = self.overflow.last_mut() {
-                return Some(frame);
-            }
-        }
         if self.len == 0 {
             return None;
         }
@@ -167,6 +151,9 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_value(&mut self) -> Result<usize, CborError> {
+        #[cfg(feature = "alloc")]
+        let mut stack = FrameStack::new();
+        #[cfg(not(feature = "alloc"))]
         let mut stack = FrameStack::<INLINE_STACK>::new();
         stack.push(Frame::Root { remaining: 1 }, self.pos)?;
         let mut depth: usize = 0;

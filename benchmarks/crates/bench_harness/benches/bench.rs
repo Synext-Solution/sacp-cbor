@@ -7,6 +7,7 @@ use bench_harness::adapters::{encode_sacp_stream, Adapter, BenchInput, SacpCbor}
 use bench_harness::datasets::{dataset_root, load_appendix_a, synthetic_datasets};
 use bench_harness::query_edit::sort_map_entries;
 use bench_harness::value::BenchValue;
+use serde::de::IgnoredAny;
 use sacp_cbor::{ArrayPos, PathElem};
 
 #[cfg(feature = "adapter-serde_cbor")]
@@ -29,6 +30,18 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
     out.push(Box::new(Ciborium));
     #[cfg(feature = "adapter-minicbor")]
     out.push(Box::new(Minicbor));
+    #[cfg(feature = "adapter-cbor4ii")]
+    out.push(Box::new(Cbor4ii));
+    out
+}
+
+fn serde_adapters() -> Vec<Box<dyn Adapter>> {
+    let mut out: Vec<Box<dyn Adapter>> = Vec::new();
+    out.push(Box::new(SacpCbor));
+    #[cfg(feature = "adapter-serde_cbor")]
+    out.push(Box::new(SerdeCbor));
+    #[cfg(feature = "adapter-ciborium")]
+    out.push(Box::new(Ciborium));
     #[cfg(feature = "adapter-cbor4ii")]
     out.push(Box::new(Cbor4ii));
     out
@@ -243,8 +256,7 @@ fn bench_decode_canonical_trusted(c: &mut Criterion) {
     group.bench_function("appendix_a_canonical", |b| {
         b.iter(|| {
             for item in appendix {
-                let out: crate::value::BenchValue =
-                    sacp_cbor::from_canonical_bytes_ref(item.as_ref()).unwrap();
+                let out: IgnoredAny = sacp_cbor::from_canonical_bytes_ref(item.as_ref()).unwrap();
                 black_box(out);
             }
         })
@@ -282,7 +294,7 @@ fn bench_encode_stream(c: &mut Criterion) {
 
 fn bench_serde_roundtrip(c: &mut Criterion) {
     let values = synthetic_values_for_run();
-    for adapter in adapters() {
+    for adapter in serde_adapters() {
         let mut group = c.benchmark_group(format!("serde_roundtrip/{}", adapter.name()));
         for (name, value) in values {
             group.bench_with_input(BenchmarkId::new("synthetic", name), value, |b, v| {
@@ -310,10 +322,10 @@ fn bench_synthetic_decode_validated(c: &mut Criterion) {
     }
 }
 
-fn bench_synthetic_decode_trusted(c: &mut Criterion) {
+fn bench_synthetic_query_trusted(c: &mut Criterion) {
     let bytes = synthetic_bytes_for_run();
     for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("decode_synth_trusted/{}", adapter.name()));
+        let mut group = c.benchmark_group(format!("query_synth_trusted/{}", adapter.name()));
         for (name, item) in bytes {
             group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
                 b.iter(|| {
@@ -335,8 +347,7 @@ fn bench_synthetic_decode_canonical_trusted(c: &mut Criterion) {
     for (name, item) in bytes {
         group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
             b.iter(|| {
-                let out: crate::value::BenchValue =
-                    sacp_cbor::from_canonical_bytes_ref(v.as_ref()).unwrap();
+                let out: IgnoredAny = sacp_cbor::from_canonical_bytes_ref(v.as_ref()).unwrap();
                 black_box(out);
             })
         });
@@ -504,17 +515,17 @@ criterion_group! {
     config = criterion_config();
     targets =
         bench_validate,
-        bench_decode_validated,
-        bench_decode_trusted,
-        bench_decode_canonical_trusted,
-        bench_encode,
-        bench_encode_stream,
-        bench_serde_roundtrip,
-        bench_synthetic_decode_validated,
-        bench_synthetic_decode_trusted,
-        bench_synthetic_decode_canonical_trusted,
-        bench_query_path_zero_copy,
-        bench_query_map_get_many_zero_copy,
+    bench_decode_validated,
+    bench_decode_trusted,
+    bench_decode_canonical_trusted,
+    bench_encode,
+    bench_encode_stream,
+    bench_serde_roundtrip,
+    bench_synthetic_decode_validated,
+    bench_synthetic_query_trusted,
+    bench_synthetic_decode_canonical_trusted,
+    bench_query_path_zero_copy,
+    bench_query_map_get_many_zero_copy,
         bench_edit_patch
 }
 criterion_main!(benches);

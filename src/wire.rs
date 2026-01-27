@@ -1,4 +1,3 @@
-#[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::{CborError, ErrorCode};
 
@@ -7,9 +6,6 @@ use crate::alloc_util::try_reserve;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-#[cfg(feature = "alloc")]
-const TRUSTED_INLINE: usize = 64;
-#[cfg(not(feature = "alloc"))]
 const TRUSTED_INLINE: usize = DEFAULT_MAX_DEPTH + 2;
 
 pub fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {

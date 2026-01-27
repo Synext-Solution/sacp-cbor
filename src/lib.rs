@@ -15,6 +15,9 @@
 //!
 //! ## SACP-CBOR/1 profile (explicit)
 //!
+//! **Terminology note:** “canonical” in this crate means **canonical under the strict SACP-CBOR/1
+//! profile** defined here, not RFC 8949 canonical CBOR.
+//!
 //! **Allowed data model**
 //!
 //! - Single CBOR item only (no trailing bytes).

@@ -39,12 +39,7 @@ serde = { version = "1", default-features = false, features = ["alloc", "derive"
 simdutf8 = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
-criterion = "0.8.1"
 proptest = "1"
-
-[[bench]]
-name = "validate"
-harness = false
 
 [package.metadata.docs.rs]
 all-features = true

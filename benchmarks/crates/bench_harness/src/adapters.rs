@@ -1,4 +1,5 @@
 use crate::value::BenchValue;
+use serde::de::IgnoredAny;
 
 pub struct BenchInput<'a> {
     pub bytes: &'a [u8],
@@ -32,7 +33,7 @@ impl Adapter for SacpCbor {
     }
 
     fn decode_discard(&self, bytes: &[u8]) -> Result<(), String> {
-        let _v: BenchValue =
+        let _: IgnoredAny =
             sacp_cbor::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
                 .map_err(|e| format!("{e}"))?;
         Ok(())
@@ -42,7 +43,8 @@ impl Adapter for SacpCbor {
         let canon = input
             .sacp_canon
             .ok_or_else(|| "missing canonical bytes".to_string())?;
-        scan_value_ref(canon.root()).map_err(|e| format!("{e}"))?;
+        let _: IgnoredAny = sacp_cbor::from_canonical_bytes_ref(canon)
+            .map_err(|e| format!("{e}"))?;
         Ok(())
     }
 
@@ -214,44 +216,6 @@ fn to_serde_cbor_value(v: &BenchValue) -> serde_cbor::Value {
                 .collect(),
         ),
     }
-}
-
-fn scan_value_ref(root: sacp_cbor::CborValueRef<'_>) -> Result<(), sacp_cbor::CborError> {
-    let mut stack = vec![root];
-    while let Some(value) = stack.pop() {
-        match value.kind()? {
-            sacp_cbor::CborKind::Null => {}
-            sacp_cbor::CborKind::Bool => {
-                let _ = value.bool()?;
-            }
-            sacp_cbor::CborKind::Float => {
-                let _ = value.float64()?;
-            }
-            sacp_cbor::CborKind::Integer => {
-                let _ = value.integer()?;
-            }
-            sacp_cbor::CborKind::Bytes => {
-                let _ = value.bytes()?;
-            }
-            sacp_cbor::CborKind::Text => {
-                let _ = value.text()?;
-            }
-            sacp_cbor::CborKind::Array => {
-                let array = value.array()?;
-                for item in array.iter() {
-                    stack.push(item?);
-                }
-            }
-            sacp_cbor::CborKind::Map => {
-                let map = value.map()?;
-                for entry in map.iter() {
-                    let (_k, v) = entry?;
-                    stack.push(v);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(feature = "adapter-ciborium")]
