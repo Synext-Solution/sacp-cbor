@@ -1,6 +1,6 @@
 [package]
 name = "sacp-cbor"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -10,6 +10,9 @@ keywords = ["cbor", "canonical", "deterministic", "no_std", "sacp"]
 categories = ["encoding", "no-std"]
 
 repository = "https://github.com/Synext-Solution/sacp-cbor"
+
+[workspace]
+members = ["sacp-cbor-derive"]
 
 [features]
 # Full-featured default for typical server deployments.
@@ -36,6 +39,7 @@ unsafe-utf8 = []
 [dependencies]
 sha2 = { version = "0.10", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+sacp-cbor-derive = { path = "sacp-cbor-derive", version = "0.7.1" }
 simdutf8 = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]

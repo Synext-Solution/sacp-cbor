@@ -65,6 +65,7 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 mod alloc_util;
 mod canonical;
+mod codec;
 mod error;
 mod limits;
 mod parse;
@@ -82,6 +83,7 @@ mod edit;
 mod int;
 
 pub use crate::canonical::{CborBytesRef, EncodedTextKey};
+pub use crate::codec::{decode, decode_canonical, CborDecode, Decoder};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
 pub use crate::parse::{validate, validate_canonical};
@@ -100,6 +102,11 @@ mod value;
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CborBytes;
 #[cfg(feature = "alloc")]
+pub use crate::codec::{
+    decode_canonical_owned, encode_into, encode_to_canonical, encode_to_vec, CborArrayElem,
+    CborEncode, MapEntries,
+};
+#[cfg(feature = "alloc")]
 pub use crate::edit::{
     ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
 };
@@ -116,6 +123,8 @@ pub use crate::serde_impl::{
     from_canonical_bytes, from_canonical_bytes_ref, from_slice, from_slice_borrowed, to_vec,
     DeError,
 };
+
+pub use sacp_cbor_derive::{CborDecode, CborEncode};
 
 /// Construct a path slice for query/edit operations.
 #[macro_export]

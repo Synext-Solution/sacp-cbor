@@ -1,12 +1,12 @@
 use crate::alloc_util::try_reserve;
 use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
-use crate::profile::{
-    is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
-};
+use crate::codec::CborEncode;
+use crate::profile::{cmp_encoded_key_bytes, validate_bignum_bytes, validate_int_safe_i64};
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::{CborError, ErrorCode};
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 trait Sink {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError>;
@@ -110,20 +110,24 @@ fn encode_major_len<S: Sink>(sink: &mut S, major: u8, len: usize) -> Result<(), 
 
 fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(), CborError> {
     debug_assert!(major <= 7);
-    if let Ok(v8) = u8::try_from(value) {
-        if v8 < 24 {
-            return sink.write_u8((major << 5) | v8);
-        }
+    if value < 24 {
+        let v = u8::try_from(value).unwrap();
+        return sink.write_u8((major << 5) | v);
+    }
+    if value <= 0xff {
+        let v = u8::try_from(value).unwrap();
         sink.write_u8((major << 5) | 24)?;
-        return sink.write_u8(v8);
+        return sink.write_u8(v);
     }
-    if let Ok(v16) = u16::try_from(value) {
+    if value <= 0xffff {
+        let v = u16::try_from(value).unwrap();
         sink.write_u8((major << 5) | 25)?;
-        return sink.write(&v16.to_be_bytes());
+        return sink.write(&v.to_be_bytes());
     }
-    if let Ok(v32) = u32::try_from(value) {
+    if value <= 0xffff_ffff {
+        let v = u32::try_from(value).unwrap();
         sink.write_u8((major << 5) | 26)?;
-        return sink.write(&v32.to_be_bytes());
+        return sink.write(&v.to_be_bytes());
     }
     sink.write_u8((major << 5) | 27)?;
     sink.write(&value.to_be_bytes())
@@ -181,6 +185,11 @@ impl Encoder {
         let limits = crate::DecodeLimits::for_bytes(bytes.len());
         crate::validate_canonical(&bytes, limits)?;
         Ok(CborBytes::new_unchecked(bytes))
+    }
+
+    /// Clear the encoder while retaining allocated capacity.
+    pub fn clear(&mut self) {
+        self.sink.buf.clear();
     }
 
     /// Borrow the bytes emitted so far.
@@ -557,6 +566,16 @@ impl ArrayEncoder<'_> {
         self.enc.raw_value_ref(v)
     }
 
+    /// Encode a value using the native `CborEncode` trait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the array length is exceeded or if encoding fails.
+    pub fn value<T: CborEncode>(&mut self, value: &T) -> Result<(), CborError> {
+        self.consume_one()?;
+        value.encode(self.enc)
+    }
+
     /// Encode a nested array.
     ///
     /// # Errors
@@ -697,11 +716,9 @@ impl MapEncoder<'_> {
 }
 
 fn check_map_key_order(prev: &[u8], curr: &[u8], key_start: usize) -> Result<(), CborError> {
-    if prev == curr {
-        return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+    match cmp_encoded_key_bytes(prev, curr) {
+        Ordering::Less => Ok(()),
+        Ordering::Equal => Err(CborError::new(ErrorCode::DuplicateMapKey, key_start)),
+        Ordering::Greater => Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start)),
     }
-    if !is_strictly_increasing_encoded(prev, curr) {
-        return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
-    }
-    Ok(())
 }

@@ -86,8 +86,12 @@ pub enum ErrorCode {
     ExpectedBytes,
     /// Expected a boolean at the current location.
     ExpectedBool,
+    /// Expected a null at the current location.
+    ExpectedNull,
     /// Expected a float64 at the current location.
     ExpectedFloat,
+    /// Expected a CBOR value matching an untagged enum variant.
+    ExpectedEnum,
 
     /// Patch operations overlap or conflict.
     PatchConflict,
@@ -171,7 +175,9 @@ impl fmt::Display for CborError {
             ErrorCode::ExpectedText => "expected CBOR text string",
             ErrorCode::ExpectedBytes => "expected CBOR byte string",
             ErrorCode::ExpectedBool => "expected CBOR bool",
+            ErrorCode::ExpectedNull => "expected CBOR null",
             ErrorCode::ExpectedFloat => "expected CBOR float64",
+            ErrorCode::ExpectedEnum => "expected CBOR enum value",
             ErrorCode::PatchConflict => "patch operations conflict",
             ErrorCode::IndexOutOfBounds => "array index out of bounds",
             ErrorCode::InvalidQuery => "invalid query arguments",
