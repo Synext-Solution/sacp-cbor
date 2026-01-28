@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- Added `sacp-cbor-derive` workspace crate and `#[derive(CborEncode, CborDecode)]`.
+- Optimized skip/query hot paths (inline stack reuse, primitive fast paths, less UTF-8 work in trusted queries).
+- Reduced map-key order check overhead by consolidating comparisons.
+- CI/release fixes: publish derive crate first, robust crates.io version check, and publish metadata cleanup.
+
 ## 0.7.0
 
 - **Breaking:** removed owned value tree APIs and the `cbor!` macro; encoding is streaming-only via `Encoder`/`cbor_bytes!`.
