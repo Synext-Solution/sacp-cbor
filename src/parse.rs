@@ -34,6 +34,7 @@ pub fn validate_canonical(
     Ok(CborBytesRef::new(bytes))
 }
 
+#[cfg(feature = "alloc")]
 pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
     let mut cursor = Cursor::<CborError>::with_pos(data, start);
     let mut items_seen = 0;
