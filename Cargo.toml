@@ -11,9 +11,6 @@ categories = ["encoding", "no-std"]
 
 repository = "https://github.com/Synext-Solution/sacp-cbor"
 
-[workspace]
-members = ["sacp-cbor-derive"]
-
 [features]
 # Full-featured default for typical server deployments.
 default = ["std", "alloc", "sha2"]
