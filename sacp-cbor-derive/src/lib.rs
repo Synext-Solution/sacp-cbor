@@ -20,16 +20,11 @@ struct CborVariantAttr {
     rename: Option<LitStr>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum EnumTagging {
+    #[default]
     Tagged,
     Untagged,
-}
-
-impl Default for EnumTagging {
-    fn default() -> Self {
-        Self::Tagged
-    }
 }
 
 fn ensure_no_cbor_attrs(attrs: &[Attribute], ctx: &str) -> syn::Result<()> {
