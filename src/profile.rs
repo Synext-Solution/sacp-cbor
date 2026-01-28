@@ -131,13 +131,6 @@ pub fn cmp_encoded_key_bytes(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
-/// Returns true iff `prev < curr` under canonical CBOR ordering (by encoded bytes).
-#[inline]
-#[must_use]
-pub fn is_strictly_increasing_encoded(prev: &[u8], curr: &[u8]) -> bool {
-    cmp_encoded_key_bytes(prev, curr) == Ordering::Less
-}
-
 /// Compare two UTF-8 text keys by SACP-CBOR/1 canonical map ordering.
 ///
 /// For SACP-CBOR/1 maps, keys are restricted to CBOR text strings. Canonical map ordering is defined

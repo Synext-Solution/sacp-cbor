@@ -1,13 +1,12 @@
 use crate::alloc_util::try_reserve;
 use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
 use crate::codec::CborEncode;
-use crate::profile::{
-    is_strictly_increasing_encoded, validate_bignum_bytes, validate_int_safe_i64,
-};
+use crate::profile::{cmp_encoded_key_bytes, validate_bignum_bytes, validate_int_safe_i64};
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::{CborError, ErrorCode};
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 trait Sink {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError>;
@@ -717,11 +716,9 @@ impl MapEncoder<'_> {
 }
 
 fn check_map_key_order(prev: &[u8], curr: &[u8], key_start: usize) -> Result<(), CborError> {
-    if prev == curr {
-        return Err(CborError::new(ErrorCode::DuplicateMapKey, key_start));
+    match cmp_encoded_key_bytes(prev, curr) {
+        Ordering::Less => Ok(()),
+        Ordering::Equal => Err(CborError::new(ErrorCode::DuplicateMapKey, key_start)),
+        Ordering::Greater => Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start)),
     }
-    if !is_strictly_increasing_encoded(prev, curr) {
-        return Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start));
-    }
-    Ok(())
 }

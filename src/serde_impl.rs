@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::canonical::{CborBytes, CborBytesRef};
 use crate::encode::Encoder;
 use crate::profile::{
-    is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
+    cmp_encoded_key_bytes, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
@@ -31,13 +31,16 @@ fn check_map_key_order(
         let buf = enc.as_bytes();
         let prev = &buf[ps..pe];
         let curr = &buf[key_start..key_end];
-        if prev == curr {
-            enc.truncate(entry_start);
-            return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
-        }
-        if !is_strictly_increasing_encoded(prev, curr) {
-            enc.truncate(entry_start);
-            return Err(SerdeError::with_code(ErrorCode::NonCanonicalMapOrder));
+        match cmp_encoded_key_bytes(prev, curr) {
+            core::cmp::Ordering::Less => {}
+            core::cmp::Ordering::Equal => {
+                enc.truncate(entry_start);
+                return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
+            }
+            core::cmp::Ordering::Greater => {
+                enc.truncate(entry_start);
+                return Err(SerdeError::with_code(ErrorCode::NonCanonicalMapOrder));
+            }
         }
     }
     Ok(())
@@ -1128,11 +1131,14 @@ impl<'de, const CHECKED: bool> DirectDeserializer<'de, CHECKED> {
             if let Some((ps, pe)) = *prev_key_range {
                 let prev = &self.input[ps..pe];
                 let curr = &self.input[key_start..key_end];
-                if prev == curr {
-                    return Err(DeError::new(ErrorCode::DuplicateMapKey, key_start));
-                }
-                if !is_strictly_increasing_encoded(prev, curr) {
-                    return Err(DeError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+                match cmp_encoded_key_bytes(prev, curr) {
+                    core::cmp::Ordering::Less => {}
+                    core::cmp::Ordering::Equal => {
+                        return Err(DeError::new(ErrorCode::DuplicateMapKey, key_start));
+                    }
+                    core::cmp::Ordering::Greater => {
+                        return Err(DeError::new(ErrorCode::NonCanonicalMapOrder, key_start));
+                    }
                 }
             }
             *prev_key_range = Some((key_start, key_end));

@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use core::marker::PhantomData;
 
 #[cfg(feature = "alloc")]
@@ -8,7 +9,7 @@ use core::alloc::Layout;
 #[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::{
-    is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
+    cmp_encoded_key_bytes, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
 use crate::utf8;
 use crate::{CborError, DecodeLimits, ErrorCode};
@@ -274,11 +275,10 @@ pub fn check_map_key_order<E: DecodeError>(
     if let Some((ps, pe)) = *prev_key_range {
         let prev = &data[ps..pe];
         let curr = &data[key_start..key_end];
-        if prev == curr {
-            return Err(E::new(ErrorCode::DuplicateMapKey, key_start));
-        }
-        if !is_strictly_increasing_encoded(prev, curr) {
-            return Err(E::new(ErrorCode::NonCanonicalMapOrder, key_start));
+        match cmp_encoded_key_bytes(prev, curr) {
+            Ordering::Less => {}
+            Ordering::Equal => return Err(E::new(ErrorCode::DuplicateMapKey, key_start)),
+            Ordering::Greater => return Err(E::new(ErrorCode::NonCanonicalMapOrder, key_start)),
         }
     }
     *prev_key_range = Some((key_start, key_end));
@@ -287,9 +287,6 @@ pub fn check_map_key_order<E: DecodeError>(
 
 #[derive(Clone, Copy)]
 enum Frame {
-    Root {
-        remaining: usize,
-    },
     Array {
         remaining: usize,
     },
@@ -301,20 +298,25 @@ enum Frame {
 }
 
 impl Frame {
-    const fn is_container(self) -> bool {
-        matches!(self, Self::Array { .. } | Self::Map { .. })
-    }
-
-    const fn is_done(self) -> bool {
+    #[inline]
+    const fn is_done(&self) -> bool {
         match self {
-            Self::Root { remaining } | Self::Array { remaining } => remaining == 0,
+            Self::Array { remaining } => *remaining == 0,
             Self::Map {
                 remaining_pairs,
                 expecting_key,
                 ..
-            } => remaining_pairs == 0 && expecting_key,
+            } => *remaining_pairs == 0 && *expecting_key,
         }
     }
+}
+
+trait StackOps {
+    fn is_empty(&self) -> bool;
+    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E>;
+    fn pop(&mut self) -> Option<Frame>;
+    fn peek(&self) -> Option<&Frame>;
+    fn peek_mut(&mut self) -> Option<&mut Frame>;
 }
 
 #[cfg(feature = "alloc")]
@@ -331,16 +333,26 @@ struct FrameStack {
 impl FrameStack {
     const fn new() -> Self {
         Self {
-            inline: [Frame::Root { remaining: 0 }; INLINE_FRAMES],
+            inline: [Frame::Array { remaining: 0 }; INLINE_FRAMES],
             len: 0,
             heap: None,
         }
     }
 
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+        if let Some(items) = &mut self.heap {
+            items.clear();
+        }
+    }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         self.heap.as_ref().map_or(self.len == 0, Vec::is_empty)
     }
 
+    #[inline]
     fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
         match &mut self.heap {
             Some(items) => {
@@ -363,6 +375,7 @@ impl FrameStack {
         Ok(())
     }
 
+    #[inline]
     fn pop(&mut self) -> Option<Frame> {
         match &mut self.heap {
             Some(items) => items.pop(),
@@ -377,18 +390,61 @@ impl FrameStack {
         }
     }
 
-    fn peek(&self) -> Option<Frame> {
-        self.heap.as_ref().map_or_else(
-            || self.len.checked_sub(1).map(|i| self.inline[i]),
-            |items| items.last().copied(),
-        )
+    #[inline]
+    #[allow(clippy::option_if_let_else)]
+    fn peek(&self) -> Option<&Frame> {
+        match &self.heap {
+            Some(items) => items.last(),
+            None => {
+                if self.len == 0 {
+                    None
+                } else {
+                    Some(&self.inline[self.len - 1])
+                }
+            }
+        }
     }
 
+    #[inline]
     fn peek_mut(&mut self) -> Option<&mut Frame> {
         match &mut self.heap {
             Some(items) => items.last_mut(),
-            None => self.len.checked_sub(1).map(|i| &mut self.inline[i]),
+            None => {
+                if self.len == 0 {
+                    None
+                } else {
+                    Some(&mut self.inline[self.len - 1])
+                }
+            }
         }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl StackOps for FrameStack {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+
+    #[inline]
+    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+        Self::push(self, frame, off)
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Frame> {
+        Self::pop(self)
+    }
+
+    #[inline]
+    fn peek(&self) -> Option<&Frame> {
+        Self::peek(self)
+    }
+
+    #[inline]
+    fn peek_mut(&mut self) -> Option<&mut Frame> {
+        Self::peek_mut(self)
     }
 }
 
@@ -426,10 +482,17 @@ impl<const N: usize> FrameStack<N> {
         }
     }
 
+    #[inline]
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
         if self.len < N {
             self.inline[self.len] = Some(frame);
@@ -440,6 +503,7 @@ impl<const N: usize> FrameStack<N> {
         }
     }
 
+    #[inline]
     fn pop(&mut self) -> Option<Frame> {
         if self.len == 0 {
             return None;
@@ -448,18 +512,74 @@ impl<const N: usize> FrameStack<N> {
         self.inline[self.len].take()
     }
 
-    fn peek(&self) -> Option<Frame> {
+    #[inline]
+    fn peek(&self) -> Option<&Frame> {
         if self.len == 0 {
             return None;
         }
-        self.inline[self.len - 1]
+        self.inline[self.len - 1].as_ref()
     }
 
+    #[inline]
     fn peek_mut(&mut self) -> Option<&mut Frame> {
         if self.len == 0 {
             return None;
         }
         self.inline[self.len - 1].as_mut()
+    }
+}
+
+#[cfg(not(feature = "alloc"))]
+impl<const N: usize> StackOps for FrameStack<N> {
+    #[inline]
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+
+    #[inline]
+    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+        Self::push(self, frame, off)
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Frame> {
+        Self::pop(self)
+    }
+
+    #[inline]
+    fn peek(&self) -> Option<&Frame> {
+        Self::peek(self)
+    }
+
+    #[inline]
+    fn peek_mut(&mut self) -> Option<&mut Frame> {
+        Self::peek_mut(self)
+    }
+}
+
+#[cfg(feature = "alloc")]
+pub struct SkipScratch {
+    stack: FrameStack,
+}
+
+#[cfg(not(feature = "alloc"))]
+pub struct SkipScratch {
+    stack: FrameStack<INLINE_STACK>,
+}
+
+impl SkipScratch {
+    #[cfg(feature = "alloc")]
+    pub(crate) const fn new() -> Self {
+        Self {
+            stack: FrameStack::new(),
+        }
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    pub(crate) const fn new() -> Self {
+        Self {
+            stack: FrameStack::<INLINE_STACK>::new(),
+        }
     }
 }
 
@@ -503,7 +623,7 @@ fn ensure_depth<E: DecodeError>(
 #[inline]
 fn consume_value<E: DecodeError>(frame: &mut Frame, off: usize) -> Result<(), E> {
     match frame {
-        Frame::Root { remaining } | Frame::Array { remaining } => {
+        Frame::Array { remaining } => {
             *remaining = remaining
                 .checked_sub(1)
                 .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, off))?;
@@ -526,48 +646,149 @@ fn consume_value<E: DecodeError>(frame: &mut Frame, off: usize) -> Result<(), E>
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn skip_one_value<const CHECKED: bool, E: DecodeError>(
+#[inline]
+fn skip_primitive<const CHECKED: bool, E: DecodeError>(
+    cursor: &mut Cursor<'_, E>,
+    limits: Option<&DecodeLimits>,
+    items_seen: &mut usize,
+    next_depth: usize,
+    off: usize,
+    major: u8,
+    ai: u8,
+) -> Result<Option<Frame>, E> {
+    match major {
+        0 => {
+            let v = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
+            if CHECKED && v > MAX_SAFE_INTEGER {
+                return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
+            }
+            Ok(None)
+        }
+        1 => {
+            let n = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
+            if CHECKED && n >= MAX_SAFE_INTEGER {
+                return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
+            }
+            Ok(None)
+        }
+        2 => {
+            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            if let Some(limits) = limits {
+                if len > limits.max_bytes_len {
+                    return Err(E::new(ErrorCode::BytesLenLimitExceeded, off));
+                }
+            }
+            let _ = cursor.read_exact(len)?;
+            Ok(None)
+        }
+        3 => {
+            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            if let Some(limits) = limits {
+                if len > limits.max_text_len {
+                    return Err(E::new(ErrorCode::TextLenLimitExceeded, off));
+                }
+            }
+            let bytes = cursor.read_exact(len)?;
+            if CHECKED {
+                utf8::validate(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?;
+            }
+            Ok(None)
+        }
+        4 => {
+            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            if let Some(limits) = limits {
+                if len > limits.max_array_len {
+                    return Err(E::new(ErrorCode::ArrayLenLimitExceeded, off));
+                }
+            }
+            bump_items::<E>(limits, items_seen, len, off)?;
+            ensure_depth::<E>(limits, next_depth, off)?;
+            if len == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(Frame::Array { remaining: len }))
+            }
+        }
+        5 => {
+            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            if let Some(limits) = limits {
+                if len > limits.max_map_len {
+                    return Err(E::new(ErrorCode::MapLenLimitExceeded, off));
+                }
+            }
+            let items = len
+                .checked_mul(2)
+                .ok_or_else(|| E::new(ErrorCode::LengthOverflow, off))?;
+            bump_items::<E>(limits, items_seen, items, off)?;
+            ensure_depth::<E>(limits, next_depth, off)?;
+            if len == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(Frame::Map {
+                    remaining_pairs: len,
+                    expecting_key: true,
+                    prev_key_range: None,
+                }))
+            }
+        }
+        6 => {
+            let _ = parse_bignum::<CHECKED, E>(cursor, limits, off, ai)?;
+            Ok(None)
+        }
+        7 => {
+            match ai {
+                20..=22 => {}
+                27 => {
+                    let bits = cursor.read_be_u64()?;
+                    validate_f64_bits(bits).map_err(|code| E::new(code, off))?;
+                }
+                24 => {
+                    let simple = cursor.read_u8()?;
+                    if simple < 24 {
+                        return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+                    }
+                    return Err(E::new(ErrorCode::UnsupportedSimpleValue, off));
+                }
+                28..=30 => return Err(E::new(ErrorCode::ReservedAdditionalInfo, off)),
+                _ => return Err(E::new(ErrorCode::UnsupportedSimpleValue, off)),
+            }
+            Ok(None)
+        }
+        _ => Err(E::new(ErrorCode::MalformedCanonical, off)),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
     cursor: &mut Cursor<'_, E>,
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     base_depth: usize,
+    stack: &mut S,
 ) -> Result<(), E> {
-    #[cfg(feature = "alloc")]
-    let mut stack = FrameStack::new();
-    #[cfg(not(feature = "alloc"))]
-    let mut stack = FrameStack::<INLINE_STACK>::new();
-
-    stack.push(Frame::Root { remaining: 1 }, cursor.position())?;
     let mut local_depth: usize = 0;
+    let mut started = false;
 
     loop {
         loop {
-            let done = match stack.peek() {
-                Some(frame) => frame.is_done(),
-                None => return Ok(()),
-            };
-            if !done {
+            let Some(frame) = stack.peek() else { break };
+            if !frame.is_done() {
                 break;
             }
-            let popped = stack
+            let _ = stack
                 .pop()
                 .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, cursor.position()))?;
-            if popped.is_container() {
-                local_depth = local_depth.saturating_sub(1);
-            }
-            if stack.is_empty() {
+            local_depth = local_depth.saturating_sub(1);
+            if stack.is_empty() && started {
                 return Ok(());
             }
         }
 
-        let expecting_key = matches!(
-            stack.peek(),
-            Some(Frame::Map {
-                expecting_key: true,
-                ..
-            })
-        );
-        if expecting_key {
+        if let Some(Frame::Map {
+            expecting_key: true,
+            ..
+        }) = stack.peek()
+        {
             let frame = stack
                 .peek_mut()
                 .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, cursor.position()))?;
@@ -587,7 +808,17 @@ pub fn skip_one_value<const CHECKED: bool, E: DecodeError>(
             if major != 3 {
                 return Err(E::new(ErrorCode::MapKeyMustBeText, key_start));
             }
-            let _ = parse_text_from_header::<CHECKED, E>(cursor, limits, key_start, ai)?;
+            if CHECKED {
+                let _ = parse_text_from_header::<CHECKED, E>(cursor, limits, key_start, ai)?;
+            } else {
+                let len = read_len::<CHECKED, E>(cursor, ai, key_start)?;
+                if let Some(limits) = limits {
+                    if len > limits.max_text_len {
+                        return Err(E::new(ErrorCode::TextLenLimitExceeded, key_start));
+                    }
+                }
+                let _ = cursor.read_exact(len)?;
+            }
             let key_end = cursor.position();
 
             if CHECKED {
@@ -603,109 +834,51 @@ pub fn skip_one_value<const CHECKED: bool, E: DecodeError>(
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
-        let mut new_frame: Option<Frame> = None;
+        let next_depth = base_depth + local_depth + 1;
+        let new_frame =
+            skip_primitive::<CHECKED, E>(cursor, limits, items_seen, next_depth, off, major, ai)?;
+        started = true;
 
-        match major {
-            0 => {
-                let v = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
-                if CHECKED && v > MAX_SAFE_INTEGER {
-                    return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
-                }
-            }
-            1 => {
-                let n = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
-                if CHECKED && n >= MAX_SAFE_INTEGER {
-                    return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
-                }
-            }
-            2 => {
-                let len = read_len::<CHECKED, E>(cursor, ai, off)?;
-                if let Some(limits) = limits {
-                    if len > limits.max_bytes_len {
-                        return Err(E::new(ErrorCode::BytesLenLimitExceeded, off));
-                    }
-                }
-                let _ = cursor.read_exact(len)?;
-            }
-            3 => {
-                let len = read_len::<CHECKED, E>(cursor, ai, off)?;
-                if let Some(limits) = limits {
-                    if len > limits.max_text_len {
-                        return Err(E::new(ErrorCode::TextLenLimitExceeded, off));
-                    }
-                }
-                let bytes = cursor.read_exact(len)?;
-                if CHECKED {
-                    utf8::validate(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?;
-                } else {
-                    utf8::trusted(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?;
-                }
-            }
-            4 => {
-                let len = read_len::<CHECKED, E>(cursor, ai, off)?;
-                if let Some(limits) = limits {
-                    if len > limits.max_array_len {
-                        return Err(E::new(ErrorCode::ArrayLenLimitExceeded, off));
-                    }
-                }
-                bump_items::<E>(limits, items_seen, len, off)?;
-                ensure_depth::<E>(limits, base_depth + local_depth + 1, off)?;
-                if len > 0 {
-                    new_frame = Some(Frame::Array { remaining: len });
-                }
-            }
-            5 => {
-                let len = read_len::<CHECKED, E>(cursor, ai, off)?;
-                if let Some(limits) = limits {
-                    if len > limits.max_map_len {
-                        return Err(E::new(ErrorCode::MapLenLimitExceeded, off));
-                    }
-                }
-                let items = len
-                    .checked_mul(2)
-                    .ok_or_else(|| E::new(ErrorCode::LengthOverflow, off))?;
-                bump_items::<E>(limits, items_seen, items, off)?;
-                ensure_depth::<E>(limits, base_depth + local_depth + 1, off)?;
-                if len > 0 {
-                    new_frame = Some(Frame::Map {
-                        remaining_pairs: len,
-                        expecting_key: true,
-                        prev_key_range: None,
-                    });
-                }
-            }
-            6 => {
-                let _ = parse_bignum::<CHECKED, E>(cursor, limits, off, ai)?;
-            }
-            7 => match ai {
-                20..=22 => {}
-                27 => {
-                    let bits = cursor.read_be_u64()?;
-                    validate_f64_bits(bits).map_err(|code| E::new(code, off))?;
-                }
-                24 => {
-                    let simple = cursor.read_u8()?;
-                    if simple < 24 {
-                        return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
-                    }
-                    return Err(E::new(ErrorCode::UnsupportedSimpleValue, off));
-                }
-                28..=30 => return Err(E::new(ErrorCode::ReservedAdditionalInfo, off)),
-                _ => return Err(E::new(ErrorCode::UnsupportedSimpleValue, off)),
-            },
-            _ => return Err(E::new(ErrorCode::MalformedCanonical, off)),
+        if let Some(frame) = stack.peek_mut() {
+            consume_value::<E>(frame, off)?;
+        } else if new_frame.is_none() {
+            return Ok(());
         }
-
-        let frame = stack
-            .peek_mut()
-            .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, cursor.position()))?;
-        consume_value::<E>(frame, off)?;
 
         if let Some(frame) = new_frame {
             stack.push::<E>(frame, off)?;
-            if frame.is_container() {
-                local_depth = local_depth.saturating_add(1);
-            }
+            local_depth = local_depth.saturating_add(1);
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn skip_one_value<const CHECKED: bool, E: DecodeError>(
+    cursor: &mut Cursor<'_, E>,
+    limits: Option<&DecodeLimits>,
+    items_seen: &mut usize,
+    base_depth: usize,
+) -> Result<(), E> {
+    #[cfg(feature = "alloc")]
+    let mut stack = FrameStack::new();
+    #[cfg(not(feature = "alloc"))]
+    let mut stack = FrameStack::<INLINE_STACK>::new();
+    skip_one_value_inner::<CHECKED, E, _>(cursor, limits, items_seen, base_depth, &mut stack)
+}
+
+pub fn skip_one_value_with_scratch<const CHECKED: bool, E: DecodeError>(
+    cursor: &mut Cursor<'_, E>,
+    limits: Option<&DecodeLimits>,
+    items_seen: &mut usize,
+    base_depth: usize,
+    scratch: &mut SkipScratch,
+) -> Result<(), E> {
+    scratch.stack.clear();
+    skip_one_value_inner::<CHECKED, E, _>(
+        cursor,
+        limits,
+        items_seen,
+        base_depth,
+        &mut scratch.stack,
+    )
 }
