@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
 
-use bench_harness::adapters::{encode_sacp_stream, Adapter, BenchInput, SacpCbor};
+use bench_harness::adapters::{encode_sacp_stream, Adapter, SacpCbor};
 use bench_harness::datasets::{dataset_root, load_appendix_a, synthetic_datasets};
 use bench_harness::query_edit::sort_map_entries;
 use bench_harness::value::{BenchValue, BenchValueBorrowed, BenchValueNative};
@@ -30,18 +33,6 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
     out.push(Box::new(Ciborium));
     #[cfg(feature = "adapter-minicbor")]
     out.push(Box::new(Minicbor));
-    #[cfg(feature = "adapter-cbor4ii")]
-    out.push(Box::new(Cbor4ii));
-    out
-}
-
-fn serde_adapters() -> Vec<Box<dyn Adapter>> {
-    let mut out: Vec<Box<dyn Adapter>> = Vec::new();
-    out.push(Box::new(SacpCbor));
-    #[cfg(feature = "adapter-serde_cbor")]
-    out.push(Box::new(SerdeCbor));
-    #[cfg(feature = "adapter-ciborium")]
-    out.push(Box::new(Ciborium));
     #[cfg(feature = "adapter-cbor4ii")]
     out.push(Box::new(Cbor4ii));
     out
@@ -84,12 +75,7 @@ fn synthetic_values_fast() -> &'static Vec<(String, BenchValue)> {
     SYNTHETIC_VALUES_FAST.get_or_init(|| {
         synthetic_values()
             .iter()
-            .filter(|(name, _)| {
-                matches!(
-                    name.as_str(),
-                    "map_k16_i64" | "array_len256_bool"
-                )
-            })
+            .filter(|(name, _)| matches!(name.as_str(), "map_k16_i64" | "array_len256_bool"))
             .cloned()
             .collect()
     })
@@ -107,7 +93,7 @@ fn synthetic_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::C
     values
         .iter()
         .map(|(name, v)| {
-            let bytes = SacpCbor.encode(v).expect("encode synthetic value");
+            let bytes = encode_sacp_stream(v).expect("encode synthetic value");
             let canon = sacp_cbor::CborBytes::from_vec_default_limits(bytes)
                 .expect("synthetic bytes must be canonical");
             (name.clone(), canon)
@@ -125,7 +111,10 @@ fn synthetic_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CborBytes)> {
 
 fn build_nested_doc(items_len: usize, values_len: usize) -> BenchValue {
     let mut meta = vec![
-        ("flags".to_string(), BenchValue::Array(vec![BenchValue::Bool(true), BenchValue::Bool(false)])),
+        (
+            "flags".to_string(),
+            BenchValue::Array(vec![BenchValue::Bool(true), BenchValue::Bool(false)]),
+        ),
         ("owner".to_string(), BenchValue::Text("alice".to_string())),
         ("version".to_string(), BenchValue::Int(1)),
     ];
@@ -184,10 +173,9 @@ fn query_edit_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::
     values
         .iter()
         .map(|(name, v)| {
-            let bytes = SacpCbor.encode(v).expect("encode query/edit value");
-            let canon =
-                sacp_cbor::CborBytes::from_vec_default_limits(bytes)
-                    .expect("query/edit bytes must be canonical");
+            let bytes = encode_sacp_stream(v).expect("encode query/edit value");
+            let canon = sacp_cbor::CborBytes::from_vec_default_limits(bytes)
+                .expect("query/edit bytes must be canonical");
             (name.clone(), canon)
         })
         .collect()
@@ -201,14 +189,17 @@ fn query_edit_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CborBytes)> {
     }
 }
 
-fn bench_validate(c: &mut Criterion) {
+fn bench_appendix_decode_ignored(c: &mut Criterion) {
     let appendix = load_appendix_canonical();
+    let total: u64 = appendix.iter().map(|b| b.as_bytes().len() as u64).sum();
+
     for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("validate/{}", adapter.name()));
+        let mut group = c.benchmark_group(format!("decode_ignored/appendix_a/{}", adapter.name()));
+        group.throughput(Throughput::Bytes(total));
         group.bench_function("appendix_a_canonical", |b| {
             b.iter(|| {
                 for item in appendix {
-                    adapter.validate(black_box(item.as_bytes())).unwrap();
+                    adapter.decode_ignored(black_box(item.as_bytes())).unwrap();
                 }
             })
         });
@@ -216,43 +207,29 @@ fn bench_validate(c: &mut Criterion) {
     }
 }
 
-fn bench_decode_validated(c: &mut Criterion) {
+fn bench_appendix_validate_only_sacp(c: &mut Criterion) {
     let appendix = load_appendix_canonical();
-    for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("decode_validated/{}", adapter.name()));
-        group.bench_function("appendix_a_canonical", |b| {
-            b.iter(|| {
-                for item in appendix {
-                    adapter.decode_discard(black_box(item.as_bytes())).unwrap();
-                }
-            })
-        });
-        group.finish();
-    }
-}
+    let total: u64 = appendix.iter().map(|b| b.as_bytes().len() as u64).sum();
 
-fn bench_decode_trusted(c: &mut Criterion) {
-    let appendix = load_appendix_canonical();
-    for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("decode_trusted/{}", adapter.name()));
-        group.bench_function("appendix_a_canonical", |b| {
-            b.iter(|| {
-                for item in appendix {
-                    let input = BenchInput {
-                        bytes: item.as_bytes(),
-                        sacp_canon: Some(item.as_ref()),
-                    };
-                    adapter.decode_discard_trusted(black_box(&input)).unwrap();
-                }
-            })
-        });
-        group.finish();
-    }
+    let mut group = c.benchmark_group("validate_only/appendix_a/sacp-cbor");
+    group.throughput(Throughput::Bytes(total));
+    group.bench_function("appendix_a_canonical", |b| {
+        b.iter(|| {
+            for item in appendix {
+                sacp_cbor::validate(
+                    black_box(item.as_bytes()),
+                    sacp_cbor::DecodeLimits::for_bytes(item.as_bytes().len()),
+                )
+                .unwrap();
+            }
+        })
+    });
+    group.finish();
 }
 
 fn bench_decode_canonical_trusted(c: &mut Criterion) {
     let appendix = load_appendix_canonical();
-    let mut group = c.benchmark_group("decode_canonical_trusted/sacp-cbor");
+    let mut group = c.benchmark_group("decode_canonical_trusted/appendix_a/sacp-cbor");
     group.bench_function("appendix_a_canonical", |b| {
         b.iter(|| {
             for item in appendix {
@@ -264,14 +241,86 @@ fn bench_decode_canonical_trusted(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_encode(c: &mut Criterion) {
-    let values = synthetic_values_for_run();
+fn bench_synth_decode_ignored(c: &mut Criterion) {
+    let bytes = synthetic_bytes_for_run();
     for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("encode/{}", adapter.name()));
+        let mut group = c.benchmark_group(format!("decode_ignored/synth/{}", adapter.name()));
+        for (name, item) in bytes {
+            group.throughput(Throughput::Bytes(item.as_bytes().len() as u64));
+            group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
+                b.iter(|| adapter.decode_ignored(black_box(v.as_bytes())).unwrap())
+            });
+        }
+        group.finish();
+    }
+}
+
+fn bench_synth_decode_value(c: &mut Criterion) {
+    let bytes = synthetic_bytes_for_run();
+    for adapter in adapters() {
+        let mut group = c.benchmark_group(format!("decode_value/synth/{}", adapter.name()));
+        for (name, item) in bytes {
+            group.throughput(Throughput::Bytes(item.as_bytes().len() as u64));
+            group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
+                b.iter(|| {
+                    let out = adapter
+                        .decode_bench_value(black_box(v.as_bytes()))
+                        .unwrap();
+                    black_box(out);
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
+fn bench_encode_value(c: &mut Criterion) {
+    let values = synthetic_values_for_run();
+
+    let lens: HashMap<&str, u64> = synthetic_bytes_for_run()
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_bytes().len() as u64))
+        .collect();
+
+    for adapter in adapters() {
+        let mut group = c.benchmark_group(format!("encode_value/synth/{}", adapter.name()));
         for (name, value) in values {
+            if let Some(len) = lens.get(name.as_str()) {
+                group.throughput(Throughput::Bytes(*len));
+            }
             group.bench_with_input(BenchmarkId::new("synthetic", name), value, |b, v| {
                 b.iter(|| {
-                    let _ = adapter.encode(black_box(v)).unwrap();
+                    let bytes = adapter.encode_bench_value(black_box(v)).unwrap();
+                    black_box(bytes);
+                })
+            });
+        }
+        group.finish();
+    }
+}
+
+fn bench_roundtrip_value(c: &mut Criterion) {
+    let values = synthetic_values_for_run();
+
+    let lens: HashMap<&str, u64> = synthetic_bytes_for_run()
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_bytes().len() as u64))
+        .collect();
+
+    for adapter in adapters() {
+        let mut group = c.benchmark_group(format!("roundtrip_value/synth/{}", adapter.name()));
+        for (name, value) in values {
+            if let Some(len) = lens.get(name.as_str()) {
+                group.throughput(Throughput::Bytes(*len));
+            }
+            group.bench_with_input(BenchmarkId::new("synthetic", name), value, |b, v| {
+                b.iter(|| {
+                    let bytes = adapter.encode_bench_value(black_box(v)).unwrap();
+                    let out = adapter
+                        .decode_bench_value(black_box(bytes.as_slice()))
+                        .unwrap();
+                    black_box(out);
+                    black_box(bytes);
                 })
             });
         }
@@ -285,26 +334,12 @@ fn bench_encode_stream(c: &mut Criterion) {
     for (name, value) in values {
         group.bench_with_input(BenchmarkId::new("synthetic", name), value, |b, v| {
             b.iter(|| {
-                let _ = encode_sacp_stream(black_box(v)).unwrap();
+                let bytes = encode_sacp_stream(black_box(v)).unwrap();
+                black_box(bytes);
             })
         });
     }
     group.finish();
-}
-
-fn bench_serde_roundtrip(c: &mut Criterion) {
-    let values = synthetic_values_for_run();
-    for adapter in serde_adapters() {
-        let mut group = c.benchmark_group(format!("serde_roundtrip/{}", adapter.name()));
-        for (name, value) in values {
-            group.bench_with_input(BenchmarkId::new("synthetic", name), value, |b, v| {
-                b.iter(|| {
-                    adapter.serde_roundtrip(black_box(v)).unwrap();
-                })
-            });
-        }
-        group.finish();
-    }
 }
 
 fn bench_native_roundtrip(c: &mut Criterion) {
@@ -337,40 +372,6 @@ fn bench_native_decode_borrowed(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_synthetic_decode_validated(c: &mut Criterion) {
-    let bytes = synthetic_bytes_for_run();
-    for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("decode_synth_validated/{}", adapter.name()));
-        for (name, item) in bytes {
-            group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
-                b.iter(|| {
-                    adapter.decode_discard(black_box(v.as_bytes())).unwrap();
-                })
-            });
-        }
-        group.finish();
-    }
-}
-
-fn bench_synthetic_query_trusted(c: &mut Criterion) {
-    let bytes = synthetic_bytes_for_run();
-    for adapter in adapters() {
-        let mut group = c.benchmark_group(format!("query_synth_trusted/{}", adapter.name()));
-        for (name, item) in bytes {
-            group.bench_with_input(BenchmarkId::new("synthetic", name), item, |b, v| {
-                b.iter(|| {
-                    let input = BenchInput {
-                        bytes: v.as_bytes(),
-                        sacp_canon: Some(v.as_ref()),
-                    };
-                    adapter.decode_discard_trusted(black_box(&input)).unwrap();
-                })
-            });
-        }
-        group.finish();
-    }
-}
-
 fn bench_synthetic_decode_canonical_trusted(c: &mut Criterion) {
     let bytes = synthetic_bytes_for_run();
     let mut group = c.benchmark_group("decode_synth_canonical_trusted/sacp-cbor");
@@ -384,7 +385,6 @@ fn bench_synthetic_decode_canonical_trusted(c: &mut Criterion) {
     }
     group.finish();
 }
-
 
 fn bench_query_path_zero_copy(c: &mut Criterion) {
     const ITEMS_INDEX: usize = 24;
@@ -456,7 +456,6 @@ fn bench_query_map_get_many_zero_copy(c: &mut Criterion) {
     group.finish();
 }
 
-
 fn bench_edit_patch(c: &mut Criterion) {
     const MAP_SET_KEY: &str = "k0008";
     const MAP_INSERT_KEY: &str = "k9999";
@@ -473,7 +472,6 @@ fn bench_edit_patch(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("edit_patch/sacp-cbor");
     for (name, item) in bytes {
-
         if name.starts_with("map_") {
             group.bench_function(BenchmarkId::new("map_set", name), |b| {
                 b.iter(|| {
@@ -544,20 +542,19 @@ criterion_group! {
     name = benches;
     config = criterion_config();
     targets =
-        bench_validate,
-    bench_decode_validated,
-    bench_decode_trusted,
-    bench_decode_canonical_trusted,
-    bench_encode,
-    bench_encode_stream,
-    bench_serde_roundtrip,
-    bench_native_roundtrip,
-    bench_native_decode_borrowed,
-    bench_synthetic_decode_validated,
-    bench_synthetic_query_trusted,
-    bench_synthetic_decode_canonical_trusted,
-    bench_query_path_zero_copy,
-    bench_query_map_get_many_zero_copy,
+        bench_appendix_decode_ignored,
+        bench_appendix_validate_only_sacp,
+        bench_decode_canonical_trusted,
+        bench_synth_decode_ignored,
+        bench_synth_decode_value,
+        bench_encode_value,
+        bench_roundtrip_value,
+        bench_encode_stream,
+        bench_native_roundtrip,
+        bench_native_decode_borrowed,
+        bench_synthetic_decode_canonical_trusted,
+        bench_query_path_zero_copy,
+        bench_query_map_get_many_zero_copy,
         bench_edit_patch
 }
 criterion_main!(benches);

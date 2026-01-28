@@ -2,77 +2,157 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 use syn::{
     parse_macro_input, spanned::Spanned, Attribute, Data, DataEnum, DataStruct, DeriveInput,
     Fields, GenericArgument, GenericParam, Generics, Ident, Lifetime, LifetimeParam, LitStr,
     PathArguments, Type,
 };
 
-#[derive(Default)]
-struct CborAttr {
-    rename: Option<String>,
+#[derive(Default, Clone)]
+struct CborFieldAttr {
+    rename: Option<LitStr>,
     skip: bool,
     default: bool,
 }
 
-#[derive(Default)]
-struct CborEnumAttr {
-    untagged: bool,
-    tagged: bool,
+#[derive(Default, Clone)]
+struct CborVariantAttr {
+    rename: Option<LitStr>,
 }
 
-fn parse_cbor_attrs(attrs: &[Attribute]) -> syn::Result<CborAttr> {
-    let mut out = CborAttr::default();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnumTagging {
+    Tagged,
+    Untagged,
+}
+
+impl Default for EnumTagging {
+    fn default() -> Self {
+        Self::Tagged
+    }
+}
+
+fn ensure_no_cbor_attrs(attrs: &[Attribute], ctx: &str) -> syn::Result<()> {
+    for a in attrs {
+        if a.path().is_ident("cbor") {
+            return Err(syn::Error::new(
+                a.span(),
+                format!("`#[cbor(...)]` is not supported on {ctx}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_cbor_field_attrs(attrs: &[Attribute]) -> syn::Result<CborFieldAttr> {
+    let mut out = CborFieldAttr::default();
     for attr in attrs {
         if !attr.path().is_ident("cbor") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("skip") {
+                if out.skip {
+                    return Err(meta.error("duplicate `cbor(skip)`"));
+                }
                 out.skip = true;
                 return Ok(());
             }
             if meta.path.is_ident("default") {
+                if out.default {
+                    return Err(meta.error("duplicate `cbor(default)`"));
+                }
                 out.default = true;
                 return Ok(());
             }
             if meta.path.is_ident("rename") {
+                if out.rename.is_some() {
+                    return Err(meta.error("duplicate `cbor(rename=...)`"));
+                }
                 let lit: LitStr = meta.value()?.parse()?;
-                out.rename = Some(lit.value());
+                out.rename = Some(lit);
                 return Ok(());
             }
-            Err(meta.error("unsupported cbor attribute"))
+            Err(meta
+                .error("unsupported `cbor(...)` field attribute (allowed: rename, skip, default)"))
+        })?;
+    }
+
+    if out.skip && (out.rename.is_some() || out.default) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`cbor(skip)` cannot be combined with `rename` or `default`",
+        ));
+    }
+
+    Ok(out)
+}
+
+fn parse_cbor_variant_attrs(attrs: &[Attribute]) -> syn::Result<CborVariantAttr> {
+    let mut out = CborVariantAttr::default();
+    for attr in attrs {
+        if !attr.path().is_ident("cbor") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if out.rename.is_some() {
+                    return Err(meta.error("duplicate `cbor(rename=...)` on variant"));
+                }
+                let lit: LitStr = meta.value()?.parse()?;
+                out.rename = Some(lit);
+                return Ok(());
+            }
+            if meta.path.is_ident("skip") || meta.path.is_ident("default") {
+                return Err(
+                    meta.error("`cbor(skip)` / `cbor(default)` are not valid on enum variants")
+                );
+            }
+            Err(meta.error("unsupported `cbor(...)` variant attribute (allowed: rename)"))
         })?;
     }
     Ok(out)
 }
 
-fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnumAttr> {
-    let mut out = CborEnumAttr::default();
+fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<EnumTagging> {
+    let mut seen_tagged = false;
+    let mut seen_untagged = false;
+
     for attr in attrs {
         if !attr.path().is_ident("cbor") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("untagged") {
-                out.untagged = true;
+                if seen_untagged {
+                    return Err(meta.error("duplicate `cbor(untagged)`"));
+                }
+                seen_untagged = true;
                 return Ok(());
             }
             if meta.path.is_ident("tagged") {
-                out.tagged = true;
+                if seen_tagged {
+                    return Err(meta.error("duplicate `cbor(tagged)`"));
+                }
+                seen_tagged = true;
                 return Ok(());
             }
-            Err(meta.error("unsupported cbor attribute"))
+            Err(meta.error("unsupported `cbor(...)` enum attribute (allowed: tagged, untagged)"))
         })?;
     }
-    if out.untagged && out.tagged {
+
+    if seen_tagged && seen_untagged {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "cbor enum cannot be both tagged and untagged",
         ));
     }
-    Ok(out)
+
+    Ok(if seen_untagged {
+        EnumTagging::Untagged
+    } else {
+        EnumTagging::Tagged
+    })
 }
 
 fn is_option_type(ty: &Type) -> bool {
@@ -81,29 +161,6 @@ fn is_option_type(ty: &Type) -> bool {
         return false;
     };
     seg.ident == "Option"
-}
-
-fn type_mentions_ident(ty: &Type, ident: &Ident) -> bool {
-    match ty {
-        Type::Path(tp) => tp.path.segments.iter().any(|seg| {
-            if seg.ident == *ident {
-                return true;
-            }
-            match &seg.arguments {
-                PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
-                    GenericArgument::Type(inner) => type_mentions_ident(inner, ident),
-                    _ => false,
-                }),
-                _ => false,
-            }
-        }),
-        Type::Reference(tr) => type_mentions_ident(&tr.elem, ident),
-        Type::Tuple(tt) => tt.elems.iter().any(|elem| type_mentions_ident(elem, ident)),
-        Type::Array(ta) => type_mentions_ident(&ta.elem, ident),
-        Type::Group(tg) => type_mentions_ident(&tg.elem, ident),
-        Type::Paren(tp) => type_mentions_ident(&tp.elem, ident),
-        _ => false,
-    }
 }
 
 fn vec_inner_type(ty: &Type) -> Option<&Type> {
@@ -125,7 +182,15 @@ fn vec_inner_type(ty: &Type) -> Option<&Type> {
     Some(inner)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+fn type_is_ident(ty: &Type, name: &str) -> bool {
+    let Type::Path(tp) = ty else { return false };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    seg.ident == name
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VariantKind {
     Null,
     Bool,
@@ -137,17 +202,95 @@ enum VariantKind {
     Map,
 }
 
-fn type_is_ident(ty: &Type, name: &str) -> bool {
-    let Type::Path(tp) = ty else { return false };
-    let Some(seg) = tp.path.segments.last() else {
+impl VariantKind {
+    const ORDER: [VariantKind; 8] = [
+        VariantKind::Null,
+        VariantKind::Bool,
+        VariantKind::Integer,
+        VariantKind::Float,
+        VariantKind::Bytes,
+        VariantKind::Text,
+        VariantKind::Array,
+        VariantKind::Map,
+    ];
+
+    fn idx(self) -> usize {
+        match self {
+            VariantKind::Null => 0,
+            VariantKind::Bool => 1,
+            VariantKind::Integer => 2,
+            VariantKind::Float => 3,
+            VariantKind::Bytes => 4,
+            VariantKind::Text => 5,
+            VariantKind::Array => 6,
+            VariantKind::Map => 7,
+        }
+    }
+
+    fn to_cbor_kind_ts(self) -> proc_macro2::TokenStream {
+        match self {
+            VariantKind::Null => quote!(::sacp_cbor::CborKind::Null),
+            VariantKind::Bool => quote!(::sacp_cbor::CborKind::Bool),
+            VariantKind::Integer => quote!(::sacp_cbor::CborKind::Integer),
+            VariantKind::Float => quote!(::sacp_cbor::CborKind::Float),
+            VariantKind::Bytes => quote!(::sacp_cbor::CborKind::Bytes),
+            VariantKind::Text => quote!(::sacp_cbor::CborKind::Text),
+            VariantKind::Array => quote!(::sacp_cbor::CborKind::Array),
+            VariantKind::Map => quote!(::sacp_cbor::CborKind::Map),
+        }
+    }
+}
+
+fn path_might_be_self(path: &syn::Path, self_ident: &Ident) -> bool {
+    let Some(last) = path.segments.last() else {
         return false;
     };
-    seg.ident == name
+    if last.ident != *self_ident {
+        return false;
+    }
+    if path.segments.len() == 1 {
+        return true;
+    }
+    path.segments
+        .iter()
+        .take(path.segments.len() - 1)
+        .all(|seg| matches!(seg.ident.to_string().as_str(), "crate" | "self" | "super"))
+}
+
+fn type_mentions_self(ty: &Type, self_ident: &Ident) -> bool {
+    match ty {
+        Type::Path(tp) => {
+            if tp.qself.is_none() && path_might_be_self(&tp.path, self_ident) {
+                return true;
+            }
+            if let Some(q) = &tp.qself {
+                if type_mentions_self(&q.ty, self_ident) {
+                    return true;
+                }
+            }
+            tp.path.segments.iter().any(|seg| match &seg.arguments {
+                PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                    GenericArgument::Type(inner) => type_mentions_self(inner, self_ident),
+                    _ => false,
+                }),
+                _ => false,
+            })
+        }
+        Type::Reference(tr) => type_mentions_self(&tr.elem, self_ident),
+        Type::Tuple(tt) => tt.elems.iter().any(|t| type_mentions_self(t, self_ident)),
+        Type::Array(ta) => type_mentions_self(&ta.elem, self_ident),
+        Type::Slice(ts) => type_mentions_self(&ts.elem, self_ident),
+        Type::Group(tg) => type_mentions_self(&tg.elem, self_ident),
+        Type::Paren(tp) => type_mentions_self(&tp.elem, self_ident),
+        _ => false,
+    }
 }
 
 fn type_kind(ty: &Type) -> Option<VariantKind> {
     match ty {
         Type::Reference(tr) => type_kind(&tr.elem),
+        Type::Group(tg) => type_kind(&tg.elem),
+        Type::Paren(tp) => type_kind(&tp.elem),
         Type::Slice(ts) => {
             if type_is_ident(&ts.elem, "u8") {
                 Some(VariantKind::Bytes)
@@ -165,7 +308,6 @@ fn type_kind(ty: &Type) -> Option<VariantKind> {
                 "f32" | "f64" => Some(VariantKind::Float),
                 "String" | "str" => Some(VariantKind::Text),
                 "CborBytesRef" => Some(VariantKind::Bytes),
-                "CborValueRef" => None,
                 "MapEntries" => Some(VariantKind::Map),
                 "Vec" => {
                     let inner = vec_inner_type(ty)?;
@@ -175,7 +317,7 @@ fn type_kind(ty: &Type) -> Option<VariantKind> {
                         Some(VariantKind::Array)
                     }
                 }
-                "Option" => None,
+                "Option" | "CborValueRef" => None,
                 _ => None,
             }
         }
@@ -199,26 +341,96 @@ fn decode_lifetime(generics: &Generics) -> (Generics, Lifetime) {
     let lt = Lifetime::new(&format!("'{name}"), proc_macro2::Span::call_site());
     out.params
         .insert(0, GenericParam::Lifetime(LifetimeParam::new(lt.clone())));
-    let where_clause = out.make_where_clause();
+
+    let wc = out.make_where_clause();
     for lifetime in generics.lifetimes() {
         let lt_ident = &lifetime.lifetime;
-        where_clause
-            .predicates
-            .push(syn::parse_quote!(#lt: #lt_ident));
+        wc.predicates.push(syn::parse_quote!(#lt: #lt_ident));
     }
+
     (out, lt)
 }
 
-fn add_where_bound(
-    where_clause: &mut syn::WhereClause,
-    ty: &Type,
-    bound: proc_macro2::TokenStream,
-) {
+fn add_where_bound(wc: &mut syn::WhereClause, ty: &Type, bound: proc_macro2::TokenStream) {
     let pred: syn::WherePredicate = syn::parse_quote!(#ty: #bound);
-    where_clause.predicates.push(pred);
+    wc.predicates.push(pred);
 }
 
-fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_macro2::TokenStream {
+fn decode_named_fields(
+    fields: &syn::FieldsNamed,
+    target: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut inits = Vec::new();
+    let mut matches = Vec::new();
+    let mut finals = Vec::new();
+
+    for field in &fields.named {
+        let attr = parse_cbor_field_attrs(&field.attrs)?;
+        let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+
+        if attr.skip {
+            finals.push(quote! { #ident: ::core::default::Default::default(), });
+            continue;
+        }
+
+        let key = attr
+            .rename
+            .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span()));
+        let var = format_ident!("__{ident}");
+
+        inits.push(
+            quote! { let mut #var: ::core::option::Option<#ty> = ::core::option::Option::None; },
+        );
+
+        matches.push(quote! {
+            #key => {
+                if #var.is_some() {
+                    return Err(::sacp_cbor::CborError::new(
+                        ::sacp_cbor::ErrorCode::DuplicateMapKey,
+                        key_off,
+                    ));
+                }
+                #var = ::core::option::Option::Some(::sacp_cbor::CborDecode::decode(decoder)?);
+            }
+        });
+
+        let is_option = is_option_type(ty);
+        if is_option || attr.default {
+            finals.push(quote! { #ident: #var.unwrap_or_default(), });
+        } else {
+            finals.push(quote! {
+                #ident: #var.ok_or_else(|| {
+                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
+                })?,
+            });
+        }
+    }
+
+    Ok(quote! {
+        let map_off = decoder.position();
+        let (map_len, entered) = decoder.parse_map_len()?;
+        #(#inits)*
+        for _ in 0..map_len {
+            let key_off = decoder.position();
+            let k = decoder.parse_text_key()?;
+            match k {
+                #(#matches)*
+                _ => decoder.skip_value()?,
+            }
+        }
+        if entered {
+            decoder.exit_container();
+        }
+        Ok(#target { #(#finals)* })
+    })
+}
+
+fn encode_struct(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let base_where_clause = where_clause;
 
@@ -226,38 +438,26 @@ fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
         Fields::Named(fields) => {
             let mut entries = Vec::new();
             let mut bounds = Vec::new();
+
             for field in &fields.named {
-                let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                let attr = parse_cbor_field_attrs(&field.attrs)?;
                 if attr.skip {
                     continue;
                 }
+                let ident = field.ident.as_ref().unwrap();
                 let key = attr
                     .rename
-                    .unwrap_or_else(|| field.ident.as_ref().unwrap().to_string());
-                let ident = field.ident.as_ref().unwrap();
-                let is_recursive = type_mentions_ident(&field.ty, name);
-                if !is_recursive {
+                    .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span()));
+
+                if !type_mentions_self(&field.ty, name) {
                     bounds.push(&field.ty);
                 }
-                let recursive_vec =
-                    vec_inner_type(&field.ty).is_some_and(|inner| type_mentions_ident(inner, name));
-                if recursive_vec {
-                    entries.push(quote! {
-                        m.entry(#key, |enc| {
-                            enc.array(self.#ident.len(), |a| {
-                                for item in &self.#ident {
-                                    a.value(item)?;
-                                }
-                                Ok(())
-                            })
-                        })?;
-                    });
-                } else {
-                    entries.push(quote! {
-                        m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(&self.#ident, enc))?;
-                    });
-                }
+
+                entries.push(quote! {
+                    m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(&self.#ident, enc))?;
+                });
             }
+
             let len = entries.len();
             let mut encode_where_clause = base_where_clause.cloned();
             if !bounds.is_empty() {
@@ -269,7 +469,8 @@ fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                     add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
                 }
             }
-            quote! {
+
+            Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
                     fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
                         enc.map(#len, |m| {
@@ -278,41 +479,26 @@ fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                         })
                     }
                 }
-                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-            }
+
+                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
+            })
         }
+
         Fields::Unnamed(fields) => {
             let mut items = Vec::new();
             let mut bounds = Vec::new();
+
             for (idx, field) in fields.unnamed.iter().enumerate() {
-                let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                if attr.skip || attr.default {
-                    return syn::Error::new(
-                        field.span(),
-                        "cbor skip/default not supported on tuple fields",
-                    )
-                    .to_compile_error();
-                }
+                ensure_no_cbor_attrs(&field.attrs, "tuple struct fields")?;
                 let index = syn::Index::from(idx);
-                let is_recursive = type_mentions_ident(&field.ty, name);
-                if !is_recursive {
+
+                if !type_mentions_self(&field.ty, name) {
                     bounds.push(&field.ty);
                 }
-                let recursive_vec =
-                    vec_inner_type(&field.ty).is_some_and(|inner| type_mentions_ident(inner, name));
-                if recursive_vec {
-                    items.push(quote! {
-                        a.array(self.#index.len(), |a| {
-                            for item in &self.#index {
-                                a.value(item)?;
-                            }
-                            Ok(())
-                        })?;
-                    });
-                } else {
-                    items.push(quote! { a.value(&self.#index)?; });
-                }
+
+                items.push(quote! { a.value(&self.#index)?; });
             }
+
             let len = items.len();
             let mut encode_where_clause = base_where_clause.cloned();
             if !bounds.is_empty() {
@@ -324,7 +510,8 @@ fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                     add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
                 }
             }
-            quote! {
+
+            Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
                     fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
                         enc.array(#len, |a| {
@@ -333,138 +520,118 @@ fn encode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                         })
                     }
                 }
-                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-            }
+
+                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
+            })
         }
-        Fields::Unit => quote! {
+
+        Fields::Unit => Ok(quote! {
             impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #base_where_clause {
                 fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
                     enc.null()
                 }
             }
+
             impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-        },
+        }),
     }
 }
 
-fn encode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro2::TokenStream {
+fn encode_enum(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let base_where_clause = where_clause;
+
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
 
     for variant in &data.variants {
-        let v_attr = parse_cbor_attrs(&variant.attrs).unwrap_or_default();
-        let vname = v_attr.rename.unwrap_or_else(|| variant.ident.to_string());
+        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
+        let vname = v_attr
+            .rename
+            .unwrap_or_else(|| LitStr::new(&variant.ident.to_string(), variant.ident.span()));
         let ident = &variant.ident;
+
         match &variant.fields {
             Fields::Unit => {
                 arms.push(quote! {
-                    Self::#ident => {
-                        enc.map(1, |m| {
-                            m.entry(#vname, |enc| enc.null())?;
-                            Ok(())
-                        })
-                    }
+                    Self::#ident => enc.map(1, |m| {
+                        m.entry(#vname, |enc| enc.null())?;
+                        Ok(())
+                    })
                 });
             }
+
             Fields::Unnamed(fields) => {
                 let mut pats = Vec::new();
                 let mut items = Vec::new();
+
                 for (idx, field) in fields.unnamed.iter().enumerate() {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                    if attr.skip || attr.default {
-                        return syn::Error::new(
-                            field.span(),
-                            "cbor skip/default not supported on tuple variants",
-                        )
-                        .to_compile_error();
-                    }
+                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
                     let var = format_ident!("v{idx}");
                     pats.push(var.clone());
-                    let is_recursive = type_mentions_ident(&field.ty, name);
-                    if !is_recursive {
+
+                    if !type_mentions_self(&field.ty, name) {
                         bounds.push(&field.ty);
                     }
-                    let recursive_vec = vec_inner_type(&field.ty)
-                        .is_some_and(|inner| type_mentions_ident(inner, name));
-                    if recursive_vec {
-                        items.push(quote! {
-                            a.array(#var.len(), |a| {
-                                for item in #var.iter() {
-                                    a.value(item)?;
-                                }
-                                Ok(())
-                            })?;
-                        });
-                    } else {
-                        items.push(quote! { a.value(#var)?; });
-                    }
+
+                    items.push(quote! { a.value(#var)?; });
                 }
+
                 let len = items.len();
                 arms.push(quote! {
-                    Self::#ident( #(#pats),* ) => {
-                        enc.map(1, |m| {
-                            m.entry(#vname, |enc| {
-                                enc.array(#len, |a| {
-                                    #(#items)*
-                                    Ok(())
-                                })
-                            })?;
-                            Ok(())
-                        })
-                    }
+                    Self::#ident( #(#pats),* ) => enc.map(1, |m| {
+                        m.entry(#vname, |enc| {
+                            enc.array(#len, |a| {
+                                #(#items)*
+                                Ok(())
+                            })
+                        })?;
+                        Ok(())
+                    })
                 });
             }
+
             Fields::Named(fields) => {
                 let mut pats = Vec::new();
                 let mut entries = Vec::new();
+
                 for field in &fields.named {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                    let attr = parse_cbor_field_attrs(&field.attrs)?;
+                    let f_ident = field.ident.as_ref().unwrap();
+                    pats.push(quote!(#f_ident));
+
                     if attr.skip {
                         continue;
                     }
+
                     let key = attr
                         .rename
-                        .unwrap_or_else(|| field.ident.as_ref().unwrap().to_string());
-                    let ident = field.ident.as_ref().unwrap();
-                    pats.push(quote!(#ident));
-                    let is_recursive = type_mentions_ident(&field.ty, name);
-                    if !is_recursive {
+                        .unwrap_or_else(|| LitStr::new(&f_ident.to_string(), f_ident.span()));
+
+                    if !type_mentions_self(&field.ty, name) {
                         bounds.push(&field.ty);
                     }
-                    let recursive_vec = vec_inner_type(&field.ty)
-                        .is_some_and(|inner| type_mentions_ident(inner, name));
-                    if recursive_vec {
-                        entries.push(quote! {
-                            m.entry(#key, |enc| {
-                                enc.array(#ident.len(), |a| {
-                                    for item in #ident.iter() {
-                                        a.value(item)?;
-                                    }
-                                    Ok(())
-                                })
-                            })?;
-                        });
-                    } else {
-                        entries.push(quote! {
-                            m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#ident, enc))?;
-                        });
-                    }
+
+                    entries.push(quote! {
+                        m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#f_ident, enc))?;
+                    });
                 }
+
                 let len = entries.len();
                 arms.push(quote! {
-                    Self::#ident { #(#pats),* } => {
-                        enc.map(1, |m| {
-                            m.entry(#vname, |enc| {
-                                enc.map(#len, |m| {
-                                    #(#entries)*
-                                    Ok(())
-                                })
-                            })?;
-                            Ok(())
-                        })
-                    }
+                    Self::#ident { #(#pats),* } => enc.map(1, |m| {
+                        m.entry(#vname, |enc| {
+                            enc.map(#len, |m| {
+                                #(#entries)*
+                                Ok(())
+                            })
+                        })?;
+                        Ok(())
+                    })
                 });
             }
         }
@@ -481,102 +648,110 @@ fn encode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
         }
     }
 
-    quote! {
+    Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
             fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
-                match self {
-                    #(#arms),*
-                }
+                match self { #(#arms),* }
             }
         }
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-    }
+
+        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
+    })
 }
 
 fn encode_enum_untagged(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
-) -> proc_macro2::TokenStream {
+) -> syn::Result<proc_macro2::TokenStream> {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let base_where_clause = where_clause;
+
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
 
     for variant in &data.variants {
+        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
+        if v_attr.rename.is_some() {
+            return Err(syn::Error::new(
+                variant.span(),
+                "variant `cbor(rename=...)` is meaningless for `#[cbor(untagged)]` enums",
+            ));
+        }
+
         let ident = &variant.ident;
         match &variant.fields {
             Fields::Unit => {
                 arms.push(quote! { Self::#ident => enc.null() });
             }
+
             Fields::Unnamed(fields) => {
-                let len = fields.unnamed.len();
-                if len == 1 {
-                    let var = format_ident!("v0");
+                let n = fields.unnamed.len();
+                if n == 1 {
                     let field = fields.unnamed.first().unwrap();
-                    if !type_mentions_ident(&field.ty, name) {
+                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+                    if !type_mentions_self(&field.ty, name) {
                         bounds.push(&field.ty);
                     }
+                    let v0 = format_ident!("v0");
                     arms.push(quote! {
-                        Self::#ident(#var) => ::sacp_cbor::CborEncode::encode(#var, enc)
+                        Self::#ident(#v0) => ::sacp_cbor::CborEncode::encode(#v0, enc)
                     });
                 } else {
                     let mut pats = Vec::new();
                     let mut items = Vec::new();
+
                     for (idx, field) in fields.unnamed.iter().enumerate() {
-                        let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                        if attr.skip || attr.default {
-                            return syn::Error::new(
-                                field.span(),
-                                "cbor skip/default not supported on tuple variants",
-                            )
-                            .to_compile_error();
-                        }
+                        ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
                         let var = format_ident!("v{idx}");
                         pats.push(var.clone());
-                        if !type_mentions_ident(&field.ty, name) {
+
+                        if !type_mentions_self(&field.ty, name) {
                             bounds.push(&field.ty);
                         }
                         items.push(quote! { a.value(#var)?; });
                     }
+
                     arms.push(quote! {
-                        Self::#ident( #(#pats),* ) => {
-                            enc.array(#len, |a| {
-                                #(#items)*
-                                Ok(())
-                            })
-                        }
+                        Self::#ident( #(#pats),* ) => enc.array(#n, |a| {
+                            #(#items)*
+                            Ok(())
+                        })
                     });
                 }
             }
+
             Fields::Named(fields) => {
                 let mut pats = Vec::new();
                 let mut entries = Vec::new();
+
                 for field in &fields.named {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                    let attr = parse_cbor_field_attrs(&field.attrs)?;
+                    let f_ident = field.ident.as_ref().unwrap();
+                    pats.push(quote!(#f_ident));
+
                     if attr.skip {
                         continue;
                     }
                     let key = attr
                         .rename
-                        .unwrap_or_else(|| field.ident.as_ref().unwrap().to_string());
-                    let ident = field.ident.as_ref().unwrap();
-                    pats.push(quote!(#ident));
-                    if !type_mentions_ident(&field.ty, name) {
+                        .unwrap_or_else(|| LitStr::new(&f_ident.to_string(), f_ident.span()));
+
+                    if !type_mentions_self(&field.ty, name) {
                         bounds.push(&field.ty);
                     }
+
                     entries.push(quote! {
-                        m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#ident, enc))?;
+                        m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#f_ident, enc))?;
                     });
                 }
+
                 let len = entries.len();
                 arms.push(quote! {
-                    Self::#ident { #(#pats),* } => {
-                        enc.map(#len, |m| {
-                            #(#entries)*
-                            Ok(())
-                        })
-                    }
+                    Self::#ident { #(#pats),* } => enc.map(#len, |m| {
+                        #(#entries)*
+                        Ok(())
+                    })
                 });
             }
         }
@@ -593,90 +768,24 @@ fn encode_enum_untagged(
         }
     }
 
-    quote! {
+    Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
             fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
-                match self {
-                    #(#arms),*
-                }
+                match self { #(#arms),* }
             }
         }
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-    }
+
+        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
+    })
 }
 
-fn decode_named_fields(
-    fields: &syn::FieldsNamed,
-    target: proc_macro2::TokenStream,
-) -> proc_macro2::TokenStream {
-    let mut inits = Vec::new();
-    let mut matches = Vec::new();
-    let mut finals = Vec::new();
-
-    for field in &fields.named {
-        let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-        let ident = field.ident.as_ref().unwrap();
-        let ty = &field.ty;
-        let key = attr.rename.unwrap_or_else(|| ident.to_string());
-        let var = format_ident!("__{ident}");
-
-        if attr.skip {
-            finals.push(quote! { #ident: ::core::default::Default::default(), });
-            continue;
-        }
-
-        inits.push(quote! { let mut #var: Option<#ty> = None; });
-
-        matches.push(quote! {
-            #key => {
-                if #var.is_some() {
-                    return Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::DuplicateMapKey,
-                        key_off,
-                    ));
-                }
-                #var = Some(::sacp_cbor::CborDecode::decode(decoder)?);
-            }
-        });
-
-        let is_option = is_option_type(ty);
-        if is_option || attr.default {
-            finals.push(quote! {
-                #ident: #var.unwrap_or_default(),
-            });
-        } else {
-            finals.push(quote! {
-                #ident: #var.ok_or_else(|| {
-                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
-                })?,
-            });
-        }
-    }
-
-    quote! {
-        let map_off = decoder.position();
-        let (len, entered) = decoder.parse_map_len()?;
-        #(#inits)*
-        for _ in 0..len {
-            let key_off = decoder.position();
-            let k = decoder.parse_text_key()?;
-            match k {
-                #(#matches)*
-                _ => {
-                    decoder.skip_value()?;
-                }
-            }
-        }
-        if entered {
-            decoder.exit_container();
-        }
-        Ok(#target { #(#finals)* })
-    }
-}
-
-fn decode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_macro2::TokenStream {
-    let (impl_generics, decode_lt) = decode_lifetime(generics);
-    let (impl_generics, _, where_clause) = impl_generics.split_for_impl();
+fn decode_struct(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let (impl_generics2, decode_lt) = decode_lifetime(generics);
+    let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
     let (_, ty_generics, _) = generics.split_for_impl();
 
     let mut where_clause = where_clause.cloned();
@@ -688,7 +797,7 @@ fn decode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
     match &data.fields {
         Fields::Named(fields) => {
             for field in &fields.named {
-                let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                let attr = parse_cbor_field_attrs(&field.attrs)?;
                 if attr.skip {
                     add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                     continue;
@@ -696,47 +805,44 @@ fn decode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                 if is_option_type(&field.ty) || attr.default {
                     add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                 }
-                if !type_mentions_ident(&field.ty, name) {
+                if !type_mentions_self(&field.ty, name) {
                     add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                 }
             }
-            let body = decode_named_fields(fields, quote!(Self));
-            quote! {
+
+            let body = decode_named_fields(fields, quote!(Self))?;
+            Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
                     fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
                         #body
                     }
                 }
-            }
+            })
         }
+
         Fields::Unnamed(fields) => {
             let mut vars = Vec::new();
             let mut decodes = Vec::new();
+
             for (idx, field) in fields.unnamed.iter().enumerate() {
-                let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                if attr.skip || attr.default {
-                    return syn::Error::new(
-                        field.span(),
-                        "cbor skip/default not supported on tuple fields",
-                    )
-                    .to_compile_error();
-                }
+                ensure_no_cbor_attrs(&field.attrs, "tuple struct fields")?;
+
                 let var = format_ident!("v{idx}");
                 vars.push(var.clone());
-                if !type_mentions_ident(&field.ty, name) {
+
+                if !type_mentions_self(&field.ty, name) {
                     add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                 }
-                decodes.push(quote! {
-                    let #var = ::sacp_cbor::CborDecode::decode(decoder)?;
-                });
+                decodes.push(quote! { let #var = ::sacp_cbor::CborDecode::decode(decoder)?; });
             }
-            let len = vars.len();
-            quote! {
+
+            let expected = vars.len();
+            Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
                     fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
                         let arr_off = decoder.position();
-                        let (len, entered) = decoder.parse_array_len()?;
-                        if len != #len {
+                        let (arr_len, entered) = decoder.parse_array_len()?;
+                        if arr_len != #expected {
                             return Err(::sacp_cbor::CborError::new(
                                 ::sacp_cbor::ErrorCode::ArrayLenMismatch,
                                 arr_off,
@@ -749,22 +855,27 @@ fn decode_struct(name: &Ident, generics: &Generics, data: &DataStruct) -> proc_m
                         Ok(Self(#(#vars),*))
                     }
                 }
-            }
+            })
         }
-        Fields::Unit => quote! {
+
+        Fields::Unit => Ok(quote! {
             impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
                 fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
                     let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                     Ok(Self)
                 }
             }
-        },
+        }),
     }
 }
 
-fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro2::TokenStream {
-    let (impl_generics, decode_lt) = decode_lifetime(generics);
-    let (impl_generics, _, where_clause) = impl_generics.split_for_impl();
+fn decode_enum(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let (impl_generics2, decode_lt) = decode_lifetime(generics);
+    let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
     let (_, ty_generics, _) = generics.split_for_impl();
 
     let mut where_clause = where_clause.cloned();
@@ -776,9 +887,12 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
     let mut arms = Vec::new();
 
     for variant in &data.variants {
-        let v_attr = parse_cbor_attrs(&variant.attrs).unwrap_or_default();
-        let vname = v_attr.rename.unwrap_or_else(|| variant.ident.to_string());
+        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
+        let vname = v_attr
+            .rename
+            .unwrap_or_else(|| LitStr::new(&variant.ident.to_string(), variant.ident.span()));
         let ident = &variant.ident;
+
         match &variant.fields {
             Fields::Unit => {
                 arms.push(quote! {
@@ -788,33 +902,29 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
                     }
                 });
             }
+
             Fields::Unnamed(fields) => {
                 let mut vars = Vec::new();
                 let mut decodes = Vec::new();
+
                 for (idx, field) in fields.unnamed.iter().enumerate() {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                    if attr.skip || attr.default {
-                        return syn::Error::new(
-                            field.span(),
-                            "cbor skip/default not supported on tuple variants",
-                        )
-                        .to_compile_error();
-                    }
-                    if !type_mentions_ident(&field.ty, name) {
+                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+
+                    if !type_mentions_self(&field.ty, name) {
                         add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                     }
+
                     let var = format_ident!("v{idx}");
                     vars.push(var.clone());
-                    decodes.push(quote! {
-                        let #var = ::sacp_cbor::CborDecode::decode(decoder)?;
-                    });
+                    decodes.push(quote! { let #var = ::sacp_cbor::CborDecode::decode(decoder)?; });
                 }
-                let len = vars.len();
+
+                let expected = vars.len();
                 arms.push(quote! {
                     #vname => {
                         let arr_off = decoder.position();
-                        let (len, entered) = decoder.parse_array_len()?;
-                        if len != #len {
+                        let (arr_len, entered) = decoder.parse_array_len()?;
+                        if arr_len != #expected {
                             return Err(::sacp_cbor::CborError::new(
                                 ::sacp_cbor::ErrorCode::ArrayLenMismatch,
                                 arr_off,
@@ -828,9 +938,10 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
                     }
                 });
             }
+
             Fields::Named(fields) => {
                 for field in &fields.named {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                    let attr = parse_cbor_field_attrs(&field.attrs)?;
                     if attr.skip {
                         add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                         continue;
@@ -838,22 +949,23 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
                     if is_option_type(&field.ty) || attr.default {
                         add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                     }
-                    if !type_mentions_ident(&field.ty, name) {
+                    if !type_mentions_self(&field.ty, name) {
                         add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                     }
                 }
-                let body = decode_named_fields(fields, quote!(Self::#ident));
+
+                let body = decode_named_fields(fields, quote!(Self::#ident))?;
                 arms.push(quote! { #vname => { #body } });
             }
         }
     }
 
-    quote! {
+    Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
             fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
                 let map_off = decoder.position();
-                let (len, entered) = decoder.parse_map_len()?;
-                if len != 1 {
+                let (map_len, entered) = decoder.parse_map_len()?;
+                if map_len != 1 {
                     return Err(::sacp_cbor::CborError::new(
                         ::sacp_cbor::ErrorCode::MapLenMismatch,
                         map_off,
@@ -862,7 +974,7 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
                 let _key_off = decoder.position();
                 let k = decoder.parse_text_key()?;
                 let result = match k {
-                    #(#arms),*
+                    #(#arms),*,
                     _ => Err(::sacp_cbor::CborError::new(
                         ::sacp_cbor::ErrorCode::MissingKey,
                         map_off,
@@ -874,16 +986,16 @@ fn decode_enum(name: &Ident, generics: &Generics, data: &DataEnum) -> proc_macro
                 result
             }
         }
-    }
+    })
 }
 
 fn decode_enum_untagged(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
-) -> proc_macro2::TokenStream {
-    let (impl_generics, decode_lt) = decode_lifetime(generics);
-    let (impl_generics, _, where_clause) = impl_generics.split_for_impl();
+) -> syn::Result<proc_macro2::TokenStream> {
+    let (impl_generics2, decode_lt) = decode_lifetime(generics);
+    let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
     let (_, ty_generics, _) = generics.split_for_impl();
 
     let mut where_clause = where_clause.cloned();
@@ -892,49 +1004,57 @@ fn decode_enum_untagged(
         predicates: Default::default(),
     });
 
-    let mut kind_map: HashMap<VariantKind, proc_macro2::TokenStream> = HashMap::new();
+    let mut bodies: Vec<Option<proc_macro2::TokenStream>> = vec![None; 8];
 
     for variant in &data.variants {
+        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
+        if v_attr.rename.is_some() {
+            return Err(syn::Error::new(
+                variant.span(),
+                "variant `cbor(rename=...)` is meaningless for `#[cbor(untagged)]` enums",
+            ));
+        }
+
         let ident = &variant.ident;
         let kind = match &variant.fields {
             Fields::Unit => VariantKind::Null,
+
             Fields::Unnamed(fields) => {
                 if fields.unnamed.len() == 1 {
                     let field = fields.unnamed.first().unwrap();
-                    match type_kind(&field.ty) {
-                        Some(kind) => kind,
-                        None => {
-                            return syn::Error::new(
-                                field.span(),
-                                "untagged enum variants must map to a concrete CBOR kind",
-                            )
-                            .to_compile_error();
-                        }
-                    }
+                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+                    type_kind(&field.ty).ok_or_else(|| {
+                        syn::Error::new(
+                            field.span(),
+                            "untagged enum single-field variants must map to a concrete CBOR kind",
+                        )
+                    })?
                 } else {
                     VariantKind::Array
                 }
             }
+
             Fields::Named(_) => VariantKind::Map,
         };
 
-        if kind_map.contains_key(&kind) {
-            return syn::Error::new(
+        let idx = kind.idx();
+        if bodies[idx].is_some() {
+            return Err(syn::Error::new(
                 variant.span(),
                 "untagged enum variants must have distinct CBOR kinds",
-            )
-            .to_compile_error();
+            ));
         }
 
-        let arm = match &variant.fields {
+        let body = match &variant.fields {
             Fields::Unit => quote! {
                 let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                 Ok(Self::#ident)
             },
+
             Fields::Unnamed(fields) => {
                 if fields.unnamed.len() == 1 {
                     let field = fields.unnamed.first().unwrap();
-                    if !type_mentions_ident(&field.ty, name) {
+                    if !type_mentions_self(&field.ty, name) {
                         add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                     }
                     quote! {
@@ -943,33 +1063,26 @@ fn decode_enum_untagged(
                 } else {
                     let mut vars = Vec::new();
                     let mut decodes = Vec::new();
-                    for (idx, field) in fields.unnamed.iter().enumerate() {
-                        let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
-                        if attr.skip || attr.default {
-                            return syn::Error::new(
-                                field.span(),
-                                "cbor skip/default not supported on tuple variants",
-                            )
-                            .to_compile_error();
-                        }
-                        if !type_mentions_ident(&field.ty, name) {
+                    for (i, field) in fields.unnamed.iter().enumerate() {
+                        ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+
+                        if !type_mentions_self(&field.ty, name) {
                             add_where_bound(
                                 wc,
                                 &field.ty,
                                 quote!(::sacp_cbor::CborDecode<#decode_lt>),
                             );
                         }
-                        let var = format_ident!("v{idx}");
-                        vars.push(var.clone());
-                        decodes.push(quote! {
-                            let #var = ::sacp_cbor::CborDecode::decode(decoder)?;
-                        });
+                        let v = format_ident!("v{i}");
+                        vars.push(v.clone());
+                        decodes
+                            .push(quote! { let #v = ::sacp_cbor::CborDecode::decode(decoder)?; });
                     }
-                    let len = vars.len();
+                    let expected = vars.len();
                     quote! {
                         let arr_off = decoder.position();
-                        let (len, entered) = decoder.parse_array_len()?;
-                        if len != #len {
+                        let (arr_len, entered) = decoder.parse_array_len()?;
+                        if arr_len != #expected {
                             return Err(::sacp_cbor::CborError::new(
                                 ::sacp_cbor::ErrorCode::ArrayLenMismatch,
                                 arr_off,
@@ -983,9 +1096,10 @@ fn decode_enum_untagged(
                     }
                 }
             }
+
             Fields::Named(fields) => {
                 for field in &fields.named {
-                    let attr = parse_cbor_attrs(&field.attrs).unwrap_or_default();
+                    let attr = parse_cbor_field_attrs(&field.attrs)?;
                     if attr.skip {
                         add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                         continue;
@@ -993,37 +1107,30 @@ fn decode_enum_untagged(
                     if is_option_type(&field.ty) || attr.default {
                         add_where_bound(wc, &field.ty, quote!(::core::default::Default));
                     }
-                    if !type_mentions_ident(&field.ty, name) {
+                    if !type_mentions_self(&field.ty, name) {
                         add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
                     }
                 }
-                decode_named_fields(fields, quote!(Self::#ident))
+                decode_named_fields(fields, quote!(Self::#ident))?
             }
         };
 
-        kind_map.insert(kind, arm);
+        bodies[idx] = Some(body);
     }
 
     let mut arms = Vec::new();
-    for (kind, body) in kind_map {
-        let kind_ts = match kind {
-            VariantKind::Null => quote!(::sacp_cbor::CborKind::Null),
-            VariantKind::Bool => quote!(::sacp_cbor::CborKind::Bool),
-            VariantKind::Integer => quote!(::sacp_cbor::CborKind::Integer),
-            VariantKind::Float => quote!(::sacp_cbor::CborKind::Float),
-            VariantKind::Bytes => quote!(::sacp_cbor::CborKind::Bytes),
-            VariantKind::Text => quote!(::sacp_cbor::CborKind::Text),
-            VariantKind::Array => quote!(::sacp_cbor::CborKind::Array),
-            VariantKind::Map => quote!(::sacp_cbor::CborKind::Map),
-        };
-        arms.push(quote! { #kind_ts => { #body } });
+    for kind in VariantKind::ORDER {
+        if let Some(body) = bodies[kind.idx()].take() {
+            let kind_ts = kind.to_cbor_kind_ts();
+            arms.push(quote! { #kind_ts => { #body } });
+        }
     }
 
-    quote! {
+    Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
             fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
                 match decoder.peek_kind()? {
-                    #(#arms),*
+                    #(#arms),*,
                     _ => Err(::sacp_cbor::CborError::new(
                         ::sacp_cbor::ErrorCode::ExpectedEnum,
                         decoder.position(),
@@ -1031,47 +1138,61 @@ fn decode_enum_untagged(
                 }
             }
         }
-    }
+    })
 }
 
 #[proc_macro_derive(CborEncode, attributes(cbor))]
 pub fn derive_cbor_encode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let out = match &input.data {
-        Data::Struct(data) => encode_struct(&input.ident, &input.generics, data),
-        Data::Enum(data) => {
-            let attr = parse_cbor_enum_attrs(&input.attrs).unwrap_or_default();
-            if attr.untagged {
-                encode_enum_untagged(&input.ident, &input.generics, data)
-            } else {
-                encode_enum(&input.ident, &input.generics, data)
+    let out = (|| -> syn::Result<proc_macro2::TokenStream> {
+        match &input.data {
+            Data::Struct(data) => encode_struct(&input.ident, &input.generics, data),
+            Data::Enum(data) => {
+                let tagging = parse_cbor_enum_attrs(&input.attrs)?;
+                match tagging {
+                    EnumTagging::Untagged => {
+                        encode_enum_untagged(&input.ident, &input.generics, data)
+                    }
+                    EnumTagging::Tagged => encode_enum(&input.ident, &input.generics, data),
+                }
             }
+            Data::Union(u) => Err(syn::Error::new(
+                u.union_token.span(),
+                "CborEncode not supported for unions",
+            )),
         }
-        Data::Union(u) => {
-            syn::Error::new(u.union_token.span(), "CborEncode not supported for unions")
-                .to_compile_error()
-        }
-    };
-    TokenStream::from(out)
+    })();
+
+    match out {
+        Ok(ts) => TokenStream::from(ts),
+        Err(e) => TokenStream::from(e.to_compile_error()),
+    }
 }
 
 #[proc_macro_derive(CborDecode, attributes(cbor))]
 pub fn derive_cbor_decode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    let out = match &input.data {
-        Data::Struct(data) => decode_struct(&input.ident, &input.generics, data),
-        Data::Enum(data) => {
-            let attr = parse_cbor_enum_attrs(&input.attrs).unwrap_or_default();
-            if attr.untagged {
-                decode_enum_untagged(&input.ident, &input.generics, data)
-            } else {
-                decode_enum(&input.ident, &input.generics, data)
+    let out = (|| -> syn::Result<proc_macro2::TokenStream> {
+        match &input.data {
+            Data::Struct(data) => decode_struct(&input.ident, &input.generics, data),
+            Data::Enum(data) => {
+                let tagging = parse_cbor_enum_attrs(&input.attrs)?;
+                match tagging {
+                    EnumTagging::Untagged => {
+                        decode_enum_untagged(&input.ident, &input.generics, data)
+                    }
+                    EnumTagging::Tagged => decode_enum(&input.ident, &input.generics, data),
+                }
             }
+            Data::Union(u) => Err(syn::Error::new(
+                u.union_token.span(),
+                "CborDecode not supported for unions",
+            )),
         }
-        Data::Union(u) => {
-            syn::Error::new(u.union_token.span(), "CborDecode not supported for unions")
-                .to_compile_error()
-        }
-    };
-    TokenStream::from(out)
+    })();
+
+    match out {
+        Ok(ts) => TokenStream::from(ts),
+        Err(e) => TokenStream::from(e.to_compile_error()),
+    }
 }

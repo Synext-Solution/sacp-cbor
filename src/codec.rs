@@ -3,8 +3,12 @@ use alloc::string::String;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "alloc")]
+use crate::alloc_util;
 use crate::canonical::CborBytesRef;
-use crate::parse::validate_canonical;
+#[cfg(not(feature = "alloc"))]
+use crate::limits::DEFAULT_MAX_DEPTH;
+use crate::profile::{validate_f64_bits, MAX_SAFE_INTEGER};
 use crate::query::{CborKind, CborValueRef};
 use crate::wire::{self, Cursor};
 use crate::{CborError, DecodeLimits, ErrorCode};
@@ -28,16 +32,159 @@ impl<K, V> MapEntries<K, V> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ContainerFrame {
+    Array,
+    Map {
+        prev_key_range: Option<(usize, usize)>,
+    },
+}
+
+#[cfg(feature = "alloc")]
+const INLINE_CONTAINER_FRAMES: usize = 32;
+
+#[cfg(not(feature = "alloc"))]
+const INLINE_CONTAINER_FRAMES: usize = DEFAULT_MAX_DEPTH + 2;
+
+#[cfg(feature = "alloc")]
+struct ContainerStack {
+    inline: [ContainerFrame; INLINE_CONTAINER_FRAMES],
+    len: usize,
+    heap: Option<Vec<ContainerFrame>>,
+}
+
+#[cfg(feature = "alloc")]
+impl ContainerStack {
+    const fn new() -> Self {
+        Self {
+            inline: [ContainerFrame::Array; INLINE_CONTAINER_FRAMES],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn push(&mut self, frame: ContainerFrame, off: usize) -> Result<(), CborError> {
+        match &mut self.heap {
+            Some(items) => {
+                alloc_util::try_reserve(items, 1, off)?;
+                items.push(frame);
+            }
+            None => {
+                if self.len < INLINE_CONTAINER_FRAMES {
+                    self.inline[self.len] = frame;
+                    self.len += 1;
+                } else {
+                    let mut items = Vec::new();
+                    alloc_util::try_reserve(&mut items, self.len + 1, off)?;
+                    items.extend_from_slice(&self.inline[..self.len]);
+                    items.push(frame);
+                    self.heap = Some(items);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<ContainerFrame> {
+        match &mut self.heap {
+            Some(items) => items.pop(),
+            None => {
+                if self.len == 0 {
+                    None
+                } else {
+                    self.len -= 1;
+                    Some(self.inline[self.len])
+                }
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<ContainerFrame> {
+        self.heap.as_ref().map_or_else(
+            || self.len.checked_sub(1).map(|i| self.inline[i]),
+            |items| items.last().copied(),
+        )
+    }
+
+    fn peek_mut(&mut self) -> Option<&mut ContainerFrame> {
+        match &mut self.heap {
+            Some(items) => items.last_mut(),
+            None => self.len.checked_sub(1).map(|i| &mut self.inline[i]),
+        }
+    }
+}
+
+#[cfg(not(feature = "alloc"))]
+struct ContainerStack<const N: usize> {
+    buf: [ContainerFrame; N],
+    len: usize,
+}
+
+#[cfg(not(feature = "alloc"))]
+impl<const N: usize> ContainerStack<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [ContainerFrame::Array; N],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, frame: ContainerFrame, off: usize) -> Result<(), CborError> {
+        if self.len < N {
+            self.buf[self.len] = frame;
+            self.len += 1;
+            Ok(())
+        } else {
+            Err(CborError::new(ErrorCode::DepthLimitExceeded, off))
+        }
+    }
+
+    fn pop(&mut self) -> Option<ContainerFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.buf[self.len])
+        }
+    }
+
+    fn peek(&self) -> Option<ContainerFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.buf[self.len - 1])
+        }
+    }
+
+    fn peek_mut(&mut self) -> Option<&mut ContainerFrame> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(&mut self.buf[self.len - 1])
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+type ContainerStackImpl = ContainerStack;
+#[cfg(not(feature = "alloc"))]
+type ContainerStackImpl = ContainerStack<INLINE_CONTAINER_FRAMES>;
+
 /// Streaming decoder over canonical CBOR bytes.
 pub struct Decoder<'de> {
     cursor: Cursor<'de, CborError>,
     limits: DecodeLimits,
     depth: usize,
     items_seen: usize,
+    checked: bool,
+    containers: ContainerStackImpl,
 }
 
 impl<'de> Decoder<'de> {
     /// Construct a decoder over canonical bytes with the provided limits.
+    ///
+    /// This assumes the input is already canonical; use `new_checked` to enforce canonical
+    /// constraints while decoding.
     ///
     /// # Errors
     ///
@@ -51,7 +198,20 @@ impl<'de> Decoder<'de> {
             limits,
             depth: 0,
             items_seen: 0,
+            checked: false,
+            containers: ContainerStackImpl::new(),
         })
+    }
+
+    /// Construct a decoder that enforces canonical constraints while decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
+    pub fn new_checked(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        let mut out = Self::new(bytes, limits)?;
+        out.checked = true;
+        Ok(out)
     }
 
     /// Return the current byte offset in the input.
@@ -84,12 +244,20 @@ impl<'de> Decoder<'de> {
 
     #[inline]
     fn read_uint_arg(&mut self, ai: u8, off: usize) -> Result<u64, CborError> {
-        wire::read_uint_arg::<false, CborError>(&mut self.cursor, ai, off)
+        if self.checked {
+            wire::read_uint_arg::<true, CborError>(&mut self.cursor, ai, off)
+        } else {
+            wire::read_uint_arg::<false, CborError>(&mut self.cursor, ai, off)
+        }
     }
 
     #[inline]
     fn read_len(&mut self, ai: u8, off: usize) -> Result<usize, CborError> {
-        wire::read_len::<false, CborError>(&mut self.cursor, ai, off)
+        if self.checked {
+            wire::read_len::<true, CborError>(&mut self.cursor, ai, off)
+        } else {
+            wire::read_len::<false, CborError>(&mut self.cursor, ai, off)
+        }
     }
 
     #[inline]
@@ -121,16 +289,28 @@ impl<'de> Decoder<'de> {
     #[inline]
     pub fn exit_container(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+        if self.checked {
+            let _ = self.containers.pop();
+        }
     }
 
     #[inline]
     fn parse_text_from_header(&mut self, off: usize, ai: u8) -> Result<&'de str, CborError> {
-        wire::parse_text_from_header::<false, CborError>(
-            &mut self.cursor,
-            Some(&self.limits),
-            off,
-            ai,
-        )
+        if self.checked {
+            wire::parse_text_from_header::<true, CborError>(
+                &mut self.cursor,
+                Some(&self.limits),
+                off,
+                ai,
+            )
+        } else {
+            wire::parse_text_from_header::<false, CborError>(
+                &mut self.cursor,
+                Some(&self.limits),
+                off,
+                ai,
+            )
+        }
     }
 
     #[inline]
@@ -144,7 +324,11 @@ impl<'de> Decoder<'de> {
 
     #[inline]
     fn parse_bignum(&mut self, off: usize, ai: u8) -> Result<(bool, &'de [u8]), CborError> {
-        wire::parse_bignum::<false, CborError>(&mut self.cursor, Some(&self.limits), off, ai)
+        if self.checked {
+            wire::parse_bignum::<true, CborError>(&mut self.cursor, Some(&self.limits), off, ai)
+        } else {
+            wire::parse_bignum::<false, CborError>(&mut self.cursor, Some(&self.limits), off, ai)
+        }
     }
 
     fn parse_safe_i64(&mut self) -> Result<i64, CborError> {
@@ -152,10 +336,16 @@ impl<'de> Decoder<'de> {
         match major {
             0 => {
                 let v = self.read_uint_arg(ai, off)?;
+                if self.checked && v > MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
                 i64::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
             }
             1 => {
                 let n = self.read_uint_arg(ai, off)?;
+                if self.checked && n >= MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
                 let n = i64::try_from(n)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Ok(-1 - n)
@@ -172,10 +362,30 @@ impl<'de> Decoder<'de> {
 
     fn parse_float64(&mut self) -> Result<f64, CborError> {
         let (major, ai, off) = self.read_header()?;
-        if major != 7 || ai != 27 {
+        if major != 7 {
             return Err(CborError::new(ErrorCode::ExpectedFloat, off));
         }
+        if ai != 27 {
+            if !self.checked {
+                return Err(CborError::new(ErrorCode::ExpectedFloat, off));
+            }
+            return match ai {
+                24 => {
+                    let simple = self.cursor.read_u8()?;
+                    if simple < 24 {
+                        return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
+                    }
+                    Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                }
+                28..=30 => Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off)),
+                25 | 26 => Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off)),
+                _ => Err(CborError::new(ErrorCode::ExpectedFloat, off)),
+            };
+        }
         let bits = self.cursor.read_be_u64()?;
+        if self.checked {
+            validate_f64_bits(bits).map_err(|code| CborError::new(code, off))?;
+        }
         Ok(f64::from_bits(bits))
     }
 
@@ -187,16 +397,66 @@ impl<'de> Decoder<'de> {
         match ai {
             20 => Ok(false),
             21 => Ok(true),
-            _ => Err(CborError::new(ErrorCode::ExpectedBool, off)),
+            22 | 27 => Err(CborError::new(ErrorCode::ExpectedBool, off)),
+            24 => {
+                if !self.checked {
+                    return Err(CborError::new(ErrorCode::ExpectedBool, off));
+                }
+                let simple = self.cursor.read_u8()?;
+                if simple < 24 {
+                    return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => {
+                if self.checked {
+                    Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off))
+                } else {
+                    Err(CborError::new(ErrorCode::ExpectedBool, off))
+                }
+            }
+            _ => {
+                if self.checked {
+                    Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                } else {
+                    Err(CborError::new(ErrorCode::ExpectedBool, off))
+                }
+            }
         }
     }
 
     fn parse_null(&mut self) -> Result<(), CborError> {
         let (major, ai, off) = self.read_header()?;
-        if major == 7 && ai == 22 {
-            Ok(())
-        } else {
-            Err(CborError::new(ErrorCode::ExpectedNull, off))
+        if major != 7 {
+            return Err(CborError::new(ErrorCode::ExpectedNull, off));
+        }
+        match ai {
+            22 => Ok(()),
+            20 | 21 | 27 => Err(CborError::new(ErrorCode::ExpectedNull, off)),
+            24 => {
+                if !self.checked {
+                    return Err(CborError::new(ErrorCode::ExpectedNull, off));
+                }
+                let simple = self.cursor.read_u8()?;
+                if simple < 24 {
+                    return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
+                }
+                Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+            }
+            28..=30 => {
+                if self.checked {
+                    Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off))
+                } else {
+                    Err(CborError::new(ErrorCode::ExpectedNull, off))
+                }
+            }
+            _ => {
+                if self.checked {
+                    Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                } else {
+                    Err(CborError::new(ErrorCode::ExpectedNull, off))
+                }
+            }
         }
     }
 
@@ -232,6 +492,9 @@ impl<'de> Decoder<'de> {
         }
         self.bump_items(len, off)?;
         let entered = self.enter_container(len, off)?;
+        if entered && self.checked {
+            self.containers.push(ContainerFrame::Array, off)?;
+        }
         Ok((len, entered))
     }
 
@@ -254,6 +517,14 @@ impl<'de> Decoder<'de> {
             .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
         self.bump_items(items, off)?;
         let entered = self.enter_container(len, off)?;
+        if entered && self.checked {
+            self.containers.push(
+                ContainerFrame::Map {
+                    prev_key_range: None,
+                },
+                off,
+            )?;
+        }
         Ok((len, entered))
     }
 
@@ -263,11 +534,36 @@ impl<'de> Decoder<'de> {
     ///
     /// Returns `MapKeyMustBeText` if the next key is not a text string.
     pub fn parse_text_key(&mut self) -> Result<&'de str, CborError> {
+        let key_start = self.position();
         let (major, ai, off) = self.read_header()?;
         if major != 3 {
             return Err(CborError::new(ErrorCode::MapKeyMustBeText, off));
         }
-        self.parse_text_from_header(off, ai)
+        let s = self.parse_text_from_header(off, ai)?;
+        if self.checked {
+            let key_end = self.position();
+            let prev = match self.containers.peek() {
+                Some(ContainerFrame::Map { prev_key_range }) => prev_key_range,
+                Some(ContainerFrame::Array) | None => {
+                    return Err(CborError::new(ErrorCode::MalformedCanonical, key_start));
+                }
+            };
+            let mut next_prev = prev;
+            wire::check_map_key_order(self.data(), &mut next_prev, key_start, key_end)?;
+            let frame = self
+                .containers
+                .peek_mut()
+                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, key_start))?;
+            match frame {
+                ContainerFrame::Map { prev_key_range } => {
+                    *prev_key_range = next_prev;
+                }
+                ContainerFrame::Array => {
+                    return Err(CborError::new(ErrorCode::MalformedCanonical, key_start));
+                }
+            }
+        }
+        Ok(s)
     }
 
     /// Skip exactly one CBOR value while enforcing decode limits.
@@ -276,12 +572,21 @@ impl<'de> Decoder<'de> {
     ///
     /// Returns a decode error if the value is malformed or violates limits.
     pub fn skip_value(&mut self) -> Result<(), CborError> {
-        wire::skip_one_value::<false, CborError>(
-            &mut self.cursor,
-            Some(&self.limits),
-            &mut self.items_seen,
-            self.depth,
-        )
+        if self.checked {
+            wire::skip_one_value::<true, CborError>(
+                &mut self.cursor,
+                Some(&self.limits),
+                &mut self.items_seen,
+                self.depth,
+            )
+        } else {
+            wire::skip_one_value::<false, CborError>(
+                &mut self.cursor,
+                Some(&self.limits),
+                &mut self.items_seen,
+                self.depth,
+            )
+        }
     }
 
     /// Peek at the kind of the next CBOR value without consuming it.
@@ -302,8 +607,11 @@ impl<'de> Decoder<'de> {
             4 => Ok(CborKind::Array),
             5 => Ok(CborKind::Map),
             6 => {
-                let tag =
-                    wire::read_uint_arg_at::<false, CborError>(self.data(), &mut pos, ai, off)?;
+                let tag = if self.checked {
+                    wire::read_uint_arg_at::<true, CborError>(self.data(), &mut pos, ai, off)?
+                } else {
+                    wire::read_uint_arg_at::<false, CborError>(self.data(), &mut pos, ai, off)?
+                };
                 match tag {
                     2 | 3 => Ok(CborKind::Integer),
                     _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
@@ -313,7 +621,31 @@ impl<'de> Decoder<'de> {
                 20 | 21 => Ok(CborKind::Bool),
                 22 => Ok(CborKind::Null),
                 27 => Ok(CborKind::Float),
-                _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
+                24 => {
+                    if !self.checked {
+                        return Err(CborError::new(ErrorCode::MalformedCanonical, off));
+                    }
+                    let simple = wire::read_u8(self.data(), &mut pos)?;
+                    if simple < 24 {
+                        Err(CborError::new(ErrorCode::NonCanonicalEncoding, off))
+                    } else {
+                        Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                    }
+                }
+                28..=30 => {
+                    if self.checked {
+                        Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off))
+                    } else {
+                        Err(CborError::new(ErrorCode::MalformedCanonical, off))
+                    }
+                }
+                _ => {
+                    if self.checked {
+                        Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off))
+                    } else {
+                        Err(CborError::new(ErrorCode::MalformedCanonical, off))
+                    }
+                }
             },
             _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
         }
@@ -355,9 +687,7 @@ pub fn decode<'de, T: CborDecode<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let canon = validate_canonical(bytes, limits)?;
-    let bytes = canon.as_bytes();
-    let mut decoder = Decoder::new(bytes, limits)?;
+    let mut decoder = Decoder::new_checked(bytes, limits)?;
     let value = T::decode(&mut decoder)?;
     if decoder.position() != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
@@ -403,6 +733,17 @@ pub fn encode_to_vec<T: CborEncode>(value: &T) -> Result<Vec<u8>, CborError> {
     let mut enc = Encoder::new();
     value.encode(&mut enc)?;
     Ok(enc.into_vec())
+}
+
+#[cfg(feature = "alloc")]
+/// Encode a value into an existing encoder, reusing its capacity.
+///
+/// # Errors
+///
+/// Returns an error if encoding fails.
+pub fn encode_into<T: CborEncode>(enc: &mut Encoder, value: &T) -> Result<(), CborError> {
+    enc.clear();
+    value.encode(enc)
 }
 
 #[cfg(feature = "alloc")]
@@ -483,12 +824,18 @@ impl<'de> CborDecode<'de> for i128 {
         match major {
             0 => {
                 let v = decoder.read_uint_arg(ai, off)?;
+                if decoder.checked && v > MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
                 let v_i = i64::try_from(v)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Ok(Self::from(v_i))
             }
             1 => {
                 let n = decoder.read_uint_arg(ai, off)?;
+                if decoder.checked && n >= MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
                 let n_i = i64::try_from(n)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Ok(Self::from(-1 - n_i))
@@ -550,6 +897,9 @@ impl<'de> CborDecode<'de> for u128 {
         match major {
             0 => {
                 let v = decoder.read_uint_arg(ai, off)?;
+                if decoder.checked && v > MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
                 let v_i = i64::try_from(v)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 let v_u64 = u64::try_from(v_i)
@@ -669,7 +1019,7 @@ impl<'de, T: CborDecode<'de>> CborDecode<'de> for Option<T> {
 impl<'de, T: CborDecode<'de> + CborArrayElem> CborDecode<'de> for Vec<T> {
     fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
         let (len, entered) = decoder.parse_array_len()?;
-        let mut out = Self::with_capacity(len);
+        let mut out = alloc_util::try_vec_with_capacity::<T>(len, decoder.position())?;
         for _ in 0..len {
             out.push(T::decode(decoder)?);
         }
@@ -684,7 +1034,7 @@ impl<'de, T: CborDecode<'de> + CborArrayElem> CborDecode<'de> for Vec<T> {
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
     fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
         let (len, entered) = decoder.parse_map_len()?;
-        let mut out = Vec::with_capacity(len);
+        let mut out = alloc_util::try_vec_with_capacity::<(&'de str, V)>(len, decoder.position())?;
         for _ in 0..len {
             let key = decoder.parse_text_key()?;
             let value = V::decode(decoder)?;
@@ -701,11 +1051,11 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
     fn decode(decoder: &mut Decoder<'de>) -> Result<Self, CborError> {
         let (len, entered) = decoder.parse_map_len()?;
-        let mut out = Vec::with_capacity(len);
+        let mut out = alloc_util::try_vec_with_capacity::<(String, V)>(len, decoder.position())?;
         for _ in 0..len {
             let key = decoder.parse_text_key()?;
             let value = V::decode(decoder)?;
-            out.push((key.to_string(), value));
+            out.push((String::from(key), value));
         }
         if entered {
             decoder.exit_container();
@@ -717,7 +1067,7 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
 #[cfg(feature = "alloc")]
 impl CborDecode<'_> for String {
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, CborError> {
-        decoder.parse_text().map(str::to_string)
+        decoder.parse_text().map(Self::from)
     }
 }
 

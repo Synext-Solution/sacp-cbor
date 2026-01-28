@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 use core::alloc::Layout;
 
+#[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::{
     is_strictly_increasing_encoded, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
@@ -264,7 +265,7 @@ pub fn parse_bignum<'a, const CHECKED: bool, E: DecodeError>(
 }
 
 #[inline]
-fn check_map_key_order<E: DecodeError>(
+pub fn check_map_key_order<E: DecodeError>(
     data: &[u8],
     prev_key_range: &mut Option<(usize, usize)>,
     key_start: usize,
@@ -317,38 +318,77 @@ impl Frame {
 }
 
 #[cfg(feature = "alloc")]
+const INLINE_FRAMES: usize = 32;
+
+#[cfg(feature = "alloc")]
 struct FrameStack {
-    items: Vec<Frame>,
+    inline: [Frame; INLINE_FRAMES],
+    len: usize,
+    heap: Option<Vec<Frame>>,
 }
 
 #[cfg(feature = "alloc")]
 impl FrameStack {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            items: Vec::with_capacity(INLINE_STACK),
+            inline: [Frame::Root { remaining: 0 }; INLINE_FRAMES],
+            len: 0,
+            heap: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.heap.as_ref().map_or(self.len == 0, Vec::is_empty)
     }
 
     fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
-        try_reserve_vec::<Frame, E>(&mut self.items, 1, off)?;
-        self.items.push(frame);
+        match &mut self.heap {
+            Some(items) => {
+                try_reserve_vec::<Frame, E>(items, 1, off)?;
+                items.push(frame);
+            }
+            None => {
+                if self.len < INLINE_FRAMES {
+                    self.inline[self.len] = frame;
+                    self.len += 1;
+                } else {
+                    let mut items = Vec::new();
+                    try_reserve_vec::<Frame, E>(&mut items, self.len + 1, off)?;
+                    items.extend_from_slice(&self.inline[..self.len]);
+                    items.push(frame);
+                    self.heap = Some(items);
+                }
+            }
+        }
         Ok(())
     }
 
     fn pop(&mut self) -> Option<Frame> {
-        self.items.pop()
+        match &mut self.heap {
+            Some(items) => items.pop(),
+            None => {
+                if self.len == 0 {
+                    None
+                } else {
+                    self.len -= 1;
+                    Some(self.inline[self.len])
+                }
+            }
+        }
     }
 
     fn peek(&self) -> Option<Frame> {
-        self.items.last().copied()
+        self.heap.as_ref().map_or_else(
+            || self.len.checked_sub(1).map(|i| self.inline[i]),
+            |items| items.last().copied(),
+        )
     }
 
     fn peek_mut(&mut self) -> Option<&mut Frame> {
-        self.items.last_mut()
+        match &mut self.heap {
+            Some(items) => items.last_mut(),
+            None => self.len.checked_sub(1).map(|i| &mut self.inline[i]),
+        }
     }
 }
 
@@ -423,6 +463,7 @@ impl<const N: usize> FrameStack<N> {
     }
 }
 
+#[cfg(not(feature = "alloc"))]
 const INLINE_STACK: usize = DEFAULT_MAX_DEPTH + 2;
 
 #[inline]

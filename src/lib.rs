@@ -103,8 +103,8 @@ mod value;
 pub use crate::canonical::CborBytes;
 #[cfg(feature = "alloc")]
 pub use crate::codec::{
-    decode_canonical_owned, encode_to_canonical, encode_to_vec, CborArrayElem, CborEncode,
-    MapEntries,
+    decode_canonical_owned, encode_into, encode_to_canonical, encode_to_vec, CborArrayElem,
+    CborEncode, MapEntries,
 };
 #[cfg(feature = "alloc")]
 pub use crate::edit::{

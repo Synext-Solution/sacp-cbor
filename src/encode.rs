@@ -111,20 +111,24 @@ fn encode_major_len<S: Sink>(sink: &mut S, major: u8, len: usize) -> Result<(), 
 
 fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(), CborError> {
     debug_assert!(major <= 7);
-    if let Ok(v8) = u8::try_from(value) {
-        if v8 < 24 {
-            return sink.write_u8((major << 5) | v8);
-        }
+    if value < 24 {
+        let v = u8::try_from(value).unwrap();
+        return sink.write_u8((major << 5) | v);
+    }
+    if value <= 0xff {
+        let v = u8::try_from(value).unwrap();
         sink.write_u8((major << 5) | 24)?;
-        return sink.write_u8(v8);
+        return sink.write_u8(v);
     }
-    if let Ok(v16) = u16::try_from(value) {
+    if value <= 0xffff {
+        let v = u16::try_from(value).unwrap();
         sink.write_u8((major << 5) | 25)?;
-        return sink.write(&v16.to_be_bytes());
+        return sink.write(&v.to_be_bytes());
     }
-    if let Ok(v32) = u32::try_from(value) {
+    if value <= 0xffff_ffff {
+        let v = u32::try_from(value).unwrap();
         sink.write_u8((major << 5) | 26)?;
-        return sink.write(&v32.to_be_bytes());
+        return sink.write(&v.to_be_bytes());
     }
     sink.write_u8((major << 5) | 27)?;
     sink.write(&value.to_be_bytes())
@@ -182,6 +186,11 @@ impl Encoder {
         let limits = crate::DecodeLimits::for_bytes(bytes.len());
         crate::validate_canonical(&bytes, limits)?;
         Ok(CborBytes::new_unchecked(bytes))
+    }
+
+    /// Clear the encoder while retaining allocated capacity.
+    pub fn clear(&mut self) {
+        self.sink.buf.clear();
     }
 
     /// Borrow the bytes emitted so far.
