@@ -770,8 +770,7 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
     let mut started = false;
 
     loop {
-        loop {
-            let Some(frame) = stack.peek() else { break };
+        while let Some(frame) = stack.peek() {
             if !frame.is_done() {
                 break;
             }
