@@ -26,6 +26,15 @@ impl<'a> CborBytesRef<'a> {
         self.bytes
     }
 
+    /// Wrap canonical bytes without validation.
+    ///
+    /// The caller must guarantee the bytes are a single canonical SACP-CBOR/1 item.
+    #[inline]
+    #[must_use]
+    pub const fn from_canonical(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
     /// Length in bytes of the canonical representation.
     #[inline]
     #[must_use]
