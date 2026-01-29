@@ -26,6 +26,19 @@ impl<'a> CborBytesRef<'a> {
         self.bytes
     }
 
+    /// Wrap canonical bytes without validation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the bytes are a single canonical SACP-CBOR/1 item.
+    #[cfg(feature = "unsafe")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unsafe")))]
+    #[inline]
+    #[must_use]
+    pub const unsafe fn from_canonical(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
     /// Length in bytes of the canonical representation.
     #[inline]
     #[must_use]

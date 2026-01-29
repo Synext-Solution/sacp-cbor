@@ -1,6 +1,6 @@
 [package]
 name = "sacp-cbor"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -34,12 +34,12 @@ serde = ["dep:serde", "alloc", "std"]
 simdutf8 = ["dep:simdutf8"]
 
 # Allow unchecked UTF-8 for canonical-trusted inputs (unsafe).
-unsafe-utf8 = []
+unsafe = []
 
 [dependencies]
 sha2 = { version = "0.10", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
-sacp-cbor-derive = { path = "sacp-cbor-derive", version = "0.7.1" }
+sacp-cbor-derive = { path = "sacp-cbor-derive", version = "0.8.0" }
 simdutf8 = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]

@@ -17,9 +17,9 @@ pub fn validate(bytes: &[u8]) -> Result<&str, ()> {
 
 /// Returns a `&str` from canonical-trusted bytes.
 ///
-/// In `unsafe-utf8` mode this skips validation and relies on the canonical
+/// In `unsafe` mode this skips validation and relies on the canonical
 /// input invariant.
-#[cfg(feature = "unsafe-utf8")]
+#[cfg(feature = "unsafe")]
 #[inline]
 #[allow(clippy::unnecessary_wraps)]
 #[allow(clippy::missing_const_for_fn)]
@@ -29,7 +29,7 @@ pub fn trusted(bytes: &[u8]) -> Result<&str, ()> {
 }
 
 /// Returns a `&str` from canonical-trusted bytes.
-#[cfg(not(feature = "unsafe-utf8"))]
+#[cfg(not(feature = "unsafe"))]
 #[inline]
 pub fn trusted(bytes: &[u8]) -> Result<&str, ()> {
     validate(bytes)

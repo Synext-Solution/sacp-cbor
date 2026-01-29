@@ -177,6 +177,20 @@ impl<'a> CborValueRef<'a> {
         Self { data, start, end }
     }
 
+    /// Construct a value reference from a canonical byte slice and range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `data` is canonical CBOR and the range bounds a full CBOR item.
+    #[cfg(feature = "unsafe")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unsafe")))]
+    #[inline]
+    #[must_use]
+    pub unsafe fn from_canonical_range(data: &'a [u8], start: usize, end: usize) -> Self {
+        debug_assert!(start <= end && end <= data.len());
+        Self { data, start, end }
+    }
+
     /// Returns the raw bytes (canonical CBOR encoding) for this value.
     #[must_use]
     pub fn as_bytes(self) -> &'a [u8] {

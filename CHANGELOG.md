@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+
+- **Breaking:** renamed feature `unsafe-utf8` to `unsafe`.
+- Added unsafe canonical constructors behind the `unsafe` feature (`CborBytesRef::from_canonical`, `CborValueRef::from_canonical_range`).
+- Refactored `sacp-cbor-derive` internals to reduce boilerplate and shared decode/encode helpers.
+- Enabled `clippy::all` deny in both crates; added missing crate-level docs for the derive crate.
+
 ## 0.7.1
 
 - Added `sacp-cbor-derive` workspace crate and `#[derive(CborEncode, CborDecode)]`.
