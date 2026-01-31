@@ -17,6 +17,11 @@ where
     let mut pats = Vec::new();
     let mut entries = Vec::new();
 
+    struct NamedEntry {
+        key_bytes: Vec<u8>,
+        entry: proc_macro2::TokenStream,
+    }
+
     for field in &fields.named {
         let attr = parse_cbor_field_attrs(&field.attrs)?;
         let f_ident = field.ident.as_ref().unwrap();
@@ -35,10 +40,23 @@ where
         }
 
         let value_ts = value(f_ident);
-        entries.push(quote! {
-            m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#value_ts, enc))?;
+        let key_bytes = key.value().into_bytes();
+        entries.push(NamedEntry {
+            key_bytes,
+            entry: quote! {
+                m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#value_ts, enc))?;
+            },
         });
     }
+
+    entries.sort_by(|a, b| {
+        a.key_bytes
+            .len()
+            .cmp(&b.key_bytes.len())
+            .then_with(|| a.key_bytes.cmp(&b.key_bytes))
+    });
+
+    let entries = entries.into_iter().map(|entry| entry.entry).collect();
 
     Ok((pats, entries))
 }

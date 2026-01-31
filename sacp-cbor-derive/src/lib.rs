@@ -6,6 +6,7 @@
 extern crate proc_macro;
 
 mod attrs;
+mod cbor_bytes;
 mod decode;
 mod encode;
 mod types;
@@ -15,6 +16,7 @@ use proc_macro::TokenStream;
 use syn::{parse_macro_input, spanned::Spanned, Data, DeriveInput};
 
 use crate::attrs::{parse_cbor_enum_attrs, EnumTagging};
+use crate::cbor_bytes::expand as expand_cbor_bytes;
 use crate::decode::{decode_enum, decode_enum_untagged, decode_struct};
 use crate::encode::{encode_enum, encode_enum_untagged, encode_struct};
 
@@ -74,4 +76,10 @@ pub fn derive_cbor_decode(input: TokenStream) -> TokenStream {
         Ok(ts) => TokenStream::from(ts),
         Err(e) => TokenStream::from(e.to_compile_error()),
     }
+}
+
+/// Construct canonical CBOR bytes with a JSON-like literal syntax.
+#[proc_macro]
+pub fn cbor_bytes(input: TokenStream) -> TokenStream {
+    expand_cbor_bytes(input)
 }

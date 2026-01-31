@@ -189,7 +189,27 @@ impl<'de> Decoder<'de> {
     /// # Errors
     ///
     /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
-    pub const fn new(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+    pub const fn new_trusted(
+        canon: CborBytesRef<'de>,
+        limits: DecodeLimits,
+    ) -> Result<Self, CborError> {
+        Self::new_with(canon.as_bytes(), limits, false)
+    }
+
+    /// Construct a decoder that enforces canonical constraints while decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
+    pub const fn new_checked(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+        Self::new_with(bytes, limits, true)
+    }
+
+    const fn new_with(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        checked: bool,
+    ) -> Result<Self, CborError> {
         if bytes.len() > limits.max_input_bytes {
             return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
         }
@@ -198,20 +218,9 @@ impl<'de> Decoder<'de> {
             limits,
             depth: 0,
             items_seen: 0,
-            checked: false,
+            checked,
             containers: ContainerStackImpl::new(),
         })
-    }
-
-    /// Construct a decoder that enforces canonical constraints while decoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
-    pub fn new_checked(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
-        let mut out = Self::new(bytes, limits)?;
-        out.checked = true;
-        Ok(out)
     }
 
     /// Return the current byte offset in the input.
@@ -701,11 +710,10 @@ pub fn decode<'de, T: CborDecode<'de>>(
 ///
 /// Returns an error if decoding fails.
 pub fn decode_canonical<'de, T: CborDecode<'de>>(canon: CborBytesRef<'de>) -> Result<T, CborError> {
-    let bytes = canon.as_bytes();
-    let limits = DecodeLimits::for_bytes(bytes.len());
-    let mut decoder = Decoder::new(bytes, limits)?;
+    let limits = DecodeLimits::for_bytes(canon.len());
+    let mut decoder = Decoder::new_trusted(canon, limits)?;
     let value = T::decode(&mut decoder)?;
-    if decoder.position() != bytes.len() {
+    if decoder.position() != canon.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
     }
     Ok(value)

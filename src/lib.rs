@@ -118,6 +118,8 @@ pub use crate::encode::{ArrayEncoder, Encoder, MapEncoder};
 pub use crate::macros::__cbor_macro;
 #[cfg(feature = "alloc")]
 pub use crate::value::{BigInt, CborInteger};
+#[cfg(feature = "alloc")]
+pub use sacp_cbor_derive::cbor_bytes;
 
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::{

@@ -550,17 +550,18 @@ You must write exactly `len` items; otherwise:
 
 - Produces `Result<CborBytes, CborError>`
 - Uses `Encoder` internally
-- **Does NOT sort map keys**. Your literal/entry order must already be canonical.
+- Sorts map keys at compile time (no runtime buffering)
+- Map keys must be identifiers or string literals
 
-Example (canonical key order required):
+Example (keys can be written in any order):
 
 ```rust
 use sacp_cbor::cbor_bytes;
 
 let bytes = cbor_bytes!({
+    "z": 3,
     "a": 1,
     "b": 2,
-    "z": 3,
 })?;
 ```
 

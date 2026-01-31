@@ -37,10 +37,15 @@ fn cbor_bytes_map_keys() {
     let limits = DecodeLimits::for_bytes(v.as_bytes().len());
     validate_canonical(v.as_bytes(), limits).unwrap();
 
-    let key = "dyn";
-    let v = cbor_bytes!({ ((key)): 2 }).unwrap();
+    let v = cbor_bytes!({ "dyn": 2 }).unwrap();
     let limits = DecodeLimits::for_bytes(v.as_bytes().len());
     validate_canonical(v.as_bytes(), limits).unwrap();
+}
+
+#[test]
+fn cbor_bytes_map_order_sorted() {
+    let v = cbor_bytes!({ b: 2, a: 1 }).unwrap();
+    assert_eq!(v.as_bytes(), &[0xa2, 0x61, b'a', 0x01, 0x61, b'b', 0x02]);
 }
 
 #[test]
@@ -58,7 +63,7 @@ fn cbor_bytes_negative_zero_rejected() {
 #[test]
 fn cbor_bytes_splice_payloads() {
     let inner = cbor_bytes!([1, 2]).unwrap();
-    let outer = cbor_bytes!({ payload: (&inner) }).unwrap();
+    let outer = cbor_bytes!({ payload: &inner }).unwrap();
     let expected = cbor_bytes!({ payload: [1, 2] }).unwrap();
     assert_eq!(outer.as_bytes(), expected.as_bytes());
 }

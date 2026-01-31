@@ -132,12 +132,6 @@ fn decode_named_fields(
 
         matches.push(quote! {
             #key => {
-                if #var.is_some() {
-                    return Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::DuplicateMapKey,
-                        key_off,
-                    ));
-                }
                 #var = ::core::option::Option::Some(::sacp_cbor::CborDecode::decode(decoder)?);
             }
         });

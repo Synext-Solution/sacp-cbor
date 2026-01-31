@@ -1304,7 +1304,9 @@ impl<'de, const CHECKED: bool> DirectDeserializer<'de, CHECKED> {
         match ai {
             27 => {
                 let bits = self.read_be_u64()?;
-                validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                if CHECKED {
+                    validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                }
                 Ok(f64::from_bits(bits))
             }
             20..=22 => Err(DeError::new(ErrorCode::ExpectedFloat, off)),
@@ -1673,7 +1675,9 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut DirectDeserializer
                 22 => visitor.visit_unit(),
                 27 => {
                     let bits = self.read_be_u64()?;
-                    validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                    if CHECKED {
+                        validate_f64_bits(bits).map_err(|code| DeError::new(code, off))?;
+                    }
                     visitor.visit_f64(f64::from_bits(bits))
                 }
                 24 => {

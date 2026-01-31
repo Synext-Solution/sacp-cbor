@@ -1,128 +1,15 @@
-//! CBOR construction macros.
-//!
-//! This module provides [`cbor_bytes!`], a convenient macro to build canonical CBOR bytes directly.
-
-/// Construct canonical CBOR bytes directly using a JSON-like literal syntax.
-///
-/// This macro returns `Result<crate::CborBytes, crate::CborError>`.
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-#[macro_export]
-macro_rules! cbor_bytes {
-    ($($tt:tt)+) => {{
-        (|| -> ::core::result::Result<$crate::CborBytes, $crate::CborError> {
-            let mut __enc = $crate::Encoder::new();
-            $crate::__cbor_bytes_into!(&mut __enc, $($tt)+)?;
-            __enc.into_canonical()
-        })()
-    }};
-}
-
-#[doc(hidden)]
-#[cfg(feature = "alloc")]
-#[macro_export]
-macro_rules! __cbor_bytes_into {
-    ($enc:expr, null) => { $enc.null() };
-    ($enc:expr, true) => { $enc.bool(true) };
-    ($enc:expr, false) => { $enc.bool(false) };
-
-    ($enc:expr, [ $($elem:tt),* $(,)? ]) => {{
-        let __len = 0usize $(+ { let _ = stringify!($elem); 1usize })*;
-        $enc.array(__len, |__arr| {
-            $( $crate::__cbor_bytes_into!(__arr, $elem)?; )*
-            ::core::result::Result::Ok(())
-        })
-    }};
-
-    ($enc:expr, { $($key:tt : $value:tt),* $(,)? }) => {{
-        let __len = 0usize $(+ { let _ = stringify!($key); let _ = stringify!($value); 1usize })*;
-        $enc.map(__len, |__map| {
-            $( $crate::__cbor_bytes_map_entry!(__map, $key, $value)?; )*
-            ::core::result::Result::Ok(())
-        })
-    }};
-
-    // fallback: encode arbitrary expression types via IntoCborBytes
-    ($enc:expr, $other:expr) => {{
-        $enc.__encode_any($other)
-    }};
-}
-
-#[doc(hidden)]
-#[cfg(feature = "alloc")]
-#[macro_export]
-macro_rules! __cbor_bytes_map_entry {
-    ($map:expr, $key:ident, $value:tt) => {{
-        $map.entry(::core::stringify!($key), |__enc| {
-            $crate::__cbor_bytes_into!(__enc, $value)
-        })?;
-        ::core::result::Result::Ok(())
-    }};
-    ($map:expr, $key:literal, $value:tt) => {{
-        $map.entry($key, |__enc| $crate::__cbor_bytes_into!(__enc, $value))?;
-        ::core::result::Result::Ok(())
-    }};
-    ($map:expr, (($key:expr)), $value:tt) => {{
-        let __k = $crate::__cbor_macro::IntoCborKey::into_cbor_key($key)?;
-        $map.entry(__k.as_ref(), |__enc| {
-            $crate::__cbor_bytes_into!(__enc, $value)
-        })?;
-        ::core::result::Result::Ok(())
-    }};
-}
+//! Internal support for the `cbor_bytes!` macro.
 
 /// Hidden support module used by `cbor_bytes!` expansions.
 ///
-/// This is re-exported at crate root as `__cbor_macro` (see `lib.rs` change below).
+/// This is re-exported at crate root as `__cbor_macro` (see `lib.rs`).
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub mod __cbor_macro {
-    use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use core::convert::TryFrom;
 
-    use crate::{CborBytes, CborBytesRef, CborError, CborValueRef, Encoder, ErrorCode, F64Bits};
-
-    #[inline]
-    const fn overflow() -> CborError {
-        CborError::new(ErrorCode::LengthOverflow, 0)
-    }
-
-    pub fn boxed_str_from_str(s: &str) -> Result<Box<str>, CborError> {
-        crate::alloc_util::try_box_str_from_str(s, 0)
-    }
-
-    pub trait IntoCborKey {
-        fn into_cbor_key(self) -> Result<Box<str>, CborError>;
-    }
-
-    impl IntoCborKey for String {
-        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
-            Ok(self.into_boxed_str())
-        }
-    }
-
-    impl IntoCborKey for &String {
-        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
-            boxed_str_from_str(self.as_str())
-        }
-    }
-
-    impl IntoCborKey for &str {
-        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
-            boxed_str_from_str(self)
-        }
-    }
-
-    impl IntoCborKey for char {
-        fn into_cbor_key(self) -> Result<Box<str>, CborError> {
-            let mut out = String::new();
-            crate::alloc_util::try_reserve_exact_str(&mut out, 4, 0)?;
-            out.push(self);
-            Ok(out.into_boxed_str())
-        }
-    }
+    use crate::{CborBytes, CborBytesRef, CborError, CborValueRef, Encoder, F64Bits};
 
     pub trait IntoCborBytes {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError>;
@@ -221,44 +108,91 @@ pub mod __cbor_macro {
         }
     }
 
-    impl IntoCborBytes for f32 {
+    impl IntoCborBytes for i64 {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-            enc.float(F64Bits::try_from_f64(f64::from(self))?)
+            enc.int(self)
         }
     }
 
-    macro_rules! impl_into_int_signed_bytes {
-        ($($t:ty),* $(,)?) => {$(
-            impl IntoCborBytes for $t {
-                fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-                    enc.int_i128(i128::from(self))
-                }
-            }
-        )*};
+    impl IntoCborBytes for i32 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
+        }
     }
 
-    macro_rules! impl_into_int_unsigned_bytes {
-        ($($t:ty),* $(,)?) => {$(
-            impl IntoCborBytes for $t {
-                fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-                    enc.int_u128(u128::from(self))
-                }
-            }
-        )*};
+    impl IntoCborBytes for i16 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
+        }
     }
 
-    impl_into_int_signed_bytes!(i8, i16, i32, i64, i128);
-    impl_into_int_unsigned_bytes!(u8, u16, u32, u64, u128);
+    impl IntoCborBytes for i8 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
+        }
+    }
 
     impl IntoCborBytes for isize {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-            enc.int_i128(i128::try_from(self).map_err(|_| overflow())?)
+            let v = i64::try_from(self)
+                .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+            enc.int(v)
+        }
+    }
+
+    impl IntoCborBytes for i128 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int_i128(self)
+        }
+    }
+
+    impl IntoCborBytes for u64 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            if self <= crate::MAX_SAFE_INTEGER {
+                let v = i64::try_from(self)
+                    .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+                enc.int(v)
+            } else {
+                enc.int_u128(u128::from(self))
+            }
+        }
+    }
+
+    impl IntoCborBytes for u32 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
+        }
+    }
+
+    impl IntoCborBytes for u16 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
+        }
+    }
+
+    impl IntoCborBytes for u8 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int(i64::from(self))
         }
     }
 
     impl IntoCborBytes for usize {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-            enc.int_u128(u128::try_from(self).map_err(|_| overflow())?)
+            let v = u64::try_from(self)
+                .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+            if v <= crate::MAX_SAFE_INTEGER {
+                let v = i64::try_from(v)
+                    .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+                enc.int(v)
+            } else {
+                enc.int_u128(u128::from(v))
+            }
+        }
+    }
+
+    impl IntoCborBytes for u128 {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.int_u128(self)
         }
     }
 }

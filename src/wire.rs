@@ -740,7 +740,9 @@ fn skip_primitive<const CHECKED: bool, E: DecodeError>(
                 20..=22 => {}
                 27 => {
                     let bits = cursor.read_be_u64()?;
-                    validate_f64_bits(bits).map_err(|code| E::new(code, off))?;
+                    if CHECKED {
+                        validate_f64_bits(bits).map_err(|code| E::new(code, off))?;
+                    }
                 }
                 24 => {
                     let simple = cursor.read_u8()?;
