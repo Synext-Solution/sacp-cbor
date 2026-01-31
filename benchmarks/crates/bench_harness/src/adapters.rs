@@ -3,7 +3,7 @@ use serde::de::IgnoredAny;
 
 pub struct BenchInput<'a> {
     pub bytes: &'a [u8],
-    pub sacp_canon: Option<sacp_cbor::CborBytesRef<'a>>,
+    pub sacp_canon: Option<sacp_cbor::CanonicalCborRef<'a>>,
 }
 
 pub trait Adapter {

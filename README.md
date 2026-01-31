@@ -11,7 +11,7 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 ### Core capabilities
 
 - **Validate** that an input is a *single, canonical* CBOR item under a strict profile (`validate_canonical`).
-- Wrap validated bytes as `CborBytesRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
+- Wrap validated bytes as `CanonicalCborRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
 - Optionally **decode** into Rust types via serde `from_slice` (`serde` + `alloc`).
 - **Encode canonical CBOR** directly (`Encoder`, `MapEncoder`, `ArrayEncoder`) (`alloc`).
 - Build canonical bytes with the **fallible** `cbor_bytes!` macro (`alloc`).
@@ -52,7 +52,7 @@ This crate is `no_std` by default unless `std` is enabled.
 | Feature | Enables | Notes |
 |---|---|---|
 | `std` | `std::error::Error` for `CborError` | Otherwise `no_std` |
-| `alloc` | Owned types + encoding + editor + macros | Required for `CborBytes`, `Encoder`, `Editor`, `cbor_bytes!` |
+| `alloc` | Owned types + encoding + editor + macros | Required for `CanonicalCbor`, `Encoder`, `Editor`, `cbor_bytes!` |
 | `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice; enables owned decoding via `from_slice` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
 | `simdutf8` | Faster UTF-8 validation | Optional SIMD validation, same semantics |
@@ -244,9 +244,9 @@ let state = limits.state_limits();
 
 ## Zero-copy query API
 
-All query APIs operate on **validated canonical bytes** (via `CborBytesRef` / `CborBytes`) and return lightweight views (`CborValueRef`) into the underlying buffer.
+All query APIs operate on **validated canonical bytes** (via `CanonicalCborRef` / `CanonicalCbor`) and return lightweight views (`CborValueRef`) into the underlying buffer.
 
-### `CborBytesRef<'a>`
+### `CanonicalCborRef<'a>`
 
 How you obtain it:
 
@@ -267,14 +267,14 @@ Key methods:
 Optional:
 
 - `sha256() -> [u8; 32]` (`sha2`) — `O(n)`
-- `to_owned() -> Result<CborBytes, CborError>` (`alloc`) — `O(n)` copy + alloc
+- `to_owned() -> Result<CanonicalCbor, CborError>` (`alloc`) — `O(n)` copy + alloc
 - `editor()/edit(...)` (`alloc`) — see “Editing”
 
-### `CborBytes` (owned, `alloc`)
+### `CanonicalCbor` (owned, `alloc`)
 
 How you obtain it:
 
-- `CborBytes::from_slice(bytes, limits)` validates + copies
+- `CanonicalCbor::from_slice(bytes, limits)` validates + copies
 - or from an `Encoder` (`into_canonical()`)
 - or from an `Editor::apply()`
 
@@ -283,7 +283,7 @@ Key methods:
 - `as_bytes() -> &[u8]` (`O(1)`)
 - `into_bytes() -> Vec<u8>` (`O(1)` move)
 - `bytes_eq(&other) -> bool` (`O(n)`)
-- `root()/at(...)` same as `CborBytesRef`
+- `root()/at(...)` same as `CanonicalCborRef`
 - `sha256()` (`sha2`) — `O(n)`
 - `edit(...)` (`alloc`) — see “Editing”
 
@@ -469,7 +469,7 @@ Create:
 Extract:
 
 - `into_vec() -> Vec<u8>` (not wrapped/validated)
-- `into_canonical() -> CborBytes` (assumes you used encoder correctly)
+- `into_canonical() -> CanonicalCbor` (assumes you used encoder correctly)
 - `as_bytes() -> &[u8]` (current buffer)
 
 Write scalars:
@@ -487,7 +487,7 @@ Write composites:
 
 Raw splice:
 
-- `raw_cbor(CborBytesRef)` (copies bytes as-is into output)
+- `raw_cbor(CanonicalCborRef)` (copies bytes as-is into output)
 - `raw_value_ref(CborValueRef)` (copies bytes as-is into output)
 
 **Key rule:** When emitting maps via `Encoder::map`, you must insert entries in **canonical key order** using `MapEncoder::entry`. The encoder enforces this and will error if you violate it.
@@ -548,7 +548,7 @@ You must write exactly `len` items; otherwise:
 
 ### `cbor_bytes!` — build canonical bytes directly (fallible)
 
-- Produces `Result<CborBytes, CborError>`
+- Produces `Result<CanonicalCbor, CborError>`
 - Uses `Encoder` internally
 - Sorts map keys at compile time (no runtime buffering)
 - Map keys must be identifiers or string literals
@@ -590,7 +590,7 @@ The editor applies a set of mutations to an existing canonical document and emit
 
 ### High-level semantics
 
-- The input must be canonical (you start from `CborBytesRef` or `CborBytes`).
+- The input must be canonical (you start from `CanonicalCborRef` or `CanonicalCbor`).
 - Operations are specified by a **non-empty path** (`&[PathElem]`).
 
   - You cannot “replace the root value” via an empty path.
@@ -615,9 +615,9 @@ Ok(())
 Or with owned bytes:
 
 ```rust
-use sacp_cbor::{CborBytes, DecodeLimits, path};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, path};
 
-let owned = CborBytes::from_slice(/*...*/, DecodeLimits::for_bytes(/*...*/))?;
+let owned = CanonicalCbor::from_slice(/*...*/, DecodeLimits::for_bytes(/*...*/))?;
 let updated = owned.edit(|ed| {
 ed.replace(path!("counter"), 42i64)?;
 Ok(())
@@ -661,7 +661,7 @@ Array splices:
 
 Finalize:
 
-- `apply(self) -> Result<CborBytes, CborError>`
+- `apply(self) -> Result<CanonicalCbor, CborError>`
 
 ### Supported value types for edits (`EditEncode`)
 
@@ -675,14 +675,14 @@ Implemented out of the box:
 - `&[u8]`, `Vec<u8>`
 - `f32`, `f64`, `F64Bits`
 - `i64`, `u64`, `i128`, `u128` (bignum encoding when outside safe range)
-- `CborBytesRef`, `CborBytes`, `&CborBytes`
+- `CanonicalCborRef`, `CanonicalCbor`, `&CanonicalCbor`
 
 **Complexity**
 
 - Converting `T` into an edit value usually means encoding a single CBOR item:
 
   - Time: `O(encoded_bytes_of_value)`
-  - Space: may allocate a `Vec<u8>` for the encoded item unless you pass a `CborBytesRef`/`&CborBytes`.
+  - Space: may allocate a `Vec<u8>` for the encoded item unless you pass a `CanonicalCborRef`/`&CanonicalCbor`.
 
 ### Editor limitations (must-read)
 
@@ -767,8 +767,8 @@ assert_eq!(decoded, msg);
 
 ## Hashing (`sha2`)
 
-- `CborBytesRef::sha256() -> [u8; 32]`
-- `CborBytes::sha256() -> [u8; 32]`
+- `CanonicalCborRef::sha256() -> [u8; 32]`
+- `CanonicalCbor::sha256() -> [u8; 32]`
 
 **Complexity**
 
@@ -836,7 +836,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
   - Validates canonical + single item.
   - Time: `O(n)`, Space: `O(d)`
 
-- `validate_canonical(bytes, limits) -> Result<CborBytesRef, CborError>`
+- `validate_canonical(bytes, limits) -> Result<CanonicalCborRef, CborError>`
 
   - Same as `validate`, but returns a typed wrapper.
   - Time: `O(n)`, Space: `O(d)`
@@ -855,7 +855,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Bytes wrappers
 
-- `CborBytesRef<'a>` (borrowed)
+- `CanonicalCborRef<'a>` (borrowed)
 
   - `as_bytes/len/is_empty/root` — `O(1)`
   - `bytes_eq` — `O(n)`
@@ -864,11 +864,11 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
   - `to_owned` (`alloc`) — `O(n)` alloc+copy
   - `editor/edit` (`alloc`) — see editing
 
-- `CborBytes` (`alloc`, owned)
+- `CanonicalCbor` (`alloc`, owned)
 
   - `from_slice(bytes, limits)` — validates then copies (`O(n)`)
   - `as_bytes/into_bytes` — `O(1)`
-  - query/edit methods same as `CborBytesRef`
+  - query/edit methods same as `CanonicalCborRef`
 
 ### Query types
 
@@ -913,7 +913,7 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Macros (`alloc`)
 
-- `cbor_bytes!` → `Result<CborBytes, CborError>`
+- `cbor_bytes!` → `Result<CanonicalCbor, CborError>`
 
   - no sorting; order must already be canonical
 
@@ -928,14 +928,14 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 ## When to use what
 
 - **You already have CBOR bytes and need fast reads:**
-  `validate_canonical` → `CborBytesRef` → `at/get/iter`
+  `validate_canonical` → `CanonicalCborRef` → `at/get/iter`
 
 - **You need to *emit* canonical CBOR efficiently:**
   `Encoder` / `cbor_bytes!`
   (ensure canonical map key order)
 
 - **You need to patch existing canonical bytes without decoding everything:**
-  `CborBytesRef::edit` / `CborBytes::edit`
+  `CanonicalCborRef::edit` / `CanonicalCbor::edit`
 
 - **You need serde:**
   `to_vec/from_slice` (or `from_slice_borrowed` when you want borrows)

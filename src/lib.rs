@@ -37,7 +37,7 @@
 //! ## Feature flags
 //!
 //! - `std` *(default)*: implements `std::error::Error` for [`CborError`].
-//! - `alloc` *(default)*: enables owned canonical bytes (`CborBytes`), editing, and encoding helpers.
+//! - `alloc` *(default)*: enables owned canonical bytes (`CanonicalCbor`), editing, and encoding helpers.
 //! - `sha2` *(default)*: enables SHA-256 hashing helpers for canonical bytes.
 //! - `simdutf8`: enables SIMD-accelerated UTF-8 validation where supported.
 //! - `unsafe`: allows unchecked UTF-8 for canonical-trusted inputs.
@@ -83,8 +83,11 @@ mod edit;
 #[cfg(feature = "alloc")]
 mod int;
 
-pub use crate::canonical::{CborBytesRef, EncodedTextKey};
-pub use crate::codec::{decode, decode_canonical, CborDecode, Decoder};
+pub use crate::canonical::{CanonicalCborRef, EncodedTextKey};
+pub use crate::codec::{
+    decode, decode_canonical, ArrayDecoder, CborDecode, CheckedDecoder, Decoder, MapDecoder,
+    TrustedDecoder,
+};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{CborLimits, DecodeLimits};
 pub use crate::parse::{validate, validate_canonical};
@@ -101,7 +104,7 @@ mod macros;
 #[cfg(feature = "alloc")]
 mod value;
 #[cfg(feature = "alloc")]
-pub use crate::canonical::CborBytes;
+pub use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
 pub use crate::codec::{
     decode_canonical_owned, encode_into, encode_to_canonical, encode_to_vec, CborArrayElem,

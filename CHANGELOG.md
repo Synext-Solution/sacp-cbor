@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0
+
+- **Breaking:** `Decoder` is now const-generic over `CHECKED`, and `CborDecode::decode` now accepts `Decoder<'_, CHECKED>` (use `CheckedDecoder`/`TrustedDecoder` aliases as needed).
+- **Breaking:** Dropping `ArrayDecoder`/`MapDecoder` before consuming all items now poisons the decoder; subsequent reads return an error instead of silently continuing.
+- Fallible allocation is enforced for `String`, `Vec<u8>`, `MapEntries<String, V>`, and query extras (OOM now maps to `AllocationFailed` instead of panicking).
+- Allocation errors now distinguish capacity overflow vs allocation failure more consistently across alloc paths.
+- `Encoder::into_canonical` now relies on internal invariants (single-item tracking) without a second-pass validation.
+
 ## 0.9.0
 
 - **Breaking:** `cbor_bytes!` is now a procedural macro that sorts map keys at compile time; dynamic keys are no longer supported in the macro (use `Encoder` for dynamic keys).

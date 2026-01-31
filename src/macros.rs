@@ -9,21 +9,24 @@ pub mod __cbor_macro {
     use alloc::string::String;
     use alloc::vec::Vec;
 
-    use crate::{CborBytes, CborBytesRef, CborError, CborValueRef, Encoder, F64Bits};
+    use crate::{
+        BigInt, CanonicalCbor, CanonicalCborRef, CborError, CborInteger, CborValueRef, Encoder,
+        F64Bits,
+    };
 
     pub trait IntoCborBytes {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError>;
     }
 
-    impl IntoCborBytes for CborBytesRef<'_> {
+    impl IntoCborBytes for CanonicalCborRef<'_> {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.raw_cbor(self)
         }
     }
 
-    impl IntoCborBytes for &CborBytes {
+    impl IntoCborBytes for &CanonicalCbor {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-            enc.raw_cbor(CborBytesRef::new(self.as_bytes()))
+            enc.raw_cbor(CanonicalCborRef::new(self.as_bytes()))
         }
     }
 
@@ -102,6 +105,42 @@ pub mod __cbor_macro {
         }
     }
 
+    impl IntoCborBytes for BigInt {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.bignum(self.is_negative(), self.magnitude())
+        }
+    }
+
+    impl IntoCborBytes for &BigInt {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            enc.bignum(self.is_negative(), self.magnitude())
+        }
+    }
+
+    impl IntoCborBytes for CborInteger {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            if let Some(value) = self.as_i64() {
+                enc.int(value)
+            } else if let Some(big) = self.as_bigint() {
+                enc.bignum(big.is_negative(), big.magnitude())
+            } else {
+                Err(CborError::new(crate::ErrorCode::ExpectedInteger, 0))
+            }
+        }
+    }
+
+    impl IntoCborBytes for &CborInteger {
+        fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
+            if let Some(value) = self.as_i64() {
+                enc.int(value)
+            } else if let Some(big) = self.as_bigint() {
+                enc.bignum(big.is_negative(), big.magnitude())
+            } else {
+                Err(CborError::new(crate::ErrorCode::ExpectedInteger, 0))
+            }
+        }
+    }
+
     impl IntoCborBytes for f64 {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             enc.float(F64Bits::try_from_f64(self)?)
@@ -148,13 +187,12 @@ pub mod __cbor_macro {
 
     impl IntoCborBytes for u64 {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
-            if self <= crate::MAX_SAFE_INTEGER {
-                let v = i64::try_from(self)
-                    .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
-                enc.int(v)
-            } else {
-                enc.int_u128(u128::from(self))
+            if self > crate::MAX_SAFE_INTEGER {
+                return Err(CborError::new(crate::ErrorCode::IntegerOutsideSafeRange, 0));
             }
+            let v = i64::try_from(self)
+                .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+            enc.int(v)
         }
     }
 
@@ -180,13 +218,12 @@ pub mod __cbor_macro {
         fn into_cbor_bytes(self, enc: &mut Encoder) -> Result<(), CborError> {
             let v = u64::try_from(self)
                 .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
-            if v <= crate::MAX_SAFE_INTEGER {
-                let v = i64::try_from(v)
-                    .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
-                enc.int(v)
-            } else {
-                enc.int_u128(u128::from(v))
+            if v > crate::MAX_SAFE_INTEGER {
+                return Err(CborError::new(crate::ErrorCode::IntegerOutsideSafeRange, 0));
             }
+            let v = i64::try_from(v)
+                .map_err(|_| CborError::new(crate::ErrorCode::LengthOverflow, 0))?;
+            enc.int(v)
         }
     }
 

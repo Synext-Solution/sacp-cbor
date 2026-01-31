@@ -15,7 +15,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     let out = quote! {
         {
-            (|| -> ::core::result::Result<::sacp_cbor::CborBytes, ::sacp_cbor::CborError> {
+            (|| -> ::core::result::Result<::sacp_cbor::CanonicalCbor, ::sacp_cbor::CborError> {
                 let mut #enc = ::sacp_cbor::Encoder::new();
                 #body?;
                 #enc.into_canonical()

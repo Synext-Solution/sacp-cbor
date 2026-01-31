@@ -4,9 +4,8 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::alloc_util::try_reserve;
-use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
+use crate::canonical::{CanonicalCbor, CanonicalCborRef, EncodedTextKey};
 use crate::encode::{ArrayEncoder, MapEncoder};
-use crate::parse;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::query::{CborValueRef, PathElem};
 use crate::scalar::F64Bits;
@@ -287,7 +286,7 @@ impl<'a> Editor<'a> {
     /// # Errors
     ///
     /// Returns an error if any edit is invalid, conflicts, or fails during encoding.
-    pub fn apply(self) -> Result<CborBytes, CborError> {
+    pub fn apply(self) -> Result<CanonicalCbor, CborError> {
         let mut enc = Encoder::with_capacity(self.root.len());
         emit_value(&mut enc, self.root, &self.ops, self.options)?;
         enc.into_canonical()
@@ -378,9 +377,9 @@ impl sealed::Sealed for i64 {}
 impl sealed::Sealed for u64 {}
 impl sealed::Sealed for i128 {}
 impl sealed::Sealed for u128 {}
-impl sealed::Sealed for CborBytesRef<'_> {}
-impl sealed::Sealed for CborBytes {}
-impl sealed::Sealed for &CborBytes {}
+impl sealed::Sealed for CanonicalCborRef<'_> {}
+impl sealed::Sealed for CanonicalCbor {}
+impl sealed::Sealed for &CanonicalCbor {}
 
 impl<'a> EditEncode<'a> for bool {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
@@ -438,13 +437,20 @@ impl<'a> EditEncode<'a> for f32 {
 
 impl<'a> EditEncode<'a> for i64 {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        encode_to_vec(|enc| enc.int_i128(i128::from(self)))
+        encode_to_vec(|enc| enc.int(self))
     }
 }
 
 impl<'a> EditEncode<'a> for u64 {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        encode_to_vec(|enc| enc.int_u128(u128::from(self)))
+        encode_to_vec(|enc| {
+            if self > crate::MAX_SAFE_INTEGER {
+                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, enc.len()));
+            }
+            let v = i64::try_from(self)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;
+            enc.int(v)
+        })
     }
 }
 
@@ -460,21 +466,21 @@ impl<'a> EditEncode<'a> for u128 {
     }
 }
 
-impl<'a> EditEncode<'a> for CborBytesRef<'a> {
+impl<'a> EditEncode<'a> for CanonicalCborRef<'a> {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
         Ok(EditValue::bytes_ref(self))
     }
 }
 
-impl<'a> EditEncode<'a> for CborBytes {
+impl<'a> EditEncode<'a> for CanonicalCbor {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
         Ok(EditValue::bytes_owned(self.into_bytes()))
     }
 }
 
-impl<'a> EditEncode<'a> for &'a CborBytes {
+impl<'a> EditEncode<'a> for &'a CanonicalCbor {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
-        Ok(EditValue::bytes_ref(CborBytesRef::new(self.as_bytes())))
+        Ok(EditValue::bytes_ref(CanonicalCborRef::new(self.as_bytes())))
     }
 }
 
@@ -605,7 +611,7 @@ enum EditValueInner<'a> {
     /// Splice an existing canonical value reference.
     Raw(CborValueRef<'a>),
     /// Splice canonical bytes by reference.
-    BytesRef(CborBytesRef<'a>),
+    BytesRef(CanonicalCborRef<'a>),
     /// Splice owned canonical bytes.
     BytesOwned(Vec<u8>),
 }
@@ -615,7 +621,7 @@ impl<'a> EditValue<'a> {
         Self(EditValueInner::Raw(value))
     }
 
-    pub(crate) const fn bytes_ref(value: CborBytesRef<'a>) -> Self {
+    pub(crate) const fn bytes_ref(value: CanonicalCborRef<'a>) -> Self {
         Self(EditValueInner::BytesRef(value))
     }
 
@@ -817,17 +823,7 @@ where
 {
     let mut enc = Encoder::new();
     f(&mut enc)?;
-    let bytes = enc.into_vec();
-    ensure_single_item(&bytes)?;
-    Ok(bytes)
-}
-
-fn ensure_single_item(bytes: &[u8]) -> Result<(), CborError> {
-    let end = parse::value_end_trusted(bytes, 0)?;
-    if end != bytes.len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, end));
-    }
-    Ok(())
+    Ok(enc.into_canonical()?.into_bytes())
 }
 
 fn encode_to_vec<'a, F>(f: F) -> Result<EditValue<'a>, CborError>
@@ -840,7 +836,7 @@ where
 
 trait ValueEncoder {
     fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError>;
-    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError>;
+    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError>;
     fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>;
@@ -854,7 +850,7 @@ impl ValueEncoder for Encoder {
         Self::raw_value_ref(self, v)
     }
 
-    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
+    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
         Self::raw_cbor(self, v)
     }
 
@@ -878,7 +874,7 @@ impl ValueEncoder for ArrayEncoder<'_> {
         ArrayEncoder::raw_value_ref(self, v)
     }
 
-    fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
+    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
         ArrayEncoder::raw_cbor(self, v)
     }
 
@@ -901,7 +897,7 @@ fn write_new_value<E: ValueEncoder>(enc: &mut E, value: &EditValue<'_>) -> Resul
     match &value.0 {
         EditValueInner::Raw(v) => enc.raw_value_ref(*v),
         EditValueInner::BytesRef(b) => enc.raw_cbor(*b),
-        EditValueInner::BytesOwned(b) => enc.raw_cbor(CborBytesRef::new(b.as_slice())),
+        EditValueInner::BytesOwned(b) => enc.raw_cbor(CanonicalCborRef::new(b.as_slice())),
     }
 }
 
@@ -1435,8 +1431,8 @@ where
     }
 }
 
-/// Adds editing methods to `CborBytesRef`.
-impl<'a> CborBytesRef<'a> {
+/// Adds editing methods to `CanonicalCborRef`.
+impl<'a> CanonicalCborRef<'a> {
     /// Create a `Editor` for this message.
     #[must_use]
     pub const fn editor(self) -> Editor<'a> {
@@ -1448,7 +1444,7 @@ impl<'a> CborBytesRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError` if any edit fails or the patch is invalid.
-    pub fn edit<F>(self, f: F) -> Result<CborBytes, CborError>
+    pub fn edit<F>(self, f: F) -> Result<CanonicalCbor, CborError>
     where
         F: FnOnce(&mut Editor<'a>) -> Result<(), CborError>,
     {
@@ -1458,8 +1454,8 @@ impl<'a> CborBytesRef<'a> {
     }
 }
 
-/// Adds editing methods to `CborBytes`.
-impl CborBytes {
+/// Adds editing methods to `CanonicalCbor`.
+impl CanonicalCbor {
     /// Create a `Editor` for this message.
     #[must_use]
     pub fn editor(&self) -> Editor<'_> {

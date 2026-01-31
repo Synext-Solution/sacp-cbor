@@ -154,7 +154,7 @@ pub(crate) fn type_kind(ty: &Type) -> Option<VariantKind> {
                 | "u128" | "usize" => Some(VariantKind::Integer),
                 "f32" | "f64" => Some(VariantKind::Float),
                 "String" | "str" => Some(VariantKind::Text),
-                "CborBytesRef" => Some(VariantKind::Bytes),
+                "CanonicalCborRef" => None,
                 "MapEntries" => Some(VariantKind::Map),
                 "Vec" => {
                     let inner = vec_inner_type(ty)?;

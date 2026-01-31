@@ -27,7 +27,17 @@ fn tuple_decode_parts(
         if !type_mentions_self(&field.ty, name) {
             add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
         }
-        decodes.push(quote! { let #var = ::sacp_cbor::CborDecode::decode(decoder)?; });
+        decodes.push(quote! {
+            let #var = match array.next_value()? {
+                ::core::option::Option::Some(value) => value,
+                ::core::option::Option::None => {
+                    return Err(::sacp_cbor::CborError::new(
+                        ::sacp_cbor::ErrorCode::ArrayLenMismatch,
+                        arr_off,
+                    ));
+                }
+            };
+        });
     }
 
     Ok((vars, decodes))
@@ -62,7 +72,8 @@ fn array_decode_block(
 ) -> proc_macro2::TokenStream {
     quote! {
         let arr_off = decoder.position();
-        let (arr_len, entered) = decoder.parse_array_len()?;
+        let mut array = decoder.array()?;
+        let arr_len = array.remaining();
         if arr_len != #expected {
             return Err(::sacp_cbor::CborError::new(
                 ::sacp_cbor::ErrorCode::ArrayLenMismatch,
@@ -70,9 +81,6 @@ fn array_decode_block(
             ));
         }
         #(#decodes)*
-        if entered {
-            decoder.exit_container();
-        }
         #result
     }
 }
@@ -132,7 +140,7 @@ fn decode_named_fields(
 
         matches.push(quote! {
             #key => {
-                #var = ::core::option::Option::Some(::sacp_cbor::CborDecode::decode(decoder)?);
+                #var = ::core::option::Option::Some(map.next_value()?);
             }
         });
 
@@ -150,18 +158,15 @@ fn decode_named_fields(
 
     Ok(quote! {
         let map_off = decoder.position();
-        let (map_len, entered) = decoder.parse_map_len()?;
+        let mut map = decoder.map()?;
         #(#inits)*
-        for _ in 0..map_len {
-            let key_off = decoder.position();
-            let k = decoder.parse_text_key()?;
+        while let ::core::option::Option::Some(k) = map.next_key()? {
             match k {
                 #(#matches)*
-                _ => decoder.skip_value()?,
+                _ => {
+                    let _unused: ::sacp_cbor::CborValueRef = map.next_value()?;
+                }
             }
-        }
-        if entered {
-            decoder.exit_container();
         }
         Ok(#target { #(#finals)* })
     })
@@ -188,7 +193,7 @@ pub(crate) fn decode_struct(
             let body = decode_named_fields(fields, quote!(Self))?;
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                    fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
+                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
                         #body
                     }
                 }
@@ -202,7 +207,7 @@ pub(crate) fn decode_struct(
             let body = array_decode_block(expected, &decodes, quote!(Ok(Self(#(#vars),*))));
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                    fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
+                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
                         #body
                     }
                 }
@@ -211,7 +216,7 @@ pub(crate) fn decode_struct(
 
         Fields::Unit => Ok(quote! {
             impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
+                fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
                     let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                     Ok(Self)
                 }
@@ -247,10 +252,10 @@ pub(crate) fn decode_enum(
         match &variant.fields {
             Fields::Unit => {
                 arms.push(quote! {
-                    #vname => {
+                    #vname => map.decode_value(|decoder| {
                         let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                         Ok(Self::#ident)
-                    }
+                    })
                 });
             }
 
@@ -261,43 +266,47 @@ pub(crate) fn decode_enum(
                 let body =
                     array_decode_block(expected, &decodes, quote!(Ok(Self::#ident(#(#vars),*))));
                 arms.push(quote! {
-                    #vname => {
+                    #vname => map.decode_value(|decoder| {
                         #body
-                    }
+                    })
                 });
             }
 
             Fields::Named(fields) => {
                 add_decode_bounds_for_named_fields(name, fields, wc, &decode_lt)?;
                 let body = decode_named_fields(fields, quote!(Self::#ident))?;
-                arms.push(quote! { #vname => { #body } });
+                arms.push(quote! { #vname => map.decode_value(|decoder| { #body }) });
             }
         }
     }
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
                 let map_off = decoder.position();
-                let (map_len, entered) = decoder.parse_map_len()?;
-                if map_len != 1 {
+                let mut map = decoder.map()?;
+                if map.remaining() != 1 {
                     return Err(::sacp_cbor::CborError::new(
                         ::sacp_cbor::ErrorCode::MapLenMismatch,
                         map_off,
                     ));
                 }
-                let _key_off = decoder.position();
-                let k = decoder.parse_text_key()?;
+                let k = match map.next_key()? {
+                    ::core::option::Option::Some(key) => key,
+                    ::core::option::Option::None => {
+                        return Err(::sacp_cbor::CborError::new(
+                            ::sacp_cbor::ErrorCode::MapLenMismatch,
+                            map_off,
+                        ));
+                    }
+                };
                 let result = match k {
                     #(#arms),*,
                     _ => Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::MissingKey,
+                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
                         map_off,
                     )),
                 };
-                if entered {
-                    decoder.exit_container();
-                }
                 result
             }
         }
@@ -407,7 +416,7 @@ pub(crate) fn decode_enum_untagged(
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode(decoder: &mut ::sacp_cbor::Decoder<#decode_lt>) -> Result<Self, ::sacp_cbor::CborError> {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
                 match decoder.peek_kind()? {
                     #(#arms),*,
                     _ => Err(::sacp_cbor::CborError::new(

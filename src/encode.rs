@@ -1,12 +1,11 @@
 use crate::alloc_util::try_reserve;
-use crate::canonical::{CborBytes, CborBytesRef, EncodedTextKey};
+use crate::canonical::{CanonicalCbor, CanonicalCborRef, EncodedTextKey};
 use crate::codec::CborEncode;
-use crate::profile::{cmp_encoded_key_bytes, validate_bignum_bytes, validate_int_safe_i64};
+use crate::profile::{check_encoded_key_order, validate_bignum_bytes, validate_int_safe_i64};
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::{CborError, ErrorCode};
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 
 trait Sink {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CborError>;
@@ -138,6 +137,9 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
 /// This supports splicing validated canonical bytes.
 pub struct Encoder {
     sink: VecSink,
+    depth: usize,
+    root_done: bool,
+    root_end: usize,
 }
 
 impl Encoder {
@@ -146,6 +148,9 @@ impl Encoder {
     pub const fn new() -> Self {
         Self {
             sink: VecSink::new(),
+            depth: 0,
+            root_done: false,
+            root_end: 0,
         }
     }
 
@@ -154,6 +159,9 @@ impl Encoder {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             sink: VecSink::with_capacity(capacity),
+            depth: 0,
+            root_done: false,
+            root_end: 0,
         }
     }
 
@@ -175,27 +183,178 @@ impl Encoder {
         self.sink.into_vec()
     }
 
-    /// Consume and return canonical bytes as a `CborBytes`.
+    /// Consume and return canonical bytes as a `CanonicalCbor`.
     ///
     /// # Errors
     ///
     /// Returns an error if the buffer does not contain exactly one canonical CBOR item.
-    pub fn into_canonical(self) -> Result<CborBytes, CborError> {
-        let bytes = self.into_vec();
-        let limits = crate::DecodeLimits::for_bytes(bytes.len());
-        crate::validate_canonical(&bytes, limits)?;
-        Ok(CborBytes::new_unchecked(bytes))
+    pub fn into_canonical(self) -> Result<CanonicalCbor, CborError> {
+        if self.depth != 0 {
+            return Err(CborError::new(
+                ErrorCode::UnexpectedEof,
+                self.sink.position(),
+            ));
+        }
+        if !self.root_done {
+            return Err(CborError::new(ErrorCode::UnexpectedEof, 0));
+        }
+        Ok(CanonicalCbor::new_unchecked(self.into_vec()))
     }
 
     /// Clear the encoder while retaining allocated capacity.
     pub fn clear(&mut self) {
         self.sink.buf.clear();
+        self.depth = 0;
+        self.root_done = false;
+        self.root_end = 0;
     }
 
     /// Borrow the bytes emitted so far.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.sink.buf
+    }
+
+    #[inline]
+    const fn begin_value(&self) -> Result<bool, CborError> {
+        if self.depth == 0 {
+            if self.root_done {
+                return Err(CborError::new(ErrorCode::TrailingBytes, self.root_end));
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    #[inline]
+    fn finish_value(&mut self, root: bool) {
+        if root {
+            self.root_done = true;
+            self.root_end = self.sink.position();
+        }
+    }
+
+    #[inline]
+    fn enter_container(&mut self) {
+        self.depth = self.depth.saturating_add(1);
+    }
+
+    #[inline]
+    fn exit_container(&mut self) {
+        debug_assert!(self.depth > 0);
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) const fn in_container(&self) -> bool {
+        self.depth != 0
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) fn finish_container(&mut self, root: bool) {
+        self.exit_container();
+        self.finish_value(root);
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) fn abort_container(&mut self) {
+        self.exit_container();
+    }
+
+    #[inline]
+    pub(crate) fn emit_null(&mut self) -> Result<(), CborError> {
+        self.sink.write_u8(0xf6)
+    }
+
+    #[inline]
+    pub(crate) fn emit_bool(&mut self, v: bool) -> Result<(), CborError> {
+        self.sink.write_u8(if v { 0xf5 } else { 0xf4 })
+    }
+
+    #[inline]
+    pub(crate) fn emit_int(&mut self, v: i64) -> Result<(), CborError> {
+        validate_int_safe_i64(v).map_err(|code| CborError::new(code, self.sink.position()))?;
+        encode_int(&mut self.sink, v)
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) fn emit_int_u128(&mut self, v: u128) -> Result<(), CborError> {
+        let safe_max = u128::from(crate::profile::MAX_SAFE_INTEGER);
+        if v <= safe_max {
+            let i = i64::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
+            return self.emit_int(i);
+        }
+
+        let magnitude = crate::int::magnitude_from_u128(v)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
+        self.emit_bignum(false, &magnitude)
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) fn emit_int_i128(&mut self, v: i128) -> Result<(), CborError> {
+        let min = i128::from(crate::profile::MIN_SAFE_INTEGER);
+        let max = i128::from(crate::profile::MAX_SAFE_INTEGER_I64);
+
+        if v >= min && v <= max {
+            let i = i64::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
+            return self.emit_int(i);
+        }
+
+        let negative = v < 0;
+        let n_u128 = if negative {
+            let n_i128 = -1_i128 - v;
+            u128::try_from(n_i128)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
+        } else {
+            u128::try_from(v)
+                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
+        };
+
+        let magnitude = crate::int::magnitude_from_u128(n_u128)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
+        self.emit_bignum(negative, &magnitude)
+    }
+
+    #[inline]
+    pub(crate) fn emit_bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
+        validate_bignum_bytes(negative, magnitude)
+            .map_err(|code| CborError::new(code, self.sink.position()))?;
+        let tag = if negative { 3u64 } else { 2u64 };
+        encode_major_uint(&mut self.sink, 6, tag)?;
+        encode_bytes(&mut self.sink, magnitude)
+    }
+
+    #[inline]
+    pub(crate) fn emit_bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
+        encode_bytes(&mut self.sink, b)
+    }
+
+    #[inline]
+    pub(crate) fn emit_text(&mut self, s: &str) -> Result<(), CborError> {
+        encode_text(&mut self.sink, s)
+    }
+
+    #[inline]
+    pub(crate) fn emit_float(&mut self, bits: F64Bits) -> Result<(), CborError> {
+        encode_float64(&mut self.sink, bits)
+    }
+
+    #[inline]
+    pub(crate) fn emit_raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
+        self.sink.write(v.as_bytes())
+    }
+
+    #[inline]
+    pub(crate) fn emit_raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
+        self.sink.write(v.as_bytes())
     }
 
     #[cfg(feature = "serde")]
@@ -214,7 +373,10 @@ impl Encoder {
     ///
     /// Returns an error if writing to the underlying buffer fails.
     pub fn null(&mut self) -> Result<(), CborError> {
-        self.sink.write_u8(0xf6)
+        let root = self.begin_value()?;
+        self.emit_null()?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a CBOR boolean.
@@ -223,7 +385,10 @@ impl Encoder {
     ///
     /// Returns an error if writing to the underlying buffer fails.
     pub fn bool(&mut self, v: bool) -> Result<(), CborError> {
-        self.sink.write_u8(if v { 0xf5 } else { 0xf4 })
+        let root = self.begin_value()?;
+        self.emit_bool(v)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a safe-range integer.
@@ -232,8 +397,10 @@ impl Encoder {
     ///
     /// Returns an error if the integer is outside the safe range or if encoding fails.
     pub fn int(&mut self, v: i64) -> Result<(), CborError> {
-        validate_int_safe_i64(v).map_err(|code| CborError::new(code, self.sink.position()))?;
-        encode_int(&mut self.sink, v)
+        let root = self.begin_value()?;
+        self.emit_int(v)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode an unsigned integer, using a bignum when outside the safe range.
@@ -290,11 +457,10 @@ impl Encoder {
     ///
     /// Returns an error if the magnitude is not canonical or if encoding fails.
     pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
-        validate_bignum_bytes(negative, magnitude)
-            .map_err(|code| CborError::new(code, self.sink.position()))?;
-        let tag = if negative { 3u64 } else { 2u64 };
-        encode_major_uint(&mut self.sink, 6, tag)?;
-        encode_bytes(&mut self.sink, magnitude)
+        let root = self.begin_value()?;
+        self.emit_bignum(negative, magnitude)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a byte string.
@@ -303,7 +469,10 @@ impl Encoder {
     ///
     /// Returns an error if encoding fails.
     pub fn bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
-        encode_bytes(&mut self.sink, b)
+        let root = self.begin_value()?;
+        self.emit_bytes(b)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a text string.
@@ -312,7 +481,10 @@ impl Encoder {
     ///
     /// Returns an error if encoding fails.
     pub fn text(&mut self, s: &str) -> Result<(), CborError> {
-        encode_text(&mut self.sink, s)
+        let root = self.begin_value()?;
+        self.emit_text(s)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a float64 bit pattern.
@@ -321,7 +493,10 @@ impl Encoder {
     ///
     /// Returns an error if encoding fails.
     pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
-        encode_float64(&mut self.sink, bits)
+        let root = self.begin_value()?;
+        self.emit_float(bits)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Splice already validated canonical CBOR bytes as the next value.
@@ -329,8 +504,11 @@ impl Encoder {
     /// # Errors
     ///
     /// Returns an error if writing to the underlying buffer fails.
-    pub fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
-        self.sink.write(v.as_bytes())
+    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
+        let root = self.begin_value()?;
+        self.emit_raw_cbor(v)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Splice a canonical sub-value reference.
@@ -339,7 +517,10 @@ impl Encoder {
     ///
     /// Returns an error if writing to the underlying buffer fails.
     pub fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        self.sink.write(v.as_bytes())
+        let root = self.begin_value()?;
+        self.emit_raw_value_ref(v)?;
+        self.finish_value(root);
+        Ok(())
     }
 
     /// Encode a definite-length array and fill it via the provided builder.
@@ -351,6 +532,7 @@ impl Encoder {
     where
         F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
     {
+        let root = self.begin_value()?;
         let start = self.sink.buf.len();
         if let Err(err) = encode_major_len(&mut self.sink, 4, len) {
             self.sink.buf.truncate(start);
@@ -360,26 +542,36 @@ impl Encoder {
             self.sink.buf.truncate(start);
             return Err(err);
         }
-        let mut a = ArrayEncoder {
-            enc: self,
-            remaining: len,
+        self.enter_container();
+        let (res, remaining) = {
+            let mut a = ArrayEncoder {
+                enc: self,
+                remaining: len,
+            };
+            let res = f(&mut a);
+            (res, a.remaining)
         };
-        if let Err(err) = f(&mut a) {
+        self.exit_container();
+        if let Err(err) = res {
             self.sink.buf.truncate(start);
             return Err(err);
         }
-        if a.remaining != 0 {
+        if remaining != 0 {
             let err = CborError::new(ErrorCode::ArrayLenMismatch, self.sink.position());
             self.sink.buf.truncate(start);
             return Err(err);
         }
+        self.finish_value(root);
         Ok(())
     }
 
     #[cfg(feature = "serde")]
-    pub(crate) fn array_header(&mut self, len: usize) -> Result<(), CborError> {
+    pub(crate) fn array_header(&mut self, len: usize) -> Result<bool, CborError> {
+        let root = self.begin_value()?;
         encode_major_len(&mut self.sink, 4, len)?;
-        self.reserve_min_array_items(len)
+        self.reserve_min_array_items(len)?;
+        self.enter_container();
+        Ok(root)
     }
 
     /// Encode a definite-length map and fill it via the provided builder.
@@ -391,6 +583,7 @@ impl Encoder {
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
     {
+        let root = self.begin_value()?;
         let start = self.sink.buf.len();
         if let Err(err) = encode_major_len(&mut self.sink, 5, len) {
             self.sink.buf.truncate(start);
@@ -400,27 +593,37 @@ impl Encoder {
             self.sink.buf.truncate(start);
             return Err(err);
         }
-        let mut m = MapEncoder {
-            enc: self,
-            remaining: len,
-            prev_key_range: None,
+        self.enter_container();
+        let (res, remaining) = {
+            let mut m = MapEncoder {
+                enc: self,
+                remaining: len,
+                prev_key_range: None,
+            };
+            let res = f(&mut m);
+            (res, m.remaining)
         };
-        if let Err(err) = f(&mut m) {
+        self.exit_container();
+        if let Err(err) = res {
             self.sink.buf.truncate(start);
             return Err(err);
         }
-        if m.remaining != 0 {
+        if remaining != 0 {
             let err = CborError::new(ErrorCode::MapLenMismatch, self.sink.position());
             self.sink.buf.truncate(start);
             return Err(err);
         }
+        self.finish_value(root);
         Ok(())
     }
 
     #[cfg(feature = "serde")]
-    pub(crate) fn map_header(&mut self, len: usize) -> Result<(), CborError> {
+    pub(crate) fn map_header(&mut self, len: usize) -> Result<bool, CborError> {
+        let root = self.begin_value()?;
         encode_major_len(&mut self.sink, 5, len)?;
-        self.reserve_min_map_items(len)
+        self.reserve_min_map_items(len)?;
+        self.enter_container();
+        Ok(root)
     }
 
     /// Internal hook used by `cbor_bytes!` for `$expr` values.
@@ -483,7 +686,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn null(&mut self) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.null()
+        self.enc.emit_null()
     }
 
     /// Encode a CBOR boolean.
@@ -493,7 +696,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn bool(&mut self, v: bool) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.bool(v)
+        self.enc.emit_bool(v)
     }
 
     /// Encode a safe-range integer.
@@ -503,7 +706,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn int(&mut self, v: i64) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.int(v)
+        self.enc.emit_int(v)
     }
 
     /// Encode a CBOR bignum (tag 2/3 + byte string magnitude).
@@ -513,7 +716,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.bignum(negative, magnitude)
+        self.enc.emit_bignum(negative, magnitude)
     }
 
     /// Encode a byte string.
@@ -523,7 +726,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.bytes(b)
+        self.enc.emit_bytes(b)
     }
 
     /// Encode a text string.
@@ -533,7 +736,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn text(&mut self, s: &str) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.text(s)
+        self.enc.emit_text(s)
     }
 
     /// Encode a float64 bit pattern.
@@ -543,7 +746,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.float(bits)
+        self.enc.emit_float(bits)
     }
 
     /// Splice canonical CBOR bytes as the next array element.
@@ -551,9 +754,9 @@ impl ArrayEncoder<'_> {
     /// # Errors
     ///
     /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn raw_cbor(&mut self, v: CborBytesRef<'_>) -> Result<(), CborError> {
+    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.raw_cbor(v)
+        self.enc.emit_raw_cbor(v)
     }
 
     /// Splice a canonical sub-value reference as the next array element.
@@ -563,7 +766,7 @@ impl ArrayEncoder<'_> {
     /// Returns an error if the array length is exceeded or if encoding fails.
     pub fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
         self.consume_one()?;
-        self.enc.raw_value_ref(v)
+        self.enc.emit_raw_value_ref(v)
     }
 
     /// Encode a value using the native `CborEncode` trait.
@@ -650,8 +853,8 @@ impl MapEncoder<'_> {
         if let Some((ps, pe)) = self.prev_key_range {
             let prev = &self.enc.sink.buf[ps..pe];
             let curr = &self.enc.sink.buf[key_start..key_end];
-            if let Err(err) = check_map_key_order(prev, curr, key_start) {
-                return self.fail_entry(entry_start, err);
+            if let Err(code) = check_encoded_key_order(prev, curr) {
+                return self.fail_entry(entry_start, CborError::new(code, key_start));
             }
         }
         Ok(())
@@ -715,10 +918,4 @@ impl MapEncoder<'_> {
     }
 }
 
-fn check_map_key_order(prev: &[u8], curr: &[u8], key_start: usize) -> Result<(), CborError> {
-    match cmp_encoded_key_bytes(prev, curr) {
-        Ordering::Less => Ok(()),
-        Ordering::Equal => Err(CborError::new(ErrorCode::DuplicateMapKey, key_start)),
-        Ordering::Greater => Err(CborError::new(ErrorCode::NonCanonicalMapOrder, key_start)),
-    }
-}
+ 

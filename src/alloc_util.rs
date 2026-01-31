@@ -1,7 +1,6 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::alloc::Layout;
 
 use crate::{CborError, ErrorCode};
 
@@ -10,7 +9,13 @@ fn check_reserve_len<T>(len: usize, additional: usize, offset: usize) -> Result<
     let needed = len
         .checked_add(additional)
         .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
-    Layout::array::<T>(needed).map_err(|_| CborError::new(ErrorCode::LengthOverflow, offset))?;
+    let elem_size = core::mem::size_of::<T>();
+    if elem_size != 0 {
+        let max = (isize::MAX as usize) / elem_size;
+        if needed > max {
+            return Err(CborError::new(ErrorCode::LengthOverflow, offset));
+        }
+    }
     Ok(())
 }
 
@@ -73,11 +78,24 @@ pub fn try_vec_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborEr
 }
 
 #[inline]
+pub fn try_vec_u8_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborError> {
+    try_vec_from_slice(bytes, offset)
+}
+
+#[inline]
 pub fn try_box_str_from_str(s: &str, offset: usize) -> Result<Box<str>, CborError> {
     let mut out = String::new();
     try_reserve_exact_str(&mut out, s.len(), offset)?;
     out.push_str(s);
     Ok(out.into_boxed_str())
+}
+
+#[inline]
+pub fn try_string_from_str(s: &str, offset: usize) -> Result<String, CborError> {
+    let mut out = String::new();
+    try_reserve_exact_str(&mut out, s.len(), offset)?;
+    out.push_str(s);
+    Ok(out)
 }
 
 #[inline]

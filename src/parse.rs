@@ -1,4 +1,4 @@
-use crate::canonical::CborBytesRef;
+use crate::canonical::CanonicalCborRef;
 use crate::wire::{self, Cursor};
 use crate::{CborError, DecodeLimits, ErrorCode};
 
@@ -23,7 +23,7 @@ pub fn validate(bytes: &[u8], limits: DecodeLimits) -> Result<(), CborError> {
 pub fn validate_canonical(
     bytes: &'_ [u8],
     limits: DecodeLimits,
-) -> Result<CborBytesRef<'_>, CborError> {
+) -> Result<CanonicalCborRef<'_>, CborError> {
     if bytes.len() > limits.max_input_bytes {
         return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
     }
@@ -31,15 +31,7 @@ pub fn validate_canonical(
     if end != bytes.len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, end));
     }
-    Ok(CborBytesRef::new(bytes))
-}
-
-#[cfg(feature = "alloc")]
-pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
-    let mut cursor = Cursor::<CborError>::with_pos(data, start);
-    let mut items_seen = 0;
-    wire::skip_one_value::<false, CborError>(&mut cursor, None, &mut items_seen, 0)?;
-    Ok(cursor.position())
+    Ok(CanonicalCborRef::new(bytes))
 }
 
 fn value_end_internal(

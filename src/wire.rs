@@ -1,15 +1,12 @@
-use core::cmp::Ordering;
 use core::marker::PhantomData;
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
-#[cfg(feature = "alloc")]
-use core::alloc::Layout;
 
 #[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::{
-    cmp_encoded_key_bytes, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
+    check_encoded_key_order, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
 use crate::utf8;
 use crate::{CborError, DecodeLimits, ErrorCode};
@@ -275,10 +272,8 @@ pub fn check_map_key_order<E: DecodeError>(
     if let Some((ps, pe)) = *prev_key_range {
         let prev = &data[ps..pe];
         let curr = &data[key_start..key_end];
-        match cmp_encoded_key_bytes(prev, curr) {
-            Ordering::Less => {}
-            Ordering::Equal => return Err(E::new(ErrorCode::DuplicateMapKey, key_start)),
-            Ordering::Greater => return Err(E::new(ErrorCode::NonCanonicalMapOrder, key_start)),
+        if let Err(code) = check_encoded_key_order(prev, curr) {
+            return Err(E::new(code, key_start));
         }
     }
     *prev_key_range = Some((key_start, key_end));
@@ -462,7 +457,13 @@ fn try_reserve_vec<T, E: DecodeError>(
     if needed <= v.capacity() {
         return Ok(());
     }
-    Layout::array::<T>(needed).map_err(|_| E::new(ErrorCode::LengthOverflow, offset))?;
+    let elem_size = core::mem::size_of::<T>();
+    if elem_size != 0 {
+        let max = (isize::MAX as usize) / elem_size;
+        if needed > max {
+            return Err(E::new(ErrorCode::LengthOverflow, offset));
+        }
+    }
     v.try_reserve(additional)
         .map_err(|_| E::new(ErrorCode::AllocationFailed, offset))
 }

@@ -92,6 +92,8 @@ pub enum ErrorCode {
     ExpectedFloat,
     /// Expected a CBOR value matching an untagged enum variant.
     ExpectedEnum,
+    /// Unknown enum variant key.
+    UnknownEnumVariant,
 
     /// Patch operations overlap or conflict.
     PatchConflict,
@@ -178,6 +180,7 @@ impl fmt::Display for CborError {
             ErrorCode::ExpectedNull => "expected CBOR null",
             ErrorCode::ExpectedFloat => "expected CBOR float64",
             ErrorCode::ExpectedEnum => "expected CBOR enum value",
+            ErrorCode::UnknownEnumVariant => "unknown CBOR enum variant",
             ErrorCode::PatchConflict => "patch operations conflict",
             ErrorCode::IndexOutOfBounds => "array index out of bounds",
             ErrorCode::InvalidQuery => "invalid query arguments",

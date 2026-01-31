@@ -25,7 +25,7 @@
 //! the canonical header length is a strictly monotone function of the payload length.
 //!
 //! ## Trust boundary
-//! [`CborBytesRef`](crate::CborBytesRef) is the only public witness that a byte slice is canonical.
+//! [`CanonicalCborRef`](crate::CanonicalCborRef) is the only public witness that a byte slice is canonical.
 //! All canonical-trusted parsing (query/edit/serde trusted mode) assumes this witness was produced
 //! by [`validate_canonical`](crate::validate_canonical) or constructed internally.
 
@@ -128,6 +128,18 @@ pub fn cmp_encoded_key_bytes(a: &[u8], b: &[u8]) -> Ordering {
     match a.len().cmp(&b.len()) {
         Ordering::Equal => a.cmp(b),
         other => other,
+    }
+}
+
+/// Validate canonical key ordering for two encoded CBOR text keys.
+///
+/// Returns `DuplicateMapKey` or `NonCanonicalMapOrder` on failure.
+#[inline]
+pub fn check_encoded_key_order(prev: &[u8], curr: &[u8]) -> Result<(), ErrorCode> {
+    match cmp_encoded_key_bytes(prev, curr) {
+        Ordering::Less => Ok(()),
+        Ordering::Equal => Err(ErrorCode::DuplicateMapKey),
+        Ordering::Greater => Err(ErrorCode::NonCanonicalMapOrder),
     }
 }
 

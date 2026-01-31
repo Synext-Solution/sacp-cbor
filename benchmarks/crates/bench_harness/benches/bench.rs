@@ -38,28 +38,28 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
     out
 }
 
-static APPENDIX_CANONICAL: OnceLock<Vec<sacp_cbor::CborBytes>> = OnceLock::new();
+static APPENDIX_CANONICAL: OnceLock<Vec<sacp_cbor::CanonicalCbor>> = OnceLock::new();
 static SYNTHETIC_VALUES: OnceLock<Vec<(String, BenchValue)>> = OnceLock::new();
 static SYNTHETIC_VALUES_FAST: OnceLock<Vec<(String, BenchValue)>> = OnceLock::new();
-static SYNTHETIC_BYTES: OnceLock<Vec<(String, sacp_cbor::CborBytes)>> = OnceLock::new();
-static SYNTHETIC_BYTES_FAST: OnceLock<Vec<(String, sacp_cbor::CborBytes)>> = OnceLock::new();
+static SYNTHETIC_BYTES: OnceLock<Vec<(String, sacp_cbor::CanonicalCbor)>> = OnceLock::new();
+static SYNTHETIC_BYTES_FAST: OnceLock<Vec<(String, sacp_cbor::CanonicalCbor)>> = OnceLock::new();
 static QUERY_EDIT_DOCS: OnceLock<Vec<(String, BenchValue)>> = OnceLock::new();
 static QUERY_EDIT_DOCS_FAST: OnceLock<Vec<(String, BenchValue)>> = OnceLock::new();
-static QUERY_EDIT_BYTES: OnceLock<Vec<(String, sacp_cbor::CborBytes)>> = OnceLock::new();
-static QUERY_EDIT_BYTES_FAST: OnceLock<Vec<(String, sacp_cbor::CborBytes)>> = OnceLock::new();
+static QUERY_EDIT_BYTES: OnceLock<Vec<(String, sacp_cbor::CanonicalCbor)>> = OnceLock::new();
+static QUERY_EDIT_BYTES_FAST: OnceLock<Vec<(String, sacp_cbor::CanonicalCbor)>> = OnceLock::new();
 
 fn fast_mode_enabled() -> bool {
     std::env::var_os("BENCH_FAST").is_some()
 }
 
-fn load_appendix_canonical() -> &'static Vec<sacp_cbor::CborBytes> {
+fn load_appendix_canonical() -> &'static Vec<sacp_cbor::CanonicalCbor> {
     APPENDIX_CANONICAL.get_or_init(|| {
         let path = dataset_root().join("appendix_a.json");
         let dataset = load_appendix_a(&path).expect("appendix_a.json must load");
         let mut out = Vec::new();
         for bytes in dataset.items {
             let limits = sacp_cbor::DecodeLimits::for_bytes(bytes.len());
-            if let Ok(canon) = sacp_cbor::CborBytes::from_vec(bytes, limits) {
+            if let Ok(canon) = sacp_cbor::CanonicalCbor::from_vec(bytes, limits) {
                 out.push(canon);
             }
         }
@@ -89,19 +89,19 @@ fn synthetic_values_for_run() -> &'static Vec<(String, BenchValue)> {
     }
 }
 
-fn synthetic_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::CborBytes)> {
+fn synthetic_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::CanonicalCbor)> {
     values
         .iter()
         .map(|(name, v)| {
             let bytes = encode_sacp_stream(v).expect("encode synthetic value");
-            let canon = sacp_cbor::CborBytes::from_vec_default_limits(bytes)
+            let canon = sacp_cbor::CanonicalCbor::from_vec_default_limits(bytes)
                 .expect("synthetic bytes must be canonical");
             (name.clone(), canon)
         })
         .collect()
 }
 
-fn synthetic_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CborBytes)> {
+fn synthetic_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CanonicalCbor)> {
     if fast_mode_enabled() {
         SYNTHETIC_BYTES_FAST.get_or_init(|| synthetic_bytes(synthetic_values_fast()))
     } else {
@@ -169,19 +169,19 @@ fn query_edit_docs_fast() -> &'static Vec<(String, BenchValue)> {
     })
 }
 
-fn query_edit_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::CborBytes)> {
+fn query_edit_bytes(values: &[(String, BenchValue)]) -> Vec<(String, sacp_cbor::CanonicalCbor)> {
     values
         .iter()
         .map(|(name, v)| {
             let bytes = encode_sacp_stream(v).expect("encode query/edit value");
-            let canon = sacp_cbor::CborBytes::from_vec_default_limits(bytes)
+            let canon = sacp_cbor::CanonicalCbor::from_vec_default_limits(bytes)
                 .expect("query/edit bytes must be canonical");
             (name.clone(), canon)
         })
         .collect()
 }
 
-fn query_edit_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CborBytes)> {
+fn query_edit_bytes_for_run() -> &'static Vec<(String, sacp_cbor::CanonicalCbor)> {
     if fast_mode_enabled() {
         QUERY_EDIT_BYTES_FAST.get_or_init(|| query_edit_bytes(query_edit_docs_fast()))
     } else {

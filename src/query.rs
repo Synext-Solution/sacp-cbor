@@ -1,7 +1,7 @@
 //! Query support for canonical CBOR messages.
 //!
 //! This module provides a lightweight, allocation-free query engine for
-//! [`CborBytesRef`](crate::CborBytesRef). Queries return borrowed views
+//! [`CanonicalCborRef`](crate::CanonicalCborRef). Queries return borrowed views
 //! ([`CborValueRef`]) pointing into the original message bytes.
 //!
 //! The query layer assumes the input bytes are already validated as canonical via
@@ -10,14 +10,14 @@
 
 use core::cmp::Ordering;
 
-use crate::canonical::CborBytesRef;
+use crate::canonical::CanonicalCborRef;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::utf8;
 use crate::wire;
 use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
-use crate::canonical::CborBytes;
+use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
 use crate::canonical::EncodedTextKey;
 
@@ -697,8 +697,13 @@ impl<'a> MapRef<'a> {
     where
         'a: 'k,
     {
-        self.extras_sorted(used_keys)?
-            .collect::<Result<Vec<_>, _>>()
+        use crate::alloc_util::try_vec_with_capacity;
+
+        let mut out = try_vec_with_capacity(self.len(), self.map_off)?;
+        for entry in self.extras_sorted(used_keys)? {
+            out.push(entry?);
+        }
+        Ok(out)
     }
 
     /// Accepts `used_keys` in any order (allocates to sort them), then returns extras.
@@ -885,8 +890,8 @@ impl<'a> ArrayRef<'a> {
     }
 }
 
-/// Adds query methods to `CborBytesRef`.
-impl<'a> CborBytesRef<'a> {
+/// Adds query methods to `CanonicalCborRef`.
+impl<'a> CanonicalCborRef<'a> {
     /// Returns a borrowed view of the root CBOR item.
     ///
     /// Canonical validation guarantees the message is exactly one CBOR item, so the
@@ -907,7 +912,7 @@ impl<'a> CborBytesRef<'a> {
 }
 
 #[cfg(feature = "alloc")]
-impl CborBytes {
+impl CanonicalCbor {
     /// Returns a borrowed view of the root CBOR item.
     #[must_use]
     pub fn root(&self) -> CborValueRef<'_> {
