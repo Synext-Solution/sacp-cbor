@@ -88,7 +88,6 @@ fn finish_struct(enc: &mut Encoder, remaining: usize, roots: &[bool]) -> Result<
     Ok(())
 }
 
-
 /// Serialize a Rust value into canonical SACP-CBOR/1 bytes.
 ///
 /// # Errors
@@ -195,15 +194,24 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
@@ -215,19 +223,31 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(i64::from(v)), |enc| enc.int(i64::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int(i64::from(v)),
+            |enc| enc.int(i64::from(v)),
+        )
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int_u128(u128::from(v)), |enc| enc.int_u128(u128::from(v)))
+        self.encode_with(
+            |enc| enc.emit_int_u128(u128::from(v)),
+            |enc| enc.int_u128(u128::from(v)),
+        )
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
@@ -1079,10 +1099,9 @@ impl<'a, 'de, const CHECKED: bool> EnumAccess<'de> for EnumAccessImpl<'a, 'de, C
     where
         V: DeserializeSeed<'de>,
     {
-        let variant = seed
-            .deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(
-                self.key,
-            ))?;
+        let variant = seed.deserialize(
+            <&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(self.key),
+        )?;
         Ok((variant, VariantAccessImpl { map: self.map }))
     }
 }
@@ -1339,14 +1358,22 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
         visitor.visit_unit()
     }
 
-    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value, DeError>
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
         self.deserialize_unit(visitor)
     }
 
-    fn deserialize_newtype_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value, DeError>
+    fn deserialize_newtype_struct<V>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {

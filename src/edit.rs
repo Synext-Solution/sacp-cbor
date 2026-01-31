@@ -445,7 +445,10 @@ impl<'a> EditEncode<'a> for u64 {
     fn into_value(self) -> Result<EditValue<'a>, CborError> {
         encode_to_vec(|enc| {
             if self > crate::MAX_SAFE_INTEGER {
-                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, enc.len()));
+                return Err(CborError::new(
+                    ErrorCode::IntegerOutsideSafeRange,
+                    enc.len(),
+                ));
             }
             let v = i64::try_from(self)
                 .map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;

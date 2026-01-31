@@ -32,7 +32,6 @@ impl<K, V> MapEntries<K, V> {
     }
 }
 
-
 /// Streaming decoder over canonical CBOR bytes.
 pub struct Decoder<'de, const CHECKED: bool> {
     cursor: Cursor<'de, CborError>,
@@ -582,7 +581,10 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     /// Returns an error if decoding fails or the map is malformed.
     pub fn next_key(&mut self) -> Result<Option<&'de str>, CborError> {
         if self.pending_value {
-            return Err(CborError::new(ErrorCode::MalformedCanonical, self.decoder.position()));
+            return Err(CborError::new(
+                ErrorCode::MalformedCanonical,
+                self.decoder.position(),
+            ));
         }
         if self.remaining == 0 {
             return Ok(None);
@@ -595,7 +597,12 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
         let key = self.decoder.parse_text_from_header(off, ai)?;
         let key_end = self.decoder.position();
         if CHECKED {
-            wire::check_map_key_order(self.decoder.data(), &mut self.prev_key_range, key_start, key_end)?;
+            wire::check_map_key_order(
+                self.decoder.data(),
+                &mut self.prev_key_range,
+                key_start,
+                key_end,
+            )?;
         }
         self.pending_value = true;
         Ok(Some(key))
@@ -620,7 +627,10 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
         F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, CborError>,
     {
         if !self.pending_value {
-            return Err(CborError::new(ErrorCode::MalformedCanonical, self.decoder.position()));
+            return Err(CborError::new(
+                ErrorCode::MalformedCanonical,
+                self.decoder.position(),
+            ));
         }
         let value = f(self.decoder)?;
         self.pending_value = false;
@@ -633,9 +643,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     /// # Errors
     ///
     /// Returns an error if decoding fails or the map is malformed.
-    pub fn next_entry<V: CborDecode<'de>>(
-        &mut self,
-    ) -> Result<Option<(&'de str, V)>, CborError> {
+    pub fn next_entry<V: CborDecode<'de>>(&mut self) -> Result<Option<(&'de str, V)>, CborError> {
         let Some(key) = self.next_key()? else {
             return Ok(None);
         };
@@ -669,9 +677,7 @@ pub trait CborDecode<'de>: Sized {
     ///
     /// Returns an error if the CBOR value does not match the expected type or violates profile
     /// constraints.
-    fn decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError>;
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError>;
 }
 
 #[cfg(feature = "alloc")]
@@ -711,7 +717,9 @@ pub fn decode<'de, T: CborDecode<'de>>(
 /// # Errors
 ///
 /// Returns an error if decoding fails.
-pub fn decode_canonical<'de, T: CborDecode<'de>>(canon: CanonicalCborRef<'de>) -> Result<T, CborError> {
+pub fn decode_canonical<'de, T: CborDecode<'de>>(
+    canon: CanonicalCborRef<'de>,
+) -> Result<T, CborError> {
     let limits = DecodeLimits::for_bytes(canon.len());
     let mut decoder = Decoder::<false>::new_trusted(canon, limits)?;
     let value = T::decode(&mut decoder)?;
@@ -1090,8 +1098,7 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
         let off = decoder.position();
         let mut map = decoder.map()?;
-        let mut out =
-            alloc_util::try_vec_with_capacity::<(&'de str, V)>(map.remaining(), off)?;
+        let mut out = alloc_util::try_vec_with_capacity::<(&'de str, V)>(map.remaining(), off)?;
         while let Some((key, value)) = map.next_entry()? {
             out.push((key, value));
         }
@@ -1104,8 +1111,7 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
         let off = decoder.position();
         let mut map = decoder.map()?;
-        let mut out =
-            alloc_util::try_vec_with_capacity::<(String, V)>(map.remaining(), off)?;
+        let mut out = alloc_util::try_vec_with_capacity::<(String, V)>(map.remaining(), off)?;
         while let Some(key) = map.next_key()? {
             let value = map.next_value()?;
             let owned = alloc_util::try_string_from_str(key, off)?;
@@ -1196,7 +1202,10 @@ impl CborEncode for i128 {
 impl CborEncode for u64 {
     fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
         if *self > crate::MAX_SAFE_INTEGER {
-            return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, enc.len()));
+            return Err(CborError::new(
+                ErrorCode::IntegerOutsideSafeRange,
+                enc.len(),
+            ));
         }
         let v = i64::try_from(*self)
             .map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;
@@ -1231,10 +1240,13 @@ impl CborEncode for usize {
         let v = u64::try_from(*self)
             .map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;
         if v > crate::MAX_SAFE_INTEGER {
-            return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, enc.len()));
+            return Err(CborError::new(
+                ErrorCode::IntegerOutsideSafeRange,
+                enc.len(),
+            ));
         }
-        let v = i64::try_from(v)
-            .map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;
+        let v =
+            i64::try_from(v).map_err(|_| CborError::new(ErrorCode::LengthOverflow, enc.len()))?;
         enc.int(v)
     }
 }

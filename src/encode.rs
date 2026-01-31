@@ -324,7 +324,11 @@ impl Encoder {
     }
 
     #[inline]
-    pub(crate) fn emit_bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
+    pub(crate) fn emit_bignum(
+        &mut self,
+        negative: bool,
+        magnitude: &[u8],
+    ) -> Result<(), CborError> {
         validate_bignum_bytes(negative, magnitude)
             .map_err(|code| CborError::new(code, self.sink.position()))?;
         let tag = if negative { 3u64 } else { 2u64 };
@@ -917,5 +921,3 @@ impl MapEncoder<'_> {
         self.write_entry(|sink| sink.write(key_bytes), f)
     }
 }
-
- 
