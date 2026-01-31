@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- **Breaking:** `cbor_bytes!` is now a procedural macro that sorts map keys at compile time; dynamic keys are no longer supported in the macro (use `Encoder` for dynamic keys).
+- **Breaking:** `Decoder::new` was removed; use `Decoder::new_checked` or `Decoder::new_trusted` (canonical bytes only).
+- **Breaking:** trusted decoding no longer applies canonical float-bit validation (consistent with other trusted paths).
+- Derived encoders sort named map fields by canonical key order at compile time.
+- Tests updated to cover map ordering for derives and `cbor_bytes!`.
+
 ## 0.8.0
 
 - **Breaking:** renamed feature `unsafe-utf8` to `unsafe`.
