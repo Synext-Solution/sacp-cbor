@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.1
+
+- Added native `CborEncode` / `CborDecode` support for `BTreeMap<String, V>` and `HashMap<String, V>` (keys are sorted into canonical order on encode).
+- Added serde helper `to_vec_sorted_maps` to encode maps with non-canonical iteration order by buffering and sorting text keys (existing `to_vec` remains strict).
+
 ## 0.10.0
 
 - **Breaking:** `Decoder` is now const-generic over `CHECKED`, and `CborDecode::decode` now accepts `Decoder<'_, CHECKED>` (use `CheckedDecoder`/`TrustedDecoder` aliases as needed).

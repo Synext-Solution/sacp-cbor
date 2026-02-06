@@ -362,6 +362,12 @@ impl Encoder {
     }
 
     #[cfg(feature = "serde")]
+    #[inline]
+    pub(crate) fn emit_raw_bytes(&mut self, bytes: &[u8]) -> Result<(), CborError> {
+        self.sink.write(bytes)
+    }
+
+    #[cfg(feature = "serde")]
     pub(crate) fn buf_len(&self) -> usize {
         self.sink.buf.len()
     }

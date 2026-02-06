@@ -1,6 +1,7 @@
 #![cfg(feature = "serde")]
 
-use sacp_cbor::{from_slice, to_vec, DecodeLimits, ErrorCode};
+use sacp_cbor::to_vec_sorted_maps;
+use sacp_cbor::{decode, from_slice, to_vec, DecodeLimits, ErrorCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -36,6 +37,46 @@ fn serde_rejects_non_text_map_keys() {
 
     let err = to_vec(&m).unwrap_err();
     assert_eq!(err.code, ErrorCode::MapKeyMustBeText);
+}
+
+#[test]
+fn serde_to_vec_rejects_btreemap_noncanonical_order() {
+    let mut m = BTreeMap::new();
+    m.insert("aa".to_string(), true);
+    m.insert("b".to_string(), false);
+
+    let err = to_vec(&m).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NonCanonicalMapOrder);
+}
+
+#[test]
+fn serde_to_vec_sorted_maps_accepts_btreemap_and_is_canonical() {
+    let mut m = BTreeMap::new();
+    m.insert("aa".to_string(), true);
+    m.insert("b".to_string(), false);
+
+    let bytes = to_vec_sorted_maps(&m).unwrap();
+    let decoded: sacp_cbor::MapEntries<String, bool> =
+        decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    assert_eq!(
+        decoded.0,
+        vec![("b".to_string(), false), ("aa".to_string(), true)]
+    );
+}
+
+#[test]
+fn serde_to_vec_sorted_maps_accepts_hashmap_and_is_canonical() {
+    let mut m = std::collections::HashMap::new();
+    m.insert("aa".to_string(), true);
+    m.insert("b".to_string(), false);
+
+    let bytes = to_vec_sorted_maps(&m).unwrap();
+    let decoded: sacp_cbor::MapEntries<String, bool> =
+        decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    assert_eq!(
+        decoded.0,
+        vec![("b".to_string(), false), ("aa".to_string(), true)]
+    );
 }
 
 #[test]

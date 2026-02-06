@@ -1,4 +1,6 @@
 #[cfg(feature = "alloc")]
+use alloc::collections::BTreeMap;
+#[cfg(feature = "alloc")]
 use alloc::string::String;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -17,6 +19,11 @@ use crate::encode::Encoder;
 use crate::CanonicalCbor;
 #[cfg(feature = "alloc")]
 use crate::{BigInt, CborInteger};
+
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+#[cfg(feature = "std")]
+use std::hash::BuildHasher;
 
 /// A CBOR map represented as ordered key/value entries.
 #[cfg(feature = "alloc")]
@@ -1094,6 +1101,62 @@ impl<'de, T: CborDecode<'de> + CborArrayElem> CborDecode<'de> for Vec<T> {
 }
 
 #[cfg(feature = "alloc")]
+impl<'de, V: CborDecode<'de>> CborDecode<'de> for BTreeMap<String, V> {
+    /// Decode a CBOR map into a `BTreeMap<String, V>`.
+    ///
+    /// # Canonical requirements
+    ///
+    /// Inputs must still be canonical SACP-CBOR/1. This impl does not relax the profile.
+    ///
+    /// # OOM note
+    ///
+    /// Key copying uses fallible allocation helpers and can return `AllocationFailed`. However,
+    /// `BTreeMap` insertion may allocate internally using infallible APIs; in a real OOM situation
+    /// the process may abort rather than returning `AllocationFailed`.
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let mut map = decoder.map()?;
+        let mut out = Self::new();
+        while let Some(key) = map.next_key()? {
+            let value: V = map.next_value()?;
+            let owned = alloc_util::try_string_from_str(key, off)?;
+            if out.insert(owned, value).is_some() {
+                return Err(CborError::new(ErrorCode::DuplicateMapKey, off));
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<'de, V: CborDecode<'de>, S: BuildHasher + Default> CborDecode<'de> for HashMap<String, V, S> {
+    /// Decode a CBOR map into a `HashMap<String, V, S>`.
+    ///
+    /// # Canonical requirements
+    ///
+    /// Inputs must still be canonical SACP-CBOR/1. This impl does not relax the profile.
+    ///
+    /// # OOM note
+    ///
+    /// Key copying uses fallible allocation helpers and can return `AllocationFailed`. However,
+    /// `HashMap` insertion may allocate internally using infallible APIs; in a real OOM situation
+    /// the process may abort rather than returning `AllocationFailed`.
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let mut map = decoder.map()?;
+        let mut out = Self::with_capacity_and_hasher(map.remaining(), S::default());
+        while let Some(key) = map.next_key()? {
+            let value: V = map.next_value()?;
+            let owned = alloc_util::try_string_from_str(key, off)?;
+            if out.insert(owned, value).is_some() {
+                return Err(CborError::new(ErrorCode::DuplicateMapKey, off));
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
         let off = decoder.position();
@@ -1359,6 +1422,53 @@ impl<T: CborEncode + CborArrayElem> CborEncode for Vec<T> {
 }
 
 #[cfg(feature = "alloc")]
+impl<K, V> CborEncode for BTreeMap<K, V>
+where
+    K: AsRef<str> + Ord,
+    V: CborEncode,
+{
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        let off = enc.len();
+        let mut entries = alloc_util::try_vec_with_capacity::<(&str, &V)>(self.len(), off)?;
+        for (k, v) in self {
+            entries.push((k.as_ref(), v));
+        }
+        entries.sort_by(|(a, _), (b, _)| crate::profile::cmp_text_keys_canonical(a, b));
+
+        enc.map(entries.len(), |m| {
+            for (k, v) in entries {
+                m.entry(k, |enc| v.encode(enc))?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<K, V, S> CborEncode for HashMap<K, V, S>
+where
+    K: AsRef<str> + Eq + core::hash::Hash,
+    V: CborEncode,
+    S: BuildHasher,
+{
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        let off = enc.len();
+        let mut entries = alloc_util::try_vec_with_capacity::<(&str, &V)>(self.len(), off)?;
+        for (k, v) in self {
+            entries.push((k.as_ref(), v));
+        }
+        entries.sort_by(|(a, _), (b, _)| crate::profile::cmp_text_keys_canonical(a, b));
+
+        enc.map(entries.len(), |m| {
+            for (k, v) in entries {
+                m.entry(k, |enc| v.encode(enc))?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl<K, V> CborEncode for MapEntries<K, V>
 where
     K: AsRef<str>,
@@ -1425,5 +1535,22 @@ impl<K, V> CborArrayElem for MapEntries<K, V>
 where
     K: AsRef<str>,
     V: CborArrayElem,
+{
+}
+
+#[cfg(feature = "alloc")]
+impl<K, V> CborArrayElem for BTreeMap<K, V>
+where
+    K: AsRef<str> + Ord,
+    V: CborArrayElem,
+{
+}
+
+#[cfg(feature = "std")]
+impl<K, V, S> CborArrayElem for HashMap<K, V, S>
+where
+    K: AsRef<str> + Eq + core::hash::Hash,
+    V: CborArrayElem,
+    S: BuildHasher,
 {
 }

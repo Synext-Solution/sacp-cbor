@@ -127,7 +127,7 @@ pub use sacp_cbor_derive::cbor_bytes;
 #[cfg(feature = "serde")]
 pub use crate::serde_impl::{
     from_canonical_bytes, from_canonical_bytes_ref, from_slice, from_slice_borrowed, to_vec,
-    DeError,
+    to_vec_sorted_maps, DeError,
 };
 
 pub use sacp_cbor_derive::{CborDecode, CborEncode};
