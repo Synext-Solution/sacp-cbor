@@ -50,6 +50,8 @@ pub enum ErrorCode {
     DuplicateMapKey,
     /// Map keys are not in canonical order.
     NonCanonicalMapOrder,
+    /// Set elements are not in strict canonical set order.
+    NonCanonicalSetOrder,
 
     /// A forbidden tag was used, or the tag structure is malformed.
     ForbiddenOrMalformedTag,
@@ -155,6 +157,7 @@ impl fmt::Display for CborError {
             ErrorCode::MapKeyMustBeText => "map keys must be text strings",
             ErrorCode::DuplicateMapKey => "duplicate map key",
             ErrorCode::NonCanonicalMapOrder => "non-canonical map key order",
+            ErrorCode::NonCanonicalSetOrder => "non-canonical set element order",
 
             ErrorCode::ForbiddenOrMalformedTag => "forbidden or malformed CBOR tag",
             ErrorCode::BignumNotCanonical => {

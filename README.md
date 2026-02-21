@@ -800,9 +800,9 @@ pub struct CborError {
 - Canonical encoding violations:
 
   - `NonCanonicalEncoding`, `IndefiniteLengthForbidden`, `ReservedAdditionalInfo`, `TrailingBytes`
-- Map rules:
+- Map/set rules:
 
-  - `MapKeyMustBeText`, `DuplicateMapKey`, `NonCanonicalMapOrder`
+  - `MapKeyMustBeText`, `DuplicateMapKey`, `NonCanonicalMapOrder`, `NonCanonicalSetOrder`
 - Integers / tags:
 
   - `IntegerOutsideSafeRange`, `ForbiddenOrMalformedTag`, `BignumNotCanonical`, `BignumMustBeOutsideSafeRange`
@@ -852,6 +852,21 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 - `CborLimits::{message_limits,state_limits}() -> DecodeLimits`
 
   - Derives `DecodeLimits` for each budget.
+
+### Typed decode/encode
+
+- `decode(bytes, limits) -> Result<T, CborError>`
+- `decode_canonical(canon_ref) -> Result<T, CborError>`
+- `decode_canonical_owned(&canon) -> Result<T, CborError>` (`alloc`)
+- `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)
+- `encode_to_canonical(&value) -> Result<CanonicalCbor, CborError>` (`alloc`)
+- `encode_into(&mut Encoder, &value) -> Result<(), CborError>` (`alloc`)
+
+Common trait coverage for derive-driven models includes:
+
+- fixed byte arrays: `[u8; N]` (CBOR byte strings with exact-length decode checks)
+- ordered sets: `BTreeSet<T>` (`alloc`; canonical deterministic order, strict order validation on decode)
+- canonical wrappers: `CanonicalCborRef<'a>` and `CanonicalCbor` (`alloc`)
 
 ### Bytes wrappers
 

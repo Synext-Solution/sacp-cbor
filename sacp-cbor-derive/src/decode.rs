@@ -193,7 +193,7 @@ pub(crate) fn decode_struct(
             let body = decode_named_fields(fields, quote!(Self))?;
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
+                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                         #body
                     }
                 }
@@ -207,7 +207,7 @@ pub(crate) fn decode_struct(
             let body = array_decode_block(expected, &decodes, quote!(Ok(Self(#(#vars),*))));
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
+                    fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                         #body
                     }
                 }
@@ -216,7 +216,7 @@ pub(crate) fn decode_struct(
 
         Fields::Unit => Ok(quote! {
             impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-                fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
+                fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                     let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                     Ok(Self)
                 }
@@ -282,7 +282,7 @@ pub(crate) fn decode_enum(
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                 let map_off = decoder.position();
                 let mut map = decoder.map()?;
                 if map.remaining() != 1 {
@@ -416,7 +416,7 @@ pub(crate) fn decode_enum_untagged(
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> Result<Self, ::sacp_cbor::CborError> {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                 match decoder.peek_kind()? {
                     #(#arms),*,
                     _ => Err(::sacp_cbor::CborError::new(

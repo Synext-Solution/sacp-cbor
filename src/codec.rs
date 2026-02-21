@@ -1,5 +1,5 @@
 #[cfg(feature = "alloc")]
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "alloc")]
 use alloc::string::String;
 #[cfg(feature = "alloc")]
@@ -1202,6 +1202,59 @@ impl<'de> CborDecode<'de> for Vec<u8> {
     }
 }
 
+impl<'de, const N: usize> CborDecode<'de> for [u8; N] {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let bytes = decoder.parse_bytes()?;
+        if bytes.len() != N {
+            return Err(CborError::new(ErrorCode::ExpectedBytes, off));
+        }
+        let mut out = [0u8; N];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+}
+
+impl<'de> CborDecode<'de> for CanonicalCborRef<'de> {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let start = decoder.position();
+        decoder.skip_value()?;
+        let end = decoder.position();
+        Ok(CanonicalCborRef::new(&decoder.data()[start..end]))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de> CborDecode<'de> for CanonicalCbor {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let canon_ref = CanonicalCborRef::decode(decoder)?;
+        let bytes = alloc_util::try_vec_from_slice(canon_ref.as_bytes(), off)?;
+        Ok(Self::new_unchecked(bytes))
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, T> CborDecode<'de> for BTreeSet<T>
+where
+    T: CborDecode<'de> + CborArrayElem + Ord,
+{
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        let off = decoder.position();
+        let mut array = decoder.array()?;
+        let mut out = Self::new();
+        while let Some(value) = array.next_value::<T>()? {
+            if let Some(last) = out.last() {
+                if value.cmp(last) != core::cmp::Ordering::Greater {
+                    return Err(CborError::new(ErrorCode::NonCanonicalSetOrder, off));
+                }
+            }
+            out.insert(value);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(feature = "alloc")]
 impl CborEncode for () {
     fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
@@ -1386,6 +1439,13 @@ impl CborEncode for Vec<u8> {
 }
 
 #[cfg(feature = "alloc")]
+impl<const N: usize> CborEncode for [u8; N] {
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        enc.bytes(self)
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl CborEncode for CborValueRef<'_> {
     fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
         enc.raw_value_ref(*self)
@@ -1396,6 +1456,13 @@ impl CborEncode for CborValueRef<'_> {
 impl CborEncode for CanonicalCborRef<'_> {
     fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
         enc.raw_cbor(*self)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl CborEncode for CanonicalCbor {
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        enc.raw_cbor(self.as_ref())
     }
 }
 
@@ -1485,6 +1552,21 @@ where
 }
 
 #[cfg(feature = "alloc")]
+impl<T> CborEncode for BTreeSet<T>
+where
+    T: CborEncode + CborArrayElem + Ord,
+{
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        enc.array(self.len(), |a| {
+            for item in self {
+                a.value(item)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "alloc")]
 impl CborArrayElem for bool {}
 #[cfg(feature = "alloc")]
 impl CborArrayElem for i64 {}
@@ -1519,6 +1601,8 @@ impl CborArrayElem for &str {}
 #[cfg(feature = "alloc")]
 impl CborArrayElem for &[u8] {}
 #[cfg(feature = "alloc")]
+impl<const N: usize> CborArrayElem for [u8; N] {}
+#[cfg(feature = "alloc")]
 impl CborArrayElem for BigInt {}
 #[cfg(feature = "alloc")]
 impl CborArrayElem for CborInteger {}
@@ -1526,6 +1610,8 @@ impl CborArrayElem for CborInteger {}
 impl CborArrayElem for CborValueRef<'_> {}
 #[cfg(feature = "alloc")]
 impl CborArrayElem for CanonicalCborRef<'_> {}
+#[cfg(feature = "alloc")]
+impl CborArrayElem for CanonicalCbor {}
 #[cfg(feature = "alloc")]
 impl<T: CborArrayElem> CborArrayElem for Option<T> {}
 #[cfg(feature = "alloc")]
@@ -1545,6 +1631,9 @@ where
     V: CborArrayElem,
 {
 }
+
+#[cfg(feature = "alloc")]
+impl<T> CborArrayElem for BTreeSet<T> where T: CborArrayElem + Ord {}
 
 #[cfg(feature = "std")]
 impl<K, V, S> CborArrayElem for HashMap<K, V, S>

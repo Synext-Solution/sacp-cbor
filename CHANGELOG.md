@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2
+
+- Fixed derive macro hygiene: generated `#[derive(CborEncode, CborDecode)]` impls now use fully-qualified `::core::result::Result`.
+- Added native `CborEncode` / `CborDecode` support for fixed byte arrays (`[u8; N]`) with exact-length decode checks.
+- Added native `CborEncode` / `CborDecode` support for `BTreeSet<T>` (`alloc`) with strict canonical set-order validation on decode (`ErrorCode::NonCanonicalSetOrder`).
+- Added native decode/encode support for canonical wrappers in typed models:
+  - `CborDecode` for `CanonicalCborRef<'a>`
+  - `CborEncode` and `CborDecode` for `CanonicalCbor` (`alloc`)
+
 ## 0.10.1
 
 - Added native `CborEncode` / `CborDecode` support for `BTreeMap<String, V>` and `HashMap<String, V>` (keys are sorted into canonical order on encode).

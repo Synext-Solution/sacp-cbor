@@ -112,7 +112,7 @@ pub(crate) fn encode_struct(
 
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
+                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
                         enc.map(#len, |m| {
                             #(#entries)*
                             Ok(())
@@ -153,7 +153,7 @@ pub(crate) fn encode_struct(
 
             Ok(quote! {
                 impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
+                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
                         enc.array(#len, |a| {
                             #(#items)*
                             Ok(())
@@ -167,7 +167,7 @@ pub(crate) fn encode_struct(
 
         Fields::Unit => Ok(quote! {
             impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #base_where_clause {
-                fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
+                fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
                     enc.null()
                 }
             }
@@ -255,7 +255,7 @@ pub(crate) fn encode_enum(
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
+            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
                 match self { #(#arms),* }
             }
         }
@@ -342,7 +342,7 @@ pub(crate) fn encode_enum_untagged(
 
     Ok(quote! {
         impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> Result<(), ::sacp_cbor::CborError> {
+            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
                 match self { #(#arms),* }
             }
         }
