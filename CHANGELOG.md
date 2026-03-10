@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.0
+
+- **Breaking:** external unit enum variants now encode as CBOR text strings (Serde-style) instead of one-entry maps; serde decode and native derive decode both accept the new text form, and the native derive decoder also keeps accepting the legacy map form.
+- Added Serde-compatible enum tagging to `#[derive(CborEncode, CborDecode)]`:
+  - `#[cbor(tag = "...")]` for internally tagged enums
+  - `#[cbor(tag = "...", content = "...")]` for adjacently tagged enums
+  - `#[cbor(rename_all = "...")]` for enum-level variant renaming, with variant `#[cbor(rename = "...")]` still taking precedence
+- Derive validation now rejects unsupported internally tagged tuple variants at compile time with a targeted error.
+- Updated serde streaming encode/decode to align with the new enum contract:
+  - unit variants serialize as text
+  - struct-like enum maps are canonically sorted before emission, so internally/adjacently tagged Serde enums no longer fail on field order
+- Added derive/serde parity tests covering internal tagging, adjacent tagging, enum `rename_all`, per-variant rename overrides, unit/newtype/tuple/struct variants, and compile-fail coverage for invalid internal-tag tuple variants.
+
 ## 0.10.2
 
 - Fixed derive macro hygiene: generated `#[derive(CborEncode, CborDecode)]` impls now use fully-qualified `::core::result::Result`.

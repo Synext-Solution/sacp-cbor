@@ -115,20 +115,20 @@ fn encode_major_uint<S: Sink>(sink: &mut S, major: u8, value: u64) -> Result<(),
     }
     if value <= 0xff {
         let v = u8::try_from(value).unwrap();
-        sink.write_u8((major << 5) | 24)?;
+        sink.write_u8((major << 5) | 0x18)?;
         return sink.write_u8(v);
     }
     if value <= 0xffff {
         let v = u16::try_from(value).unwrap();
-        sink.write_u8((major << 5) | 25)?;
+        sink.write_u8((major << 5) | 0x19)?;
         return sink.write(&v.to_be_bytes());
     }
     if value <= 0xffff_ffff {
         let v = u32::try_from(value).unwrap();
-        sink.write_u8((major << 5) | 26)?;
+        sink.write_u8((major << 5) | 0x1a)?;
         return sink.write(&v.to_be_bytes());
     }
-    sink.write_u8((major << 5) | 27)?;
+    sink.write_u8((major << 5) | 0x1b)?;
     sink.write(&value.to_be_bytes())
 }
 

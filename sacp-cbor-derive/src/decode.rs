@@ -1,10 +1,13 @@
 use quote::{format_ident, quote};
 use syn::{
     spanned::Spanned, DataEnum, DataStruct, Fields, GenericParam, Generics, Ident, Lifetime,
-    LifetimeParam, LitStr,
+    LifetimeParam, LitStr, Type,
 };
 
-use crate::attrs::{ensure_no_cbor_attrs, parse_cbor_field_attrs, parse_cbor_variant_attrs};
+use crate::attrs::{
+    ensure_no_cbor_attrs, field_key, parse_cbor_field_attrs, validate_internal_tagging,
+    variant_has_rename, variant_name, CborEnumAttr, EnumTagging,
+};
 use crate::types::{is_option_type, type_kind, type_mentions_self, VariantKind};
 use crate::util::add_where_bound;
 
@@ -172,6 +175,56 @@ fn decode_named_fields(
     })
 }
 
+#[derive(Clone)]
+struct InternalFieldSlot {
+    key: LitStr,
+    storage: Ident,
+}
+
+#[derive(Clone)]
+struct InternalVariantField {
+    ident: Ident,
+    ty: Type,
+    storage: Option<Ident>,
+    skip: bool,
+    default: bool,
+    option: bool,
+}
+
+#[derive(Clone)]
+struct InternalVariantDecode {
+    ident: Ident,
+    name: LitStr,
+    fields: Vec<InternalVariantField>,
+    unit: bool,
+}
+
+fn decode_raw_value(ty: &Type, raw: &Ident) -> proc_macro2::TokenStream {
+    quote! {
+        ::sacp_cbor::decode::<#ty>(
+            #raw.as_bytes(),
+            ::sacp_cbor::DecodeLimits::for_bytes(#raw.as_bytes().len()),
+        )
+        .map_err(|err| ::sacp_cbor::CborError::new(err.code, #raw.offset() + err.offset))
+    }
+}
+
+fn decode_body_from_raw(raw: &Ident, body: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    quote! {
+        {
+            let __result: ::core::result::Result<Self, ::sacp_cbor::CborError> = (|| {
+                let mut decoder = ::sacp_cbor::Decoder::<true>::new_checked(
+                    #raw.as_bytes(),
+                    ::sacp_cbor::DecodeLimits::for_bytes(#raw.as_bytes().len()),
+                )?;
+                #body
+            })();
+            __result
+        }
+        .map_err(|err| ::sacp_cbor::CborError::new(err.code, #raw.offset() + err.offset))
+    }
+}
+
 pub(crate) fn decode_struct(
     name: &Ident,
     generics: &Generics,
@@ -229,6 +282,23 @@ pub(crate) fn decode_enum(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
+    attrs: &CborEnumAttr,
+) -> syn::Result<proc_macro2::TokenStream> {
+    match &attrs.tagging {
+        EnumTagging::External => decode_enum_external(name, generics, data, attrs),
+        EnumTagging::Untagged => decode_enum_untagged(name, generics, data),
+        EnumTagging::Internal { tag } => decode_enum_internal(name, generics, data, attrs, tag),
+        EnumTagging::Adjacent { tag, content } => {
+            decode_enum_adjacent(name, generics, data, attrs, tag, content)
+        }
+    }
+}
+
+fn decode_enum_external(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataEnum,
+    attrs: &CborEnumAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let (impl_generics2, decode_lt) = decode_lifetime(generics);
     let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
@@ -240,22 +310,23 @@ pub(crate) fn decode_enum(
         predicates: Default::default(),
     });
 
-    let mut arms = Vec::new();
+    let mut map_arms = Vec::new();
+    let mut text_arms = Vec::new();
 
     for variant in &data.variants {
-        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
-        let vname = v_attr
-            .rename
-            .unwrap_or_else(|| LitStr::new(&variant.ident.to_string(), variant.ident.span()));
+        let vname = variant_name(variant, attrs.rename_all)?;
         let ident = &variant.ident;
 
         match &variant.fields {
             Fields::Unit => {
-                arms.push(quote! {
+                map_arms.push(quote! {
                     #vname => map.decode_value(|decoder| {
                         let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
                         Ok(Self::#ident)
                     })
+                });
+                text_arms.push(quote! {
+                    #vname => Ok(Self::#ident)
                 });
             }
 
@@ -265,7 +336,7 @@ pub(crate) fn decode_enum(
                 let expected = vars.len();
                 let body =
                     array_decode_block(expected, &decodes, quote!(Ok(Self::#ident(#(#vars),*))));
-                arms.push(quote! {
+                map_arms.push(quote! {
                     #vname => map.decode_value(|decoder| {
                         #body
                     })
@@ -275,7 +346,351 @@ pub(crate) fn decode_enum(
             Fields::Named(fields) => {
                 add_decode_bounds_for_named_fields(name, fields, wc, &decode_lt)?;
                 let body = decode_named_fields(fields, quote!(Self::#ident))?;
-                arms.push(quote! { #vname => map.decode_value(|decoder| { #body }) });
+                map_arms.push(quote! { #vname => map.decode_value(|decoder| { #body }) });
+            }
+        }
+    }
+
+    let map_body = quote! {
+        let map_off = decoder.position();
+        let mut map = decoder.map()?;
+        if map.remaining() != 1 {
+            return Err(::sacp_cbor::CborError::new(
+                ::sacp_cbor::ErrorCode::MapLenMismatch,
+                map_off,
+            ));
+        }
+        let k = match map.next_key()? {
+            ::core::option::Option::Some(key) => key,
+            ::core::option::Option::None => {
+                return Err(::sacp_cbor::CborError::new(
+                    ::sacp_cbor::ErrorCode::MapLenMismatch,
+                    map_off,
+                ));
+            }
+        };
+        match k {
+            #(#map_arms),*,
+            _ => Err(::sacp_cbor::CborError::new(
+                ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                map_off,
+            )),
+        }
+    };
+
+    let body = quote! {
+        match decoder.peek_kind()? {
+            ::sacp_cbor::CborKind::Text => {
+                let text_off = decoder.position();
+                let key: &#decode_lt str = ::sacp_cbor::CborDecode::decode(decoder)?;
+                match key {
+                    #(#text_arms),*,
+                    _ => Err(::sacp_cbor::CborError::new(
+                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                        text_off,
+                    )),
+                }
+            }
+            ::sacp_cbor::CborKind::Map => {
+                #map_body
+            }
+            _ => Err(::sacp_cbor::CborError::new(
+                ::sacp_cbor::ErrorCode::ExpectedEnum,
+                decoder.position(),
+            )),
+        }
+    };
+
+    Ok(quote! {
+        impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
+                #body
+            }
+        }
+    })
+}
+
+fn decode_enum_internal(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataEnum,
+    attrs: &CborEnumAttr,
+    tag: &LitStr,
+) -> syn::Result<proc_macro2::TokenStream> {
+    validate_internal_tagging(data, tag)?;
+
+    let (impl_generics2, decode_lt) = decode_lifetime(generics);
+    let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
+    let (_, ty_generics, _) = generics.split_for_impl();
+
+    let mut where_clause = where_clause.cloned();
+    let wc = where_clause.get_or_insert_with(|| syn::WhereClause {
+        where_token: Default::default(),
+        predicates: Default::default(),
+    });
+
+    let mut slots = Vec::<InternalFieldSlot>::new();
+    let mut variants = Vec::<InternalVariantDecode>::new();
+
+    for variant in &data.variants {
+        let vname = variant_name(variant, attrs.rename_all)?;
+        match &variant.fields {
+            Fields::Unit => variants.push(InternalVariantDecode {
+                ident: variant.ident.clone(),
+                name: vname,
+                fields: Vec::new(),
+                unit: true,
+            }),
+            Fields::Named(fields) => {
+                add_decode_bounds_for_named_fields(name, fields, wc, &decode_lt)?;
+
+                let mut variant_fields = Vec::new();
+                for field in &fields.named {
+                    let attr = parse_cbor_field_attrs(&field.attrs)?;
+                    let ident = field.ident.clone().unwrap();
+                    let ty = field.ty.clone();
+
+                    if attr.skip {
+                        variant_fields.push(InternalVariantField {
+                            ident,
+                            ty,
+                            storage: None,
+                            skip: true,
+                            default: false,
+                            option: false,
+                        });
+                        continue;
+                    }
+
+                    let key = field_key(field)?;
+                    let storage = if let Some(existing) =
+                        slots.iter().find(|slot| slot.key.value() == key.value())
+                    {
+                        existing.storage.clone()
+                    } else {
+                        let storage = format_ident!("__raw_field_{}", slots.len());
+                        slots.push(InternalFieldSlot {
+                            key: key.clone(),
+                            storage: storage.clone(),
+                        });
+                        storage
+                    };
+
+                    variant_fields.push(InternalVariantField {
+                        ident,
+                        ty,
+                        storage: Some(storage),
+                        skip: false,
+                        default: attr.default,
+                        option: is_option_type(&field.ty),
+                    });
+                }
+
+                variants.push(InternalVariantDecode {
+                    ident: variant.ident.clone(),
+                    name: vname,
+                    fields: variant_fields,
+                    unit: false,
+                });
+            }
+            Fields::Unnamed(_) => unreachable!(),
+        }
+    }
+
+    let slot_inits = slots.iter().map(|slot| {
+        let storage = &slot.storage;
+        quote! {
+            let mut #storage: ::core::option::Option<::sacp_cbor::CborValueRef<#decode_lt>> =
+                ::core::option::Option::None;
+        }
+    });
+    let slot_matches = slots.iter().map(|slot| {
+        let key = &slot.key;
+        let storage = &slot.storage;
+        quote! {
+            #key => {
+                #storage = ::core::option::Option::Some(map.next_value()?);
+            }
+        }
+    });
+
+    let variant_arms = variants.iter().map(|variant| {
+        let vname = &variant.name;
+        let ident = &variant.ident;
+
+        if variant.unit {
+            quote! {
+                #vname => Ok(Self::#ident)
+            }
+        } else {
+            let finals = variant.fields.iter().map(|field| {
+                let ident = &field.ident;
+                if field.skip {
+                    return quote! {
+                        #ident: ::core::default::Default::default(),
+                    };
+                }
+
+                let storage = field.storage.as_ref().unwrap();
+                let raw = format_ident!("__raw_{}", ident);
+                let decode_expr = decode_raw_value(&field.ty, &raw);
+
+                if field.option || field.default {
+                    quote! {
+                        #ident: match #storage {
+                            ::core::option::Option::Some(#raw) => #decode_expr?,
+                            ::core::option::Option::None => ::core::default::Default::default(),
+                        },
+                    }
+                } else {
+                    quote! {
+                        #ident: match #storage {
+                            ::core::option::Option::Some(#raw) => #decode_expr?,
+                            ::core::option::Option::None => {
+                                return Err(::sacp_cbor::CborError::new(
+                                    ::sacp_cbor::ErrorCode::MissingKey,
+                                    map_off,
+                                ));
+                            }
+                        },
+                    }
+                }
+            });
+
+            quote! {
+                #vname => Ok(Self::#ident { #(#finals)* })
+            }
+        }
+    });
+
+    Ok(quote! {
+        impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
+            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
+                let map_off = decoder.position();
+                let mut map = decoder.map()?;
+                let mut __tag: ::core::option::Option<&#decode_lt str> =
+                    ::core::option::Option::None;
+                #(#slot_inits)*
+                while let ::core::option::Option::Some(k) = map.next_key()? {
+                    match k {
+                        #tag => {
+                            __tag = ::core::option::Option::Some(map.next_value()?);
+                        }
+                        #(#slot_matches)*
+                        _ => {
+                            let _unused: ::sacp_cbor::CborValueRef = map.next_value()?;
+                        }
+                    }
+                }
+                let __tag = __tag.ok_or_else(|| {
+                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
+                })?;
+                match __tag {
+                    #(#variant_arms),*,
+                    _ => Err(::sacp_cbor::CborError::new(
+                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                        map_off,
+                    )),
+                }
+            }
+        }
+    })
+}
+
+fn decode_enum_adjacent(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataEnum,
+    attrs: &CborEnumAttr,
+    tag: &LitStr,
+    content: &LitStr,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let (impl_generics2, decode_lt) = decode_lifetime(generics);
+    let (impl_generics, _, where_clause) = impl_generics2.split_for_impl();
+    let (_, ty_generics, _) = generics.split_for_impl();
+
+    let mut where_clause = where_clause.cloned();
+    let wc = where_clause.get_or_insert_with(|| syn::WhereClause {
+        where_token: Default::default(),
+        predicates: Default::default(),
+    });
+
+    let mut variant_arms = Vec::new();
+
+    for variant in &data.variants {
+        let vname = variant_name(variant, attrs.rename_all)?;
+        let ident = &variant.ident;
+
+        match &variant.fields {
+            Fields::Unit => {
+                variant_arms.push(quote! {
+                    #vname => Ok(Self::#ident)
+                });
+            }
+            Fields::Unnamed(fields) => {
+                if fields.unnamed.len() == 1 {
+                    let field = fields.unnamed.first().unwrap();
+                    if !type_mentions_self(&field.ty, name) {
+                        add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+                    }
+                    let raw = format_ident!("__content_raw");
+                    let decode_expr = decode_raw_value(&field.ty, &raw);
+                    variant_arms.push(quote! {
+                        #vname => {
+                            let #raw = __content.ok_or_else(|| {
+                                ::sacp_cbor::CborError::new(
+                                    ::sacp_cbor::ErrorCode::MissingKey,
+                                    map_off,
+                                )
+                            })?;
+                            Ok(Self::#ident(#decode_expr?))
+                        }
+                    });
+                } else {
+                    let (vars, decodes) = tuple_decode_parts(
+                        name,
+                        fields,
+                        wc,
+                        &decode_lt,
+                        "tuple enum variant fields",
+                    )?;
+                    let expected = vars.len();
+                    let body = array_decode_block(
+                        expected,
+                        &decodes,
+                        quote!(Ok(Self::#ident(#(#vars),*))),
+                    );
+                    let raw = format_ident!("__content_raw");
+                    let decode_expr = decode_body_from_raw(&raw, body);
+                    variant_arms.push(quote! {
+                        #vname => {
+                            let #raw = __content.ok_or_else(|| {
+                                ::sacp_cbor::CborError::new(
+                                    ::sacp_cbor::ErrorCode::MissingKey,
+                                    map_off,
+                                )
+                            })?;
+                            #decode_expr
+                        }
+                    });
+                }
+            }
+            Fields::Named(fields) => {
+                add_decode_bounds_for_named_fields(name, fields, wc, &decode_lt)?;
+                let body = decode_named_fields(fields, quote!(Self::#ident))?;
+                let raw = format_ident!("__content_raw");
+                let decode_expr = decode_body_from_raw(&raw, body);
+                variant_arms.push(quote! {
+                    #vname => {
+                        let #raw = __content.ok_or_else(|| {
+                            ::sacp_cbor::CborError::new(
+                                ::sacp_cbor::ErrorCode::MissingKey,
+                                map_off,
+                            )
+                        })?;
+                        #decode_expr
+                    }
+                });
             }
         }
     }
@@ -285,29 +700,33 @@ pub(crate) fn decode_enum(
             fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
                 let map_off = decoder.position();
                 let mut map = decoder.map()?;
-                if map.remaining() != 1 {
-                    return Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::MapLenMismatch,
-                        map_off,
-                    ));
-                }
-                let k = match map.next_key()? {
-                    ::core::option::Option::Some(key) => key,
-                    ::core::option::Option::None => {
-                        return Err(::sacp_cbor::CborError::new(
-                            ::sacp_cbor::ErrorCode::MapLenMismatch,
-                            map_off,
-                        ));
+                let mut __tag: ::core::option::Option<&#decode_lt str> =
+                    ::core::option::Option::None;
+                let mut __content: ::core::option::Option<::sacp_cbor::CborValueRef<#decode_lt>> =
+                    ::core::option::Option::None;
+                while let ::core::option::Option::Some(k) = map.next_key()? {
+                    match k {
+                        #tag => {
+                            __tag = ::core::option::Option::Some(map.next_value()?);
+                        }
+                        #content => {
+                            __content = ::core::option::Option::Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _unused: ::sacp_cbor::CborValueRef = map.next_value()?;
+                        }
                     }
-                };
-                let result = match k {
-                    #(#arms),*,
+                }
+                let __tag = __tag.ok_or_else(|| {
+                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
+                })?;
+                match __tag {
+                    #(#variant_arms),*,
                     _ => Err(::sacp_cbor::CborError::new(
                         ::sacp_cbor::ErrorCode::UnknownEnumVariant,
                         map_off,
                     )),
-                };
-                result
+                }
             }
         }
     })
@@ -331,8 +750,7 @@ pub(crate) fn decode_enum_untagged(
     let mut bodies: Vec<Option<proc_macro2::TokenStream>> = vec![None; 8];
 
     for variant in &data.variants {
-        let v_attr = parse_cbor_variant_attrs(&variant.attrs)?;
-        if v_attr.rename.is_some() {
+        if variant_has_rename(variant)? {
             return Err(syn::Error::new(
                 variant.span(),
                 "variant `cbor(rename=...)` is meaningless for `#[cbor(untagged)]` enums",

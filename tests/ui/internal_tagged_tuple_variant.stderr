@@ -1,0 +1,5 @@
+error: `#[cbor(tag = ...)]` only supports unit and struct variants; use `#[cbor(tag = ..., content = ...)]` for tuple variants
+ --> tests/ui/internal_tagged_tuple_variant.rs:6:5
+  |
+6 |     Tuple(String),
+  |     ^^^^^

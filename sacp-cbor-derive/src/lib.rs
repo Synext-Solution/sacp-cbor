@@ -15,10 +15,10 @@ mod util;
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, spanned::Spanned, Data, DeriveInput};
 
-use crate::attrs::{parse_cbor_enum_attrs, EnumTagging};
+use crate::attrs::parse_cbor_enum_attrs;
 use crate::cbor_bytes::expand as expand_cbor_bytes;
-use crate::decode::{decode_enum, decode_enum_untagged, decode_struct};
-use crate::encode::{encode_enum, encode_enum_untagged, encode_struct};
+use crate::decode::{decode_enum, decode_struct};
+use crate::encode::{encode_enum, encode_struct};
 
 #[proc_macro_derive(CborEncode, attributes(cbor))]
 /// Derive canonical CBOR encoding for structs and enums.
@@ -28,13 +28,8 @@ pub fn derive_cbor_encode(input: TokenStream) -> TokenStream {
         match &input.data {
             Data::Struct(data) => encode_struct(&input.ident, &input.generics, data),
             Data::Enum(data) => {
-                let tagging = parse_cbor_enum_attrs(&input.attrs)?;
-                match tagging {
-                    EnumTagging::Untagged => {
-                        encode_enum_untagged(&input.ident, &input.generics, data)
-                    }
-                    EnumTagging::Tagged => encode_enum(&input.ident, &input.generics, data),
-                }
+                let attrs = parse_cbor_enum_attrs(&input.attrs)?;
+                encode_enum(&input.ident, &input.generics, data, &attrs)
             }
             Data::Union(u) => Err(syn::Error::new(
                 u.union_token.span(),
@@ -57,13 +52,8 @@ pub fn derive_cbor_decode(input: TokenStream) -> TokenStream {
         match &input.data {
             Data::Struct(data) => decode_struct(&input.ident, &input.generics, data),
             Data::Enum(data) => {
-                let tagging = parse_cbor_enum_attrs(&input.attrs)?;
-                match tagging {
-                    EnumTagging::Untagged => {
-                        decode_enum_untagged(&input.ident, &input.generics, data)
-                    }
-                    EnumTagging::Tagged => decode_enum(&input.ident, &input.generics, data),
-                }
+                let attrs = parse_cbor_enum_attrs(&input.attrs)?;
+                decode_enum(&input.ident, &input.generics, data, &attrs)
             }
             Data::Union(u) => Err(syn::Error::new(
                 u.union_token.span(),
