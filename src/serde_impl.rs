@@ -1451,11 +1451,7 @@ impl<'de, const CHECKED: bool> VariantAccess<'de> for VariantAccessImpl<'_, 'de,
     fn unit_variant(self) -> Result<(), DeError> {
         match self.payload {
             EnumPayload::Unit => Ok(()),
-            EnumPayload::Map(mut map) => map
-                .decode_value(|decoder| {
-                    <()>::deserialize(decoder).map_err(DeError::into_cbor_error)
-                })
-                .map_err(DeError::from),
+            EnumPayload::Map(_) => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
         }
     }
 

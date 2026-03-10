@@ -320,10 +320,10 @@ fn decode_enum_external(
         match &variant.fields {
             Fields::Unit => {
                 map_arms.push(quote! {
-                    #vname => map.decode_value(|decoder| {
-                        let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
-                        Ok(Self::#ident)
-                    })
+                    #vname => Err(::sacp_cbor::CborError::new(
+                        ::sacp_cbor::ErrorCode::ExpectedEnum,
+                        map_off,
+                    ))
                 });
                 text_arms.push(quote! {
                     #vname => Ok(Self::#ident)

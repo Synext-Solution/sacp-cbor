@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use sacp_cbor::{
     cbor_bytes, decode, encode_to_vec, from_slice, to_vec, CborDecode, CborEncode, DecodeLimits,
+    ErrorCode,
 };
 
 fn assert_derive_matches_serde<T>(value: T, expected_json: Value)
@@ -194,12 +195,19 @@ fn renamed_unit_enums_use_text_variants() {
 }
 
 #[test]
-fn renamed_unit_enums_still_decode_legacy_map_shape() {
+fn renamed_unit_enums_reject_legacy_map_shape() {
     let bytes = cbor_bytes!({ "grant": null }).unwrap();
-    let decoded: DelegationAction = decode(
+    let err = decode::<DelegationAction>(
         bytes.as_bytes(),
         DecodeLimits::for_bytes(bytes.as_bytes().len()),
     )
-    .unwrap();
-    assert_eq!(decoded, DelegationAction::Grant);
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedEnum);
+
+    let err = from_slice::<DelegationAction>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedEnum);
 }
