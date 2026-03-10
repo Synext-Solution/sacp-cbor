@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0
+
+- **Breaking:** externally tagged derive newtype variants now encode and decode as direct payloads (`{ "variant": value }`) instead of single-element arrays.
+- **Breaking:** externally tagged derive enums without unit variants now reject text-form inputs with `ErrorCode::ExpectedEnum`; those enums are map-only on the wire.
+- Fixed `CborDecode` derive for externally tagged enums with no unit variants so it no longer emits invalid Rust and now compiles against the map-only contract.
+- Derive validation now rejects empty enums at compile time with a targeted error instead of generating invalid code.
+- Added derive/serde parity coverage for externally tagged data-only enums, legacy-shape rejection coverage for external newtypes, and compile-fail coverage for empty enums.
+
 ## 0.11.0
 
 - **Breaking:** external unit enum variants now encode and decode as CBOR text strings only (Serde-style) instead of one-entry maps.

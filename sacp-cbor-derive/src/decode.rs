@@ -331,16 +331,37 @@ fn decode_enum_external(
             }
 
             Fields::Unnamed(fields) => {
-                let (vars, decodes) =
-                    tuple_decode_parts(name, fields, wc, &decode_lt, "tuple enum variant fields")?;
-                let expected = vars.len();
-                let body =
-                    array_decode_block(expected, &decodes, quote!(Ok(Self::#ident(#(#vars),*))));
-                map_arms.push(quote! {
-                    #vname => map.decode_value(|decoder| {
-                        #body
-                    })
-                });
+                if fields.unnamed.len() == 1 {
+                    let field = fields.unnamed.first().unwrap();
+                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+                    if !type_mentions_self(&field.ty, name) {
+                        add_where_bound(wc, &field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+                    }
+                    map_arms.push(quote! {
+                        #vname => map.decode_value(|decoder| {
+                            Ok(Self::#ident(::sacp_cbor::CborDecode::decode(decoder)?))
+                        })
+                    });
+                } else {
+                    let (vars, decodes) = tuple_decode_parts(
+                        name,
+                        fields,
+                        wc,
+                        &decode_lt,
+                        "tuple enum variant fields",
+                    )?;
+                    let expected = vars.len();
+                    let body = array_decode_block(
+                        expected,
+                        &decodes,
+                        quote!(Ok(Self::#ident(#(#vars),*))),
+                    );
+                    map_arms.push(quote! {
+                        #vname => map.decode_value(|decoder| {
+                            #body
+                        })
+                    });
+                }
             }
 
             Fields::Named(fields) => {
@@ -378,18 +399,31 @@ fn decode_enum_external(
         }
     };
 
+    let text_body = if text_arms.is_empty() {
+        quote! {
+            Err(::sacp_cbor::CborError::new(
+                ::sacp_cbor::ErrorCode::ExpectedEnum,
+                decoder.position(),
+            ))
+        }
+    } else {
+        quote! {
+            let text_off = decoder.position();
+            let key: &#decode_lt str = ::sacp_cbor::CborDecode::decode(decoder)?;
+            match key {
+                #(#text_arms),*,
+                _ => Err(::sacp_cbor::CborError::new(
+                    ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                    text_off,
+                )),
+            }
+        }
+    };
+
     let body = quote! {
         match decoder.peek_kind()? {
             ::sacp_cbor::CborKind::Text => {
-                let text_off = decoder.position();
-                let key: &#decode_lt str = ::sacp_cbor::CborDecode::decode(decoder)?;
-                match key {
-                    #(#text_arms),*,
-                    _ => Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
-                        text_off,
-                    )),
-                }
+                #text_body
             }
             ::sacp_cbor::CborKind::Map => {
                 #map_body
