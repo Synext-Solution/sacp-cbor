@@ -232,17 +232,27 @@ fn encode_enum_external(
                 let (pats, items) = tuple_variant_parts(name, fields, &mut bounds)?;
 
                 let len = items.len();
-                arms.push(quote! {
-                    Self::#ident( #(#pats),* ) => enc.map(1, |m| {
-                        m.entry(#vname, |enc| {
-                            enc.array(#len, |a| {
-                                #(#items)*
-                                Ok(())
-                            })
-                        })?;
-                        Ok(())
-                    })
-                });
+                if len == 1 {
+                    let value = &pats[0];
+                    arms.push(quote! {
+                        Self::#ident( #(#pats),* ) => enc.map(1, |m| {
+                            m.entry(#vname, |enc| ::sacp_cbor::CborEncode::encode(#value, enc))?;
+                            Ok(())
+                        })
+                    });
+                } else {
+                    arms.push(quote! {
+                        Self::#ident( #(#pats),* ) => enc.map(1, |m| {
+                            m.entry(#vname, |enc| {
+                                enc.array(#len, |a| {
+                                    #(#items)*
+                                    Ok(())
+                                })
+                            })?;
+                            Ok(())
+                        })
+                    });
+                }
             }
 
             Fields::Named(fields) => {

@@ -105,6 +105,15 @@ enum AdjacentExample {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, CborEncode, CborDecode)]
+#[serde(rename_all = "snake_case")]
+#[cbor(rename_all = "snake_case")]
+enum ExternalDataOnlyWire {
+    Token(String),
+    Pair(String, u8),
+    Record { id: String, version: u8 },
+}
+
 #[test]
 fn internal_tagged_enums_match_serde_json_shape() {
     assert_derive_matches_serde(
@@ -186,6 +195,72 @@ fn adjacent_tagged_enums_match_serde_json_shape() {
             }
         }),
     );
+}
+
+#[test]
+fn external_tagged_enums_without_unit_variants_match_serde_json_shape() {
+    assert_derive_matches_serde(
+        ExternalDataOnlyWire::Token("token-1".to_string()),
+        json!({
+            "token": "token-1"
+        }),
+    );
+
+    assert_derive_matches_serde(
+        ExternalDataOnlyWire::Pair("token-2".to_string(), 7),
+        json!({
+            "pair": ["token-2", 7]
+        }),
+    );
+
+    assert_derive_matches_serde(
+        ExternalDataOnlyWire::Record {
+            id: "item-1".to_string(),
+            version: 2,
+        },
+        json!({
+            "record": {
+                "id": "item-1",
+                "version": 2
+            }
+        }),
+    );
+}
+
+#[test]
+fn external_tagged_enums_without_unit_variants_reject_text_shape() {
+    let bytes = cbor_bytes!("token").unwrap();
+    let err = decode::<ExternalDataOnlyWire>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedEnum);
+
+    let err = from_slice::<ExternalDataOnlyWire>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedEnum);
+}
+
+#[test]
+fn external_tagged_enums_without_unit_variants_reject_legacy_newtype_array_shape() {
+    let bytes = cbor_bytes!({ "token": ["token-1"] }).unwrap();
+    let err = decode::<ExternalDataOnlyWire>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedText);
+
+    let err = from_slice::<ExternalDataOnlyWire>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedText);
 }
 
 #[test]
