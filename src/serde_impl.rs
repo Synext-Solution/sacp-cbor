@@ -45,60 +45,6 @@ fn check_map_key_order(
     Ok(())
 }
 
-fn write_text_entry<T: ?Sized + Serialize>(
-    enc: &mut Encoder,
-    key: &str,
-    prev_key_range: Option<(usize, usize)>,
-    entry_start: usize,
-    value: &T,
-    mode: MapKeyMode,
-) -> Result<(usize, usize), SerdeError> {
-    if let Err(err) = enc.emit_text(key) {
-        enc.truncate(entry_start);
-        return Err(SerdeError::from(err));
-    }
-    let key_start = entry_start;
-    let key_end = enc.buf_len();
-
-    check_map_key_order(enc, prev_key_range, key_start, key_end, entry_start)?;
-
-    if let Err(err) = value.serialize(EncoderSerializer::with_mode(enc, mode)) {
-        enc.truncate(entry_start);
-        return Err(err);
-    }
-
-    Ok((key_start, key_end))
-}
-
-fn write_struct_field<T: ?Sized + Serialize>(
-    enc: &mut Encoder,
-    key: &'static str,
-    value: &T,
-    remaining: &mut usize,
-    prev_key_range: &mut Option<(usize, usize)>,
-    mode: MapKeyMode,
-) -> Result<(), SerdeError> {
-    if *remaining == 0 {
-        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
-    }
-    let entry_start = enc.buf_len();
-    let (key_start, key_end) =
-        write_text_entry(enc, key, *prev_key_range, entry_start, value, mode)?;
-    *prev_key_range = Some((key_start, key_end));
-    *remaining -= 1;
-    Ok(())
-}
-
-fn finish_struct(enc: &mut Encoder, remaining: usize, roots: &[bool]) -> Result<(), SerdeError> {
-    if remaining != 0 {
-        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
-    }
-    for &root in roots {
-        enc.finish_container(root);
-    }
-    Ok(())
-}
-
 /// Serialize a Rust value into canonical SACP-CBOR/1 bytes.
 ///
 /// # Errors
@@ -337,14 +283,7 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        let map = start_enum_map(self.enc, variant)?;
-        if let Err(err) = self.enc.null() {
-            self.enc.truncate(map.start);
-            self.enc.abort_container();
-            return Err(SerdeError::from(err));
-        }
-        self.enc.finish_container(map.root);
-        Ok(())
+        self.encode_with(|enc| enc.emit_text(variant), |enc| enc.text(variant))
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
@@ -420,7 +359,7 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
         let root = self.enc.map_header(len).map_err(SerdeError::from)?;
-        Ok(StructSerializer::new(self.enc, len, root, self.mode))
+        StructSerializer::new(self.enc, len, root, self.mode)
     }
 
     fn serialize_struct_variant(
@@ -436,7 +375,7 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
             self.enc.abort_container();
             return Err(SerdeError::from(err));
         }
-        Ok(StructVariantSerializer::new(self.enc, len, map, self.mode))
+        StructVariantSerializer::new(self.enc, len, map, self.mode)
     }
 }
 
@@ -607,6 +546,54 @@ struct PendingKey {
 struct SortedEntry {
     key: String,
     value: Vec<u8>,
+}
+
+fn push_sorted_entry<T: ?Sized + Serialize>(
+    entries: &mut Vec<SortedEntry>,
+    key: &'static str,
+    value: &T,
+    remaining: &mut usize,
+    mode: MapKeyMode,
+) -> Result<(), SerdeError> {
+    if *remaining == 0 {
+        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+    }
+
+    let mut tmp = Encoder::new();
+    value.serialize(EncoderSerializer::with_mode(&mut tmp, mode))?;
+    let value = tmp.into_canonical().map_err(SerdeError::from)?.into_bytes();
+    let key = alloc_util::try_string_from_str(key, 0).map_err(SerdeError::from)?;
+    entries.push(SortedEntry { key, value });
+    *remaining -= 1;
+    Ok(())
+}
+
+fn finish_sorted_entries(
+    enc: &mut Encoder,
+    entries: &mut [SortedEntry],
+    remaining: usize,
+    roots: &[bool],
+) -> Result<(), SerdeError> {
+    if remaining != 0 {
+        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+    }
+
+    entries.sort_by(|a, b| cmp_text_keys_canonical(&a.key, &b.key));
+    for window in entries.windows(2) {
+        if window[0].key == window[1].key {
+            return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
+        }
+    }
+
+    for entry in entries.iter() {
+        enc.emit_text(&entry.key).map_err(SerdeError::from)?;
+        enc.emit_raw_bytes(&entry.value).map_err(SerdeError::from)?;
+    }
+
+    for &root in roots {
+        enc.finish_container(root);
+    }
+    Ok(())
 }
 
 enum MapState {
@@ -850,22 +837,28 @@ impl Drop for MapSerializer<'_> {
 struct StructSerializer<'a> {
     enc: &'a mut Encoder,
     remaining: usize,
-    prev_key_range: Option<(usize, usize)>,
+    entries: Vec<SortedEntry>,
     root: bool,
     finished: bool,
     mode: MapKeyMode,
 }
 
 impl<'a> StructSerializer<'a> {
-    fn new(enc: &'a mut Encoder, remaining: usize, root: bool, mode: MapKeyMode) -> Self {
-        Self {
+    fn new(
+        enc: &'a mut Encoder,
+        remaining: usize,
+        root: bool,
+        mode: MapKeyMode,
+    ) -> Result<Self, SerdeError> {
+        Ok(Self {
             enc,
             remaining,
-            prev_key_range: None,
+            entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
+                .map_err(SerdeError::from)?,
             root,
             finished: false,
             mode,
-        }
+        })
     }
 }
 
@@ -878,19 +871,18 @@ impl ser::SerializeStruct for StructSerializer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), SerdeError> {
-        write_struct_field(
-            self.enc,
+        push_sorted_entry(
+            &mut self.entries,
             key,
             value,
             &mut self.remaining,
-            &mut self.prev_key_range,
             self.mode,
         )
     }
 
     fn end(self) -> Result<(), SerdeError> {
         let mut this = self;
-        finish_struct(this.enc, this.remaining, &[this.root])?;
+        finish_sorted_entries(this.enc, &mut this.entries, this.remaining, &[this.root])?;
         this.finished = true;
         Ok(())
     }
@@ -907,7 +899,7 @@ impl Drop for StructSerializer<'_> {
 struct StructVariantSerializer<'a> {
     enc: &'a mut Encoder,
     remaining: usize,
-    prev_key_range: Option<(usize, usize)>,
+    entries: Vec<SortedEntry>,
     map_start: usize,
     map_root: bool,
     finished: bool,
@@ -915,16 +907,22 @@ struct StructVariantSerializer<'a> {
 }
 
 impl<'a> StructVariantSerializer<'a> {
-    fn new(enc: &'a mut Encoder, remaining: usize, map: EnumMapState, mode: MapKeyMode) -> Self {
-        Self {
+    fn new(
+        enc: &'a mut Encoder,
+        remaining: usize,
+        map: EnumMapState,
+        mode: MapKeyMode,
+    ) -> Result<Self, SerdeError> {
+        Ok(Self {
             enc,
             remaining,
-            prev_key_range: None,
+            entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
+                .map_err(SerdeError::from)?,
             map_start: map.start,
             map_root: map.root,
             finished: false,
             mode,
-        }
+        })
     }
 }
 
@@ -937,19 +935,23 @@ impl ser::SerializeStructVariant for StructVariantSerializer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), SerdeError> {
-        write_struct_field(
-            self.enc,
+        push_sorted_entry(
+            &mut self.entries,
             key,
             value,
             &mut self.remaining,
-            &mut self.prev_key_range,
             self.mode,
         )
     }
 
     fn end(self) -> Result<(), SerdeError> {
         let mut this = self;
-        finish_struct(this.enc, this.remaining, &[false, this.map_root])?;
+        finish_sorted_entries(
+            this.enc,
+            &mut this.entries,
+            this.remaining,
+            &[false, this.map_root],
+        )?;
         this.finished = true;
         Ok(())
     }
@@ -1405,9 +1407,15 @@ impl<'de, const CHECKED: bool> MapAccess<'de> for MapAccessImpl<'_, 'de, CHECKED
     }
 }
 
+enum EnumPayload<'a, 'de, const CHECKED: bool> {
+    Unit,
+    Map(MapDecoder<'a, 'de, CHECKED>),
+}
+
 struct EnumAccessImpl<'a, 'de, const CHECKED: bool> {
     key: &'de str,
-    map: MapDecoder<'a, 'de, CHECKED>,
+    payload: EnumPayload<'a, 'de, CHECKED>,
+    offset: usize,
 }
 
 #[allow(clippy::elidable_lifetime_names)]
@@ -1422,60 +1430,77 @@ impl<'a, 'de, const CHECKED: bool> EnumAccess<'de> for EnumAccessImpl<'a, 'de, C
         let variant = seed.deserialize(
             <&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(self.key),
         )?;
-        Ok((variant, VariantAccessImpl { map: self.map }))
+        Ok((
+            variant,
+            VariantAccessImpl {
+                payload: self.payload,
+                offset: self.offset,
+            },
+        ))
     }
 }
 
 struct VariantAccessImpl<'a, 'de, const CHECKED: bool> {
-    map: MapDecoder<'a, 'de, CHECKED>,
+    payload: EnumPayload<'a, 'de, CHECKED>,
+    offset: usize,
 }
 
 impl<'de, const CHECKED: bool> VariantAccess<'de> for VariantAccessImpl<'_, 'de, CHECKED> {
     type Error = DeError;
 
-    fn unit_variant(mut self) -> Result<(), DeError> {
-        self.map
-            .decode_value(|decoder| <()>::deserialize(decoder).map_err(DeError::into_cbor_error))
-            .map_err(DeError::from)
+    fn unit_variant(self) -> Result<(), DeError> {
+        match self.payload {
+            EnumPayload::Unit => Ok(()),
+            EnumPayload::Map(_) => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
+        }
     }
 
-    fn newtype_variant_seed<T>(mut self, seed: T) -> Result<T::Value, DeError>
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, DeError>
     where
         T: DeserializeSeed<'de>,
     {
-        self.map
-            .decode_value(|decoder| seed.deserialize(decoder).map_err(DeError::into_cbor_error))
-            .map_err(DeError::from)
+        match self.payload {
+            EnumPayload::Unit => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
+            EnumPayload::Map(mut map) => map
+                .decode_value(|decoder| seed.deserialize(decoder).map_err(DeError::into_cbor_error))
+                .map_err(DeError::from),
+        }
     }
 
-    fn tuple_variant<V>(mut self, len: usize, visitor: V) -> Result<V::Value, DeError>
+    fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        self.map
-            .decode_value(|decoder| {
-                decoder
-                    .deserialize_tuple(len, visitor)
-                    .map_err(DeError::into_cbor_error)
-            })
-            .map_err(DeError::from)
+        match self.payload {
+            EnumPayload::Unit => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
+            EnumPayload::Map(mut map) => map
+                .decode_value(|decoder| {
+                    decoder
+                        .deserialize_tuple(len, visitor)
+                        .map_err(DeError::into_cbor_error)
+                })
+                .map_err(DeError::from),
+        }
     }
 
     fn struct_variant<V>(
-        mut self,
+        self,
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        self.map
-            .decode_value(|decoder| {
-                decoder
-                    .deserialize_struct("", fields, visitor)
-                    .map_err(DeError::into_cbor_error)
-            })
-            .map_err(DeError::from)
+        match self.payload {
+            EnumPayload::Unit => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
+            EnumPayload::Map(mut map) => map
+                .decode_value(|decoder| {
+                    decoder
+                        .deserialize_struct("", fields, visitor)
+                        .map_err(DeError::into_cbor_error)
+                })
+                .map_err(DeError::from),
+        }
     }
 }
 
@@ -1769,14 +1794,31 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
         V: Visitor<'de>,
     {
         let off = self.position();
-        let mut map = self.map().map_err(DeError::from)?;
-        if map.remaining() != 1 {
-            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+        match self.peek_kind().map_err(DeError::from)? {
+            CborKind::Text => {
+                let key: &'de str = CborDecode::decode(self).map_err(DeError::from)?;
+                visitor.visit_enum(EnumAccessImpl {
+                    key,
+                    payload: EnumPayload::<CHECKED>::Unit,
+                    offset: off,
+                })
+            }
+            CborKind::Map => {
+                let mut map = self.map().map_err(DeError::from)?;
+                if map.remaining() != 1 {
+                    return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+                }
+                let Some(key) = map.next_key().map_err(DeError::from)? else {
+                    return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+                };
+                visitor.visit_enum(EnumAccessImpl {
+                    key,
+                    payload: EnumPayload::Map(map),
+                    offset: off,
+                })
+            }
+            _ => Err(DeError::new(ErrorCode::ExpectedEnum, off)),
         }
-        let Some(key) = map.next_key().map_err(DeError::from)? else {
-            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
-        };
-        visitor.visit_enum(EnumAccessImpl { key, map })
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, DeError>
