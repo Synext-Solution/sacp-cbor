@@ -11,8 +11,7 @@ fn check_reserve_len<T>(len: usize, additional: usize, offset: usize) -> Result<
         .checked_add(additional)
         .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, offset))?;
     let elem_size = core::mem::size_of::<T>();
-    if elem_size != 0 {
-        let max = (isize::MAX as usize) / elem_size;
+    if let Some(max) = (isize::MAX as usize).checked_div(elem_size) {
         if needed > max {
             return Err(CborError::new(ErrorCode::LengthOverflow, offset));
         }
