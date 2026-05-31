@@ -1,0 +1,5 @@
+error: duplicate CBOR map key
+ --> tests/ui/cbor_bytes_duplicate_key.rs:4:33
+  |
+4 |     let _ = cbor_bytes!({ a: 1, a: 2 });
+  |                                 ^

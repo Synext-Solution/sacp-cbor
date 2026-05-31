@@ -1,13 +1,17 @@
 #[cfg(feature = "adapter-minicbor")]
 mod impls {
+    use minicbor::data::Type;
     use minicbor::decode::{Decoder, Error as DecodeError};
     use minicbor::encode::{Encoder, Error as EncodeError, Write};
-    use minicbor::data::Type;
 
     use crate::value::BenchValue;
 
     impl<C> minicbor::Encode<C> for BenchValue {
-        fn encode<W: Write>(&self, e: &mut Encoder<W>, _ctx: &mut C) -> Result<(), EncodeError<W::Error>> {
+        fn encode<W: Write>(
+            &self,
+            e: &mut Encoder<W>,
+            _ctx: &mut C,
+        ) -> Result<(), EncodeError<W::Error>> {
             match self {
                 BenchValue::Null => {
                     e.null()?;

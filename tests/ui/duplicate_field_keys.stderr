@@ -1,0 +1,5 @@
+error: duplicate CBOR field key `x`
+ --> tests/ui/duplicate_field_keys.rs:7:21
+  |
+7 |     #[cbor(rename = "x")]
+  |                     ^^^

@@ -1,0 +1,5 @@
+error: duplicate CBOR variant name `x`
+ --> tests/ui/duplicate_variant_names.rs:7:21
+  |
+7 |     #[cbor(rename = "x")]
+  |                     ^^^

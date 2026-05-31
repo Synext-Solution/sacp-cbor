@@ -1,41 +1,26 @@
-use core::marker::PhantomData;
-
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(feature = "alloc")]
+use crate::alloc_util::try_reserve;
 #[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::{
-    check_encoded_key_order, validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
+    check_encoded_key_order, is_minimal_uint_ai, validate_bignum_bytes, validate_f64_bits,
+    MAX_SAFE_INTEGER,
 };
 use crate::utf8;
 use crate::{CborError, DecodeLimits, ErrorCode};
 
-pub trait DecodeError: Sized {
-    fn new(code: ErrorCode, offset: usize) -> Self;
-}
-
-impl DecodeError for CborError {
-    #[inline]
-    fn new(code: ErrorCode, offset: usize) -> Self {
-        Self::new(code, offset)
-    }
-}
-
-pub struct Cursor<'a, E: DecodeError> {
+pub struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
-    _marker: PhantomData<E>,
 }
 
-impl<'a, E: DecodeError> Cursor<'a, E> {
+impl<'a> Cursor<'a> {
     #[inline]
     pub const fn with_pos(data: &'a [u8], pos: usize) -> Self {
-        Self {
-            data,
-            pos,
-            _marker: PhantomData,
-        }
+        Self { data, pos }
     }
 
     #[inline]
@@ -49,17 +34,17 @@ impl<'a, E: DecodeError> Cursor<'a, E> {
     }
 
     #[inline]
-    pub fn read_u8(&mut self) -> Result<u8, E> {
+    pub fn read_u8(&mut self) -> Result<u8, CborError> {
         read_u8_at(self.data, &mut self.pos)
     }
 
     #[inline]
-    pub fn read_exact(&mut self, n: usize) -> Result<&'a [u8], E> {
+    pub fn read_exact(&mut self, n: usize) -> Result<&'a [u8], CborError> {
         read_exact_at(self.data, &mut self.pos, n)
     }
 
     #[inline]
-    pub fn read_be_u64(&mut self) -> Result<u64, E> {
+    pub fn read_be_u64(&mut self) -> Result<u64, CborError> {
         let s = self.read_exact(8)?;
         Ok(u64::from_be_bytes([
             s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
@@ -68,27 +53,23 @@ impl<'a, E: DecodeError> Cursor<'a, E> {
 }
 
 #[inline]
-fn read_u8_at<E: DecodeError>(data: &[u8], pos: &mut usize) -> Result<u8, E> {
+fn read_u8_at(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {
     let off = *pos;
     let b = *data
         .get(*pos)
-        .ok_or_else(|| E::new(ErrorCode::UnexpectedEof, off))?;
+        .ok_or_else(|| CborError::new(ErrorCode::UnexpectedEof, off))?;
     *pos += 1;
     Ok(b)
 }
 
 #[inline]
-fn read_exact_at<'a, E: DecodeError>(
-    data: &'a [u8],
-    pos: &mut usize,
-    n: usize,
-) -> Result<&'a [u8], E> {
+fn read_exact_at<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], CborError> {
     let off = *pos;
     let end = pos
         .checked_add(n)
-        .ok_or_else(|| E::new(ErrorCode::LengthOverflow, off))?;
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
     if end > data.len() {
-        return Err(E::new(ErrorCode::UnexpectedEof, off));
+        return Err(CborError::new(ErrorCode::UnexpectedEof, off));
     }
     let s = &data[*pos..end];
     *pos = end;
@@ -96,93 +77,93 @@ fn read_exact_at<'a, E: DecodeError>(
 }
 
 pub fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {
-    read_u8_at::<CborError>(data, pos)
+    read_u8_at(data, pos)
 }
 
 pub fn read_exact<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], CborError> {
-    read_exact_at::<CborError>(data, pos, n)
+    read_exact_at(data, pos, n)
 }
 
 #[inline]
-pub fn read_uint_arg_at<const CHECKED: bool, E: DecodeError>(
+pub fn read_uint_arg_at<const CHECKED: bool>(
     data: &[u8],
     pos: &mut usize,
     ai: u8,
     off: usize,
-) -> Result<u64, E> {
+) -> Result<u64, CborError> {
     match ai {
         0..=23 => Ok(u64::from(ai)),
         24 => {
-            let v = u64::from(read_u8_at::<E>(data, pos)?);
-            if CHECKED && v < 24 {
-                return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+            let v = u64::from(read_u8_at(data, pos)?);
+            if CHECKED && !is_minimal_uint_ai(ai, v) {
+                return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
             }
             Ok(v)
         }
         25 => {
             let v = u64::from({
-                let s = read_exact_at::<E>(data, pos, 2)?;
+                let s = read_exact_at(data, pos, 2)?;
                 u16::from_be_bytes([s[0], s[1]])
             });
-            if CHECKED && u8::try_from(v).is_ok() {
-                return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+            if CHECKED && !is_minimal_uint_ai(ai, v) {
+                return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
             }
             Ok(v)
         }
         26 => {
             let v = u64::from({
-                let s = read_exact_at::<E>(data, pos, 4)?;
+                let s = read_exact_at(data, pos, 4)?;
                 u32::from_be_bytes([s[0], s[1], s[2], s[3]])
             });
-            if CHECKED && u16::try_from(v).is_ok() {
-                return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+            if CHECKED && !is_minimal_uint_ai(ai, v) {
+                return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
             }
             Ok(v)
         }
         27 => {
             let v = {
-                let s = read_exact_at::<E>(data, pos, 8)?;
+                let s = read_exact_at(data, pos, 8)?;
                 u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
             };
-            if CHECKED && u32::try_from(v).is_ok() {
-                return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+            if CHECKED && !is_minimal_uint_ai(ai, v) {
+                return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
             }
             Ok(v)
         }
-        _ => Err(E::new(ErrorCode::ReservedAdditionalInfo, off)),
+        _ => Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off)),
     }
 }
 
 #[inline]
-pub fn read_uint_arg<const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'_, E>,
+pub fn read_uint_arg<const CHECKED: bool>(
+    cursor: &mut Cursor<'_>,
     ai: u8,
     off: usize,
-) -> Result<u64, E> {
-    read_uint_arg_at::<CHECKED, E>(cursor.data, &mut cursor.pos, ai, off)
+) -> Result<u64, CborError> {
+    read_uint_arg_at::<CHECKED>(cursor.data, &mut cursor.pos, ai, off)
 }
 
 #[inline]
-pub fn read_len_at<const CHECKED: bool, E: DecodeError>(
+pub fn read_len_at<const CHECKED: bool>(
     data: &[u8],
     pos: &mut usize,
     ai: u8,
     off: usize,
-) -> Result<usize, E> {
+) -> Result<usize, CborError> {
     if ai == 31 {
-        return Err(E::new(ErrorCode::IndefiniteLengthForbidden, off));
+        return Err(CborError::new(ErrorCode::IndefiniteLengthForbidden, off));
     }
-    let len = read_uint_arg_at::<CHECKED, E>(data, pos, ai, off)?;
-    usize::try_from(len).map_err(|_| E::new(ErrorCode::LengthOverflow, off))
+    let len = read_uint_arg_at::<CHECKED>(data, pos, ai, off)?;
+    usize::try_from(len).map_err(|_| CborError::new(ErrorCode::LengthOverflow, off))
 }
 
 #[inline]
-pub fn read_len<const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'_, E>,
+pub fn read_len<const CHECKED: bool>(
+    cursor: &mut Cursor<'_>,
     ai: u8,
     off: usize,
-) -> Result<usize, E> {
-    read_len_at::<CHECKED, E>(cursor.data, &mut cursor.pos, ai, off)
+) -> Result<usize, CborError> {
+    read_len_at::<CHECKED>(cursor.data, &mut cursor.pos, ai, off)
 }
 
 pub fn read_uint_trusted(
@@ -191,7 +172,7 @@ pub fn read_uint_trusted(
     ai: u8,
     off: usize,
 ) -> Result<u64, CborError> {
-    read_uint_arg_at::<false, CborError>(data, pos, ai, off)
+    read_uint_arg_at::<false>(data, pos, ai, off)
 }
 
 pub fn read_len_trusted(
@@ -200,43 +181,112 @@ pub fn read_len_trusted(
     ai: u8,
     off: usize,
 ) -> Result<usize, CborError> {
-    read_len_at::<false, CborError>(data, pos, ai, off)
+    read_len_at::<false>(data, pos, ai, off)
 }
 
 #[inline]
-pub fn parse_text_from_header<'a, const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'a, E>,
+const fn trusted_canonical_err(cause: CborError) -> CborError {
+    CborError::new(ErrorCode::MalformedCanonical, cause.offset)
+}
+
+#[inline]
+pub fn read_u8_trusted_canonical(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {
+    read_u8(data, pos).map_err(trusted_canonical_err)
+}
+
+#[inline]
+pub fn read_exact_trusted_canonical<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    n: usize,
+) -> Result<&'a [u8], CborError> {
+    read_exact(data, pos, n).map_err(trusted_canonical_err)
+}
+
+#[inline]
+pub fn read_uint_trusted_canonical(
+    data: &[u8],
+    pos: &mut usize,
+    ai: u8,
+    off: usize,
+) -> Result<u64, CborError> {
+    read_uint_trusted(data, pos, ai, off).map_err(trusted_canonical_err)
+}
+
+#[inline]
+pub fn read_len_trusted_canonical(
+    data: &[u8],
+    pos: &mut usize,
+    ai: u8,
+    off: usize,
+) -> Result<usize, CborError> {
+    read_len_trusted(data, pos, ai, off).map_err(trusted_canonical_err)
+}
+
+pub fn read_text_payload_trusted<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+) -> Result<&'a [u8], CborError> {
+    let off = *pos;
+    let initial = read_u8_trusted_canonical(data, pos)?;
+    if initial >> 5 != 3 {
+        return Err(CborError::new(ErrorCode::MalformedCanonical, off));
+    }
+    let len = read_len_trusted_canonical(data, pos, initial & 0x1f, off)?;
+    read_exact_trusted_canonical(data, pos, len)
+}
+
+pub fn read_text_trusted<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str, CborError> {
+    let off = *pos;
+    let bytes = read_text_payload_trusted(data, pos)?;
+    utf8::trusted(bytes).map_err(|()| CborError::new(ErrorCode::MalformedCanonical, off))
+}
+
+pub fn value_end_trusted_with_scratch(
+    data: &[u8],
+    start: usize,
+    scratch: &mut SkipScratch,
+) -> Result<usize, CborError> {
+    let mut cursor = Cursor::with_pos(data, start);
+    let mut items_seen = 0;
+    skip_one_value_with_scratch::<false>(&mut cursor, None, &mut items_seen, 0, scratch)?;
+    Ok(cursor.position())
+}
+
+#[inline]
+pub fn parse_text_from_header<'a, const CHECKED: bool>(
+    cursor: &mut Cursor<'a>,
     limits: Option<&DecodeLimits>,
     off: usize,
     ai: u8,
-) -> Result<&'a str, E> {
-    let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+) -> Result<&'a str, CborError> {
+    let len = read_len::<CHECKED>(cursor, ai, off)?;
     if let Some(limits) = limits {
         if len > limits.max_text_len {
-            return Err(E::new(ErrorCode::TextLenLimitExceeded, off));
+            return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
         }
     }
     let bytes = cursor.read_exact(len)?;
     let s = if CHECKED {
-        utf8::validate(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?
+        utf8::validate_utf8(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?
     } else {
-        utf8::trusted(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?
+        utf8::trusted(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?
     };
     Ok(s)
 }
 
 #[inline]
-pub fn parse_bignum<'a, const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'a, E>,
+pub fn parse_bignum<'a, const CHECKED: bool>(
+    cursor: &mut Cursor<'a>,
     limits: Option<&DecodeLimits>,
     off: usize,
     ai: u8,
-) -> Result<(bool, &'a [u8]), E> {
-    let tag = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
+) -> Result<(bool, &'a [u8]), CborError> {
+    let tag = read_uint_arg::<CHECKED>(cursor, ai, off)?;
     let negative = match tag {
         2 => false,
         3 => true,
-        _ => return Err(E::new(ErrorCode::ForbiddenOrMalformedTag, off)),
+        _ => return Err(CborError::new(ErrorCode::ForbiddenOrMalformedTag, off)),
     };
 
     let m_off = cursor.position();
@@ -244,36 +294,36 @@ pub fn parse_bignum<'a, const CHECKED: bool, E: DecodeError>(
     let m_major = first >> 5;
     let m_ai = first & 0x1f;
     if m_major != 2 {
-        return Err(E::new(ErrorCode::ForbiddenOrMalformedTag, m_off));
+        return Err(CborError::new(ErrorCode::ForbiddenOrMalformedTag, m_off));
     }
 
-    let m_len = read_len::<CHECKED, E>(cursor, m_ai, m_off)?;
+    let m_len = read_len::<CHECKED>(cursor, m_ai, m_off)?;
     if let Some(limits) = limits {
         if m_len > limits.max_bytes_len {
-            return Err(E::new(ErrorCode::BytesLenLimitExceeded, m_off));
+            return Err(CborError::new(ErrorCode::BytesLenLimitExceeded, m_off));
         }
     }
     let mag = cursor.read_exact(m_len)?;
 
     if CHECKED {
-        validate_bignum_bytes(negative, mag).map_err(|code| E::new(code, m_off))?;
+        validate_bignum_bytes(negative, mag).map_err(|code| CborError::new(code, m_off))?;
     }
 
     Ok((negative, mag))
 }
 
 #[inline]
-pub fn check_map_key_order<E: DecodeError>(
+pub fn check_map_key_order(
     data: &[u8],
     prev_key_range: &mut Option<(usize, usize)>,
     key_start: usize,
     key_end: usize,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     if let Some((ps, pe)) = *prev_key_range {
         let prev = &data[ps..pe];
         let curr = &data[key_start..key_end];
         if let Err(code) = check_encoded_key_order(prev, curr) {
-            return Err(E::new(code, key_start));
+            return Err(CborError::new(code, key_start));
         }
     }
     *prev_key_range = Some((key_start, key_end));
@@ -308,7 +358,7 @@ impl Frame {
 
 trait StackOps {
     fn is_empty(&self) -> bool;
-    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E>;
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError>;
     fn pop(&mut self) -> Option<Frame>;
     fn peek(&self) -> Option<&Frame>;
     fn peek_mut(&mut self) -> Option<&mut Frame>;
@@ -348,10 +398,10 @@ impl FrameStack {
     }
 
     #[inline]
-    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         match &mut self.heap {
             Some(items) => {
-                try_reserve_vec::<Frame, E>(items, 1, off)?;
+                try_reserve(items, 1, off)?;
                 items.push(frame);
             }
             None => {
@@ -360,7 +410,7 @@ impl FrameStack {
                     self.len += 1;
                 } else {
                     let mut items = Vec::new();
-                    try_reserve_vec::<Frame, E>(&mut items, self.len + 1, off)?;
+                    try_reserve(&mut items, self.len + 1, off)?;
                     items.extend_from_slice(&self.inline[..self.len]);
                     items.push(frame);
                     self.heap = Some(items);
@@ -423,7 +473,7 @@ impl StackOps for FrameStack {
     }
 
     #[inline]
-    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         Self::push(self, frame, off)
     }
 
@@ -441,31 +491,6 @@ impl StackOps for FrameStack {
     fn peek_mut(&mut self) -> Option<&mut Frame> {
         Self::peek_mut(self)
     }
-}
-
-#[cfg(feature = "alloc")]
-#[inline]
-fn try_reserve_vec<T, E: DecodeError>(
-    v: &mut Vec<T>,
-    additional: usize,
-    offset: usize,
-) -> Result<(), E> {
-    let needed = v
-        .len()
-        .checked_add(additional)
-        .ok_or_else(|| E::new(ErrorCode::LengthOverflow, offset))?;
-    if needed <= v.capacity() {
-        return Ok(());
-    }
-    let elem_size = core::mem::size_of::<T>();
-    if elem_size != 0 {
-        let max = (isize::MAX as usize) / elem_size;
-        if needed > max {
-            return Err(E::new(ErrorCode::LengthOverflow, offset));
-        }
-    }
-    v.try_reserve(additional)
-        .map_err(|_| E::new(ErrorCode::AllocationFailed, offset))
 }
 
 #[cfg(not(feature = "alloc"))]
@@ -489,18 +514,18 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[inline]
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         if self.len < N {
             self.inline[self.len] = Some(frame);
             self.len += 1;
             Ok(())
         } else {
-            Err(E::new(ErrorCode::DepthLimitExceeded, off))
+            Err(CborError::new(ErrorCode::DepthLimitExceeded, off))
         }
     }
 
@@ -514,7 +539,7 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[inline]
-    fn peek(&self) -> Option<&Frame> {
+    const fn peek(&self) -> Option<&Frame> {
         if self.len == 0 {
             return None;
         }
@@ -538,7 +563,7 @@ impl<const N: usize> StackOps for FrameStack<N> {
     }
 
     #[inline]
-    fn push<E: DecodeError>(&mut self, frame: Frame, off: usize) -> Result<(), E> {
+    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         Self::push(self, frame, off)
     }
 
@@ -588,46 +613,46 @@ impl SkipScratch {
 const INLINE_STACK: usize = DEFAULT_MAX_DEPTH + 2;
 
 #[inline]
-fn bump_items<E: DecodeError>(
+fn bump_items(
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     add: usize,
     off: usize,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     let Some(limits) = limits else {
         return Ok(());
     };
     *items_seen = items_seen
         .checked_add(add)
-        .ok_or_else(|| E::new(ErrorCode::LengthOverflow, off))?;
+        .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
     if *items_seen > limits.max_total_items {
-        return Err(E::new(ErrorCode::TotalItemsLimitExceeded, off));
+        return Err(CborError::new(ErrorCode::TotalItemsLimitExceeded, off));
     }
     Ok(())
 }
 
 #[inline]
-fn ensure_depth<E: DecodeError>(
+const fn ensure_depth(
     limits: Option<&DecodeLimits>,
     next_depth: usize,
     off: usize,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     let Some(limits) = limits else {
         return Ok(());
     };
     if next_depth > limits.max_depth {
-        return Err(E::new(ErrorCode::DepthLimitExceeded, off));
+        return Err(CborError::new(ErrorCode::DepthLimitExceeded, off));
     }
     Ok(())
 }
 
 #[inline]
-fn consume_value<E: DecodeError>(frame: &mut Frame, off: usize) -> Result<(), E> {
+fn consume_value(frame: &mut Frame, off: usize) -> Result<(), CborError> {
     match frame {
         Frame::Array { remaining } => {
             *remaining = remaining
                 .checked_sub(1)
-                .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, off))?;
+                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, off))?;
         }
         Frame::Map {
             remaining_pairs,
@@ -635,11 +660,11 @@ fn consume_value<E: DecodeError>(frame: &mut Frame, off: usize) -> Result<(), E>
             ..
         } => {
             if *expecting_key {
-                return Err(E::new(ErrorCode::MalformedCanonical, off));
+                return Err(CborError::new(ErrorCode::MalformedCanonical, off));
             }
             *remaining_pairs = remaining_pairs
                 .checked_sub(1)
-                .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, off))?;
+                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, off))?;
             *expecting_key = true;
         }
     }
@@ -648,62 +673,63 @@ fn consume_value<E: DecodeError>(frame: &mut Frame, off: usize) -> Result<(), E>
 
 #[allow(clippy::too_many_lines)]
 #[inline]
-fn skip_primitive<const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'_, E>,
+fn skip_primitive<const CHECKED: bool>(
+    cursor: &mut Cursor<'_>,
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     next_depth: usize,
     off: usize,
     major: u8,
     ai: u8,
-) -> Result<Option<Frame>, E> {
+) -> Result<Option<Frame>, CborError> {
     match major {
         0 => {
-            let v = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
+            let v = read_uint_arg::<CHECKED>(cursor, ai, off)?;
             if CHECKED && v > MAX_SAFE_INTEGER {
-                return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
+                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
             }
             Ok(None)
         }
         1 => {
-            let n = read_uint_arg::<CHECKED, E>(cursor, ai, off)?;
+            let n = read_uint_arg::<CHECKED>(cursor, ai, off)?;
             if CHECKED && n >= MAX_SAFE_INTEGER {
-                return Err(E::new(ErrorCode::IntegerOutsideSafeRange, off));
+                return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
             }
             Ok(None)
         }
         2 => {
-            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            let len = read_len::<CHECKED>(cursor, ai, off)?;
             if let Some(limits) = limits {
                 if len > limits.max_bytes_len {
-                    return Err(E::new(ErrorCode::BytesLenLimitExceeded, off));
+                    return Err(CborError::new(ErrorCode::BytesLenLimitExceeded, off));
                 }
             }
             let _ = cursor.read_exact(len)?;
             Ok(None)
         }
         3 => {
-            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            let len = read_len::<CHECKED>(cursor, ai, off)?;
             if let Some(limits) = limits {
                 if len > limits.max_text_len {
-                    return Err(E::new(ErrorCode::TextLenLimitExceeded, off));
+                    return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
                 }
             }
             let bytes = cursor.read_exact(len)?;
             if CHECKED {
-                utf8::validate(bytes).map_err(|()| E::new(ErrorCode::Utf8Invalid, off))?;
+                utf8::validate_utf8(bytes)
+                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?;
             }
             Ok(None)
         }
         4 => {
-            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            let len = read_len::<CHECKED>(cursor, ai, off)?;
             if let Some(limits) = limits {
                 if len > limits.max_array_len {
-                    return Err(E::new(ErrorCode::ArrayLenLimitExceeded, off));
+                    return Err(CborError::new(ErrorCode::ArrayLenLimitExceeded, off));
                 }
             }
-            bump_items::<E>(limits, items_seen, len, off)?;
-            ensure_depth::<E>(limits, next_depth, off)?;
+            bump_items(limits, items_seen, len, off)?;
+            ensure_depth(limits, next_depth, off)?;
             if len == 0 {
                 Ok(None)
             } else {
@@ -711,17 +737,17 @@ fn skip_primitive<const CHECKED: bool, E: DecodeError>(
             }
         }
         5 => {
-            let len = read_len::<CHECKED, E>(cursor, ai, off)?;
+            let len = read_len::<CHECKED>(cursor, ai, off)?;
             if let Some(limits) = limits {
                 if len > limits.max_map_len {
-                    return Err(E::new(ErrorCode::MapLenLimitExceeded, off));
+                    return Err(CborError::new(ErrorCode::MapLenLimitExceeded, off));
                 }
             }
             let items = len
                 .checked_mul(2)
-                .ok_or_else(|| E::new(ErrorCode::LengthOverflow, off))?;
-            bump_items::<E>(limits, items_seen, items, off)?;
-            ensure_depth::<E>(limits, next_depth, off)?;
+                .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+            bump_items(limits, items_seen, items, off)?;
+            ensure_depth(limits, next_depth, off)?;
             if len == 0 {
                 Ok(None)
             } else {
@@ -733,7 +759,7 @@ fn skip_primitive<const CHECKED: bool, E: DecodeError>(
             }
         }
         6 => {
-            let _ = parse_bignum::<CHECKED, E>(cursor, limits, off, ai)?;
+            let _ = parse_bignum::<CHECKED>(cursor, limits, off, ai)?;
             Ok(None)
         }
         7 => {
@@ -742,33 +768,33 @@ fn skip_primitive<const CHECKED: bool, E: DecodeError>(
                 27 => {
                     let bits = cursor.read_be_u64()?;
                     if CHECKED {
-                        validate_f64_bits(bits).map_err(|code| E::new(code, off))?;
+                        validate_f64_bits(bits).map_err(|code| CborError::new(code, off))?;
                     }
                 }
                 24 => {
                     let simple = cursor.read_u8()?;
                     if simple < 24 {
-                        return Err(E::new(ErrorCode::NonCanonicalEncoding, off));
+                        return Err(CborError::new(ErrorCode::NonCanonicalEncoding, off));
                     }
-                    return Err(E::new(ErrorCode::UnsupportedSimpleValue, off));
+                    return Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off));
                 }
-                28..=30 => return Err(E::new(ErrorCode::ReservedAdditionalInfo, off)),
-                _ => return Err(E::new(ErrorCode::UnsupportedSimpleValue, off)),
+                28..=30 => return Err(CborError::new(ErrorCode::ReservedAdditionalInfo, off)),
+                _ => return Err(CborError::new(ErrorCode::UnsupportedSimpleValue, off)),
             }
             Ok(None)
         }
-        _ => Err(E::new(ErrorCode::MalformedCanonical, off)),
+        _ => Err(CborError::new(ErrorCode::MalformedCanonical, off)),
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
-    cursor: &mut Cursor<'_, E>,
+fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
+    cursor: &mut Cursor<'_>,
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     base_depth: usize,
     stack: &mut S,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     let mut local_depth: usize = 0;
     let mut started = false;
 
@@ -779,7 +805,7 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
             }
             let _ = stack
                 .pop()
-                .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, cursor.position()))?;
+                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, cursor.position()))?;
             local_depth = local_depth.saturating_sub(1);
             if stack.is_empty() && started {
                 return Ok(());
@@ -793,14 +819,17 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
         {
             let frame = stack
                 .peek_mut()
-                .ok_or_else(|| E::new(ErrorCode::MalformedCanonical, cursor.position()))?;
+                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, cursor.position()))?;
             let Frame::Map {
                 expecting_key,
                 prev_key_range,
                 ..
             } = frame
             else {
-                return Err(E::new(ErrorCode::MalformedCanonical, cursor.position()));
+                return Err(CborError::new(
+                    ErrorCode::MalformedCanonical,
+                    cursor.position(),
+                ));
             };
 
             let key_start = cursor.position();
@@ -808,15 +837,15 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
             let major = ib >> 5;
             let ai = ib & 0x1f;
             if major != 3 {
-                return Err(E::new(ErrorCode::MapKeyMustBeText, key_start));
+                return Err(CborError::new(ErrorCode::MapKeyMustBeText, key_start));
             }
             if CHECKED {
-                let _ = parse_text_from_header::<CHECKED, E>(cursor, limits, key_start, ai)?;
+                let _ = parse_text_from_header::<CHECKED>(cursor, limits, key_start, ai)?;
             } else {
-                let len = read_len::<CHECKED, E>(cursor, ai, key_start)?;
+                let len = read_len::<CHECKED>(cursor, ai, key_start)?;
                 if let Some(limits) = limits {
                     if len > limits.max_text_len {
-                        return Err(E::new(ErrorCode::TextLenLimitExceeded, key_start));
+                        return Err(CborError::new(ErrorCode::TextLenLimitExceeded, key_start));
                     }
                 }
                 let _ = cursor.read_exact(len)?;
@@ -824,7 +853,7 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
             let key_end = cursor.position();
 
             if CHECKED {
-                check_map_key_order::<E>(cursor.data(), prev_key_range, key_start, key_end)?;
+                check_map_key_order(cursor.data(), prev_key_range, key_start, key_end)?;
             }
 
             *expecting_key = false;
@@ -838,49 +867,43 @@ fn skip_one_value_inner<const CHECKED: bool, E: DecodeError, S: StackOps>(
 
         let next_depth = base_depth + local_depth + 1;
         let new_frame =
-            skip_primitive::<CHECKED, E>(cursor, limits, items_seen, next_depth, off, major, ai)?;
+            skip_primitive::<CHECKED>(cursor, limits, items_seen, next_depth, off, major, ai)?;
         started = true;
 
         if let Some(frame) = stack.peek_mut() {
-            consume_value::<E>(frame, off)?;
+            consume_value(frame, off)?;
         } else if new_frame.is_none() {
             return Ok(());
         }
 
         if let Some(frame) = new_frame {
-            stack.push::<E>(frame, off)?;
+            stack.push(frame, off)?;
             local_depth = local_depth.saturating_add(1);
         }
     }
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn skip_one_value<const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'_, E>,
+pub fn skip_one_value<const CHECKED: bool>(
+    cursor: &mut Cursor<'_>,
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     base_depth: usize,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     #[cfg(feature = "alloc")]
     let mut stack = FrameStack::new();
     #[cfg(not(feature = "alloc"))]
     let mut stack = FrameStack::<INLINE_STACK>::new();
-    skip_one_value_inner::<CHECKED, E, _>(cursor, limits, items_seen, base_depth, &mut stack)
+    skip_one_value_inner::<CHECKED, _>(cursor, limits, items_seen, base_depth, &mut stack)
 }
 
-pub fn skip_one_value_with_scratch<const CHECKED: bool, E: DecodeError>(
-    cursor: &mut Cursor<'_, E>,
+pub fn skip_one_value_with_scratch<const CHECKED: bool>(
+    cursor: &mut Cursor<'_>,
     limits: Option<&DecodeLimits>,
     items_seen: &mut usize,
     base_depth: usize,
     scratch: &mut SkipScratch,
-) -> Result<(), E> {
+) -> Result<(), CborError> {
     scratch.stack.clear();
-    skip_one_value_inner::<CHECKED, E, _>(
-        cursor,
-        limits,
-        items_seen,
-        base_depth,
-        &mut scratch.stack,
-    )
+    skip_one_value_inner::<CHECKED, _>(cursor, limits, items_seen, base_depth, &mut scratch.stack)
 }

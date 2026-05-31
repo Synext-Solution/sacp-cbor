@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use sacp_cbor::{ArrayPos, PathElem};
+use sacp_cbor::{edit::ArrayPos, query::PathElem};
 
 use crate::value::BenchValue;
 
@@ -229,9 +229,7 @@ fn parent_container<'a, 'p>(
     root: &'a mut BenchValue,
     path: &'p [PathElem<'p>],
 ) -> Result<(ContainerMut<'a>, &'p PathElem<'p>), String> {
-    let (last, parent_path) = path
-        .split_last()
-        .ok_or_else(|| "empty path".to_string())?;
+    let (last, parent_path) = path.split_last().ok_or_else(|| "empty path".to_string())?;
     let parent = value_at_mut(root, parent_path)?;
 
     match parent {
@@ -252,7 +250,8 @@ fn value_at_mut<'a>(
     match path[0] {
         PathElem::Key(key) => match root {
             BenchValue::Map(entries) => {
-                let idx = map_find_index(entries, key).ok_or_else(|| "map key missing".to_string())?;
+                let idx =
+                    map_find_index(entries, key).ok_or_else(|| "map key missing".to_string())?;
                 value_at_mut(&mut entries[idx].1, &path[1..])
             }
             _ => Err("expected map".to_string()),

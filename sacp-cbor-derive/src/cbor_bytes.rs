@@ -9,21 +9,64 @@ use syn::{
 
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let value = syn::parse_macro_input!(input as Value);
+    if let Err(err) = validate_value(&value) {
+        return err.to_compile_error().into();
+    }
+
     let mut emitter = Emitter::new();
     let enc = format_ident!("__cbor_enc");
-    let body = emitter.emit_value(&value, &enc);
+    let enc_ref = format_ident!("__cbor_enc_ref");
+    let body = emitter.emit_value(&value, &enc_ref, Target::Encoder);
 
     let out = quote! {
         {
             (|| -> ::core::result::Result<::sacp_cbor::CanonicalCbor, ::sacp_cbor::CborError> {
                 let mut #enc = ::sacp_cbor::Encoder::new();
-                #body?;
-                #enc.into_canonical()
+                {
+                    let #enc_ref = &mut #enc;
+                    #body?;
+                }
+                #enc.finish()
             })()
         }
     };
 
     TokenStream::from(out)
+}
+
+fn validate_value(value: &Value) -> Result<()> {
+    match value {
+        Value::Null | Value::Expr(_) => Ok(()),
+        Value::Array(values) => {
+            for value in values {
+                validate_value(value)?;
+            }
+            Ok(())
+        }
+        Value::Map(entries) => {
+            let mut entries_sorted = entries.iter().collect::<Vec<_>>();
+            entries_sorted.sort_by(|a, b| {
+                a.key_bytes
+                    .len()
+                    .cmp(&b.key_bytes.len())
+                    .then_with(|| a.key_bytes.cmp(&b.key_bytes))
+            });
+
+            for pair in entries_sorted.windows(2) {
+                if pair[0].key_bytes == pair[1].key_bytes {
+                    return Err(syn::Error::new(
+                        pair[1].key.span(),
+                        "duplicate CBOR map key",
+                    ));
+                }
+            }
+
+            for entry in entries {
+                validate_value(&entry.value)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -98,6 +141,12 @@ struct Emitter {
     counter: usize,
 }
 
+#[derive(Clone, Copy)]
+enum Target {
+    Encoder,
+    Array,
+}
+
 impl Emitter {
     fn new() -> Self {
         Self { counter: 0 }
@@ -109,16 +158,19 @@ impl Emitter {
         id
     }
 
-    fn emit_value(&mut self, value: &Value, enc: &Ident) -> TokenStream2 {
+    fn emit_value(&mut self, value: &Value, enc: &Ident, target: Target) -> TokenStream2 {
         match value {
             Value::Null => quote! { #enc.null() },
-            Value::Expr(expr) => quote! { #enc.__encode_any(#expr) },
+            Value::Expr(expr) => match target {
+                Target::Encoder => quote! { ::sacp_cbor::CborEncode::encode(&#expr, #enc) },
+                Target::Array => quote! { #enc.value(&#expr) },
+            },
             Value::Array(elems) => {
                 let len = elems.len();
                 let arr = self.fresh("arr");
                 let mut elem_stmts = Vec::with_capacity(len);
                 for elem in elems {
-                    let expr = self.emit_value(elem, &arr);
+                    let expr = self.emit_value(elem, &arr, Target::Array);
                     elem_stmts.push(quote! { #expr?; });
                 }
                 quote! {
@@ -142,7 +194,7 @@ impl Emitter {
                 for entry in &entries_sorted {
                     let key = &entry.key;
                     let enc_inner = self.fresh("enc");
-                    let expr = self.emit_value(&entry.value, &enc_inner);
+                    let expr = self.emit_value(&entry.value, &enc_inner, Target::Encoder);
                     entry_stmts.push(quote! {
                         #map.entry(#key, |#enc_inner| #expr)?;
                     });

@@ -1,4 +1,5 @@
-use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode, PathElem};
+use sacp_cbor::query::PathElem;
+use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode};
 
 #[test]
 fn map_get_single_int() {
@@ -90,21 +91,32 @@ fn get_many_sorted_basic() {
 
     let out2 = map.get_many_sorted(["a", "c", "bb"]).unwrap();
     assert!(out2[2].is_none());
+
+    let mut out3 = [None, None, None];
+    map.get_many_sorted_into(&["a", "b", "c"], &mut out3)
+        .unwrap();
+    assert_eq!(out3[0].unwrap().integer().unwrap().as_i64().unwrap(), 1);
+    assert_eq!(out3[1].unwrap().integer().unwrap().as_i64().unwrap(), 2);
+    assert_eq!(out3[2].unwrap().integer().unwrap().as_i64().unwrap(), 3);
 }
 
 #[test]
-fn get_many_sorted_accepts_unsorted_and_rejects_duplicates() {
+#[cfg(feature = "alloc")]
+fn get_many_accepts_unsorted_and_rejects_duplicates() {
     // { "a": 1, "b": 2 }
     let bytes = [0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02];
 
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let map = canon.root().map().unwrap();
 
-    let out = map.get_many_sorted(["b", "a"]).unwrap();
+    let out = map.get_many(&["b", "a"]).unwrap();
     assert_eq!(out[0].unwrap().integer().unwrap().as_i64().unwrap(), 2);
     assert_eq!(out[1].unwrap().integer().unwrap().as_i64().unwrap(), 1);
 
-    let err = map.get_many_sorted(["a", "a"]).unwrap_err();
+    let err = map.get_many(&["a", "a"]).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidQuery);
+
+    let err = map.get_many_sorted(["b", "a"]).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidQuery);
 }
 
@@ -172,15 +184,15 @@ fn kind_and_bignum_accessors() {
     assert_eq!(
         kinds,
         [
-            sacp_cbor::CborKind::Integer,
-            sacp_cbor::CborKind::Bytes,
-            sacp_cbor::CborKind::Text,
-            sacp_cbor::CborKind::Array,
-            sacp_cbor::CborKind::Map,
-            sacp_cbor::CborKind::Bool,
-            sacp_cbor::CborKind::Null,
-            sacp_cbor::CborKind::Float,
-            sacp_cbor::CborKind::Integer,
+            sacp_cbor::query::CborKind::Integer,
+            sacp_cbor::query::CborKind::Bytes,
+            sacp_cbor::query::CborKind::Text,
+            sacp_cbor::query::CborKind::Array,
+            sacp_cbor::query::CborKind::Map,
+            sacp_cbor::query::CborKind::Bool,
+            sacp_cbor::query::CborKind::Null,
+            sacp_cbor::query::CborKind::Float,
+            sacp_cbor::query::CborKind::Integer,
         ]
     );
 
@@ -197,14 +209,113 @@ fn kind_and_bignum_accessors() {
 }
 
 #[test]
-fn get_many_sorted_respects_input_order_not_canonical_order() {
+#[cfg(feature = "alloc")]
+fn get_many_respects_input_order_not_canonical_order() {
     // { "b": 1, "aa": 2 } (canonical order by encoded length)
     let bytes = [0xa2, 0x61, 0x62, 0x01, 0x62, 0x61, 0x61, 0x02];
 
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let map = canon.root().map().unwrap();
 
-    let out = map.get_many_sorted(["aa", "b"]).unwrap();
+    let out = map.get_many(&["aa", "b"]).unwrap();
     assert_eq!(out[0].unwrap().integer().unwrap().as_i64().unwrap(), 2);
     assert_eq!(out[1].unwrap().integer().unwrap().as_i64().unwrap(), 1);
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn extras_and_required_multi_key_queries_are_ordered() {
+    let bytes = [0xa3, 0x61, b'a', 0x01, 0x61, b'b', 0x02, 0x61, b'c', 0x03];
+
+    let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let map = canon.root().map().unwrap();
+
+    assert_eq!(
+        map.require("a").unwrap().integer().unwrap().as_i64(),
+        Some(1)
+    );
+    assert_eq!(map.require("z").unwrap_err().code, ErrorCode::MissingKey);
+
+    let required = map.require_many_sorted(["a", "c"]).unwrap();
+    assert_eq!(required[0].integer().unwrap().as_i64(), Some(1));
+    assert_eq!(required[1].integer().unwrap().as_i64(), Some(3));
+    assert_eq!(
+        map.require_many_sorted(["a", "z"]).unwrap_err().code,
+        ErrorCode::MissingKey
+    );
+    assert_eq!(
+        map.require_many_sorted(["c", "a"]).unwrap_err().code,
+        ErrorCode::InvalidQuery
+    );
+
+    let extras: Vec<_> = map
+        .extras_sorted(&["b"])
+        .unwrap()
+        .map(|entry| {
+            let (key, value) = entry.unwrap();
+            (key.to_string(), value.integer().unwrap().as_i64().unwrap())
+        })
+        .collect();
+    assert_eq!(extras, vec![("a".to_string(), 1), ("c".to_string(), 3)]);
+
+    let extras = map.extras_sorted_vec(&["a", "c"]).unwrap();
+    assert_eq!(extras.len(), 1);
+    assert_eq!(extras[0].0, "b");
+    assert_eq!(extras[0].1.integer().unwrap().as_i64(), Some(2));
+
+    let extras = map.extras_vec(&["c", "a"]).unwrap();
+    assert_eq!(extras.len(), 1);
+    assert_eq!(extras[0].0, "b");
+    assert_eq!(extras[0].1.integer().unwrap().as_i64(), Some(2));
+
+    let err = match map.extras_sorted(&["a", "a"]) {
+        Err(err) => err,
+        Ok(_) => panic!("duplicate sorted extras query accepted"),
+    };
+    assert_eq!(err.code, ErrorCode::InvalidQuery);
+    assert_eq!(
+        map.extras_vec(&["a", "a"]).unwrap_err().code,
+        ErrorCode::InvalidQuery
+    );
+}
+
+#[test]
+#[cfg(feature = "alloc")]
+fn array_iter_skips_deep_nested_values() {
+    let depth = 40usize;
+    let mut bytes = Vec::with_capacity(depth + 3);
+    bytes.push(0x82);
+    bytes.extend(std::iter::repeat(0x81).take(depth));
+    bytes.push(0xf6);
+    bytes.push(0xf5);
+
+    let mut limits = DecodeLimits::for_bytes(bytes.len());
+    limits.max_depth = depth + 1;
+    limits.max_total_items = depth + 2;
+    let canon = validate_canonical(&bytes, limits).unwrap();
+    let mut iter = canon.root().array().unwrap().iter();
+
+    let nested = iter.next().unwrap().unwrap();
+    assert_eq!(nested.as_bytes().len(), depth + 1);
+    assert!(iter.next().unwrap().unwrap().bool().unwrap());
+    assert!(iter.next().is_none());
+}
+
+#[cfg(feature = "unsafe")]
+#[test]
+fn unsafe_value_ref_malformed_ranges_return_query_errors() {
+    let empty = unsafe { sacp_cbor::query::CborValueRef::from_canonical_range(&[], 0, 0) };
+    let err = empty.kind().unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
+
+    // Declares two entries. Lookup for "a" can stop at first key "b"; lookup for "z" must scan
+    // into the malformed second key and surface the query-layer malformed canonical error.
+    let bytes = [0xa2, 0x61, b'b', 0x01, 0x01];
+    let root =
+        unsafe { sacp_cbor::query::CborValueRef::from_canonical_range(&bytes, 0, bytes.len()) };
+    let map = root.map().unwrap();
+    assert!(map.get("a").unwrap().is_none());
+
+    let err = map.get("z").unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
 }

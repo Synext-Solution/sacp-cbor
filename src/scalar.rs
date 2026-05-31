@@ -1,3 +1,5 @@
+//! Scalar wrapper types whose constructors enforce SACP-CBOR/1 invariants.
+
 use crate::profile::{validate_f64_bits, CANONICAL_NAN_BITS, NEGATIVE_ZERO_BITS};
 use crate::{CborError, ErrorCode};
 

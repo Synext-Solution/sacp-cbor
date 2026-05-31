@@ -1,4 +1,4 @@
-#![cfg(feature = "alloc")]
+#![cfg(feature = "derive")]
 
 use sacp_cbor::{cbor_bytes, validate_canonical, DecodeLimits, ErrorCode};
 
@@ -46,12 +46,6 @@ fn cbor_bytes_map_keys() {
 fn cbor_bytes_map_order_sorted() {
     let v = cbor_bytes!({ b: 2, a: 1 }).unwrap();
     assert_eq!(v.as_bytes(), &[0xa2, 0x61, b'a', 0x01, 0x61, b'b', 0x02]);
-}
-
-#[test]
-fn cbor_bytes_duplicate_keys_error() {
-    let err = cbor_bytes!({ a: 1, a: 2 }).unwrap_err();
-    assert_eq!(err.code, ErrorCode::DuplicateMapKey);
 }
 
 #[test]

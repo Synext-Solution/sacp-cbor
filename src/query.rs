@@ -1,7 +1,7 @@
 //! Query support for canonical CBOR messages.
 //!
 //! This module provides a lightweight, allocation-free query engine for
-//! [`CanonicalCborRef`](crate::CanonicalCborRef). Queries return borrowed views
+//! [`CanonicalCborRef`]. Queries return borrowed views
 //! ([`CborValueRef`]) pointing into the original message bytes.
 //!
 //! The query layer assumes the input bytes are already validated as canonical via
@@ -12,13 +12,12 @@ use core::cmp::Ordering;
 
 use crate::canonical::CanonicalCborRef;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
-use crate::utf8;
 use crate::wire;
 use crate::{CborError, ErrorCode};
 
 #[cfg(feature = "alloc")]
 use crate::canonical::CanonicalCbor;
-#[cfg(feature = "alloc")]
+#[cfg(feature = "edit")]
 use crate::canonical::EncodedTextKey;
 
 #[cfg(feature = "alloc")]
@@ -51,6 +50,70 @@ const fn err(code: ErrorCode, offset: usize) -> CborError {
 
 const fn malformed(offset: usize) -> CborError {
     err(ErrorCode::MalformedCanonical, offset)
+}
+
+pub(crate) fn peek_kind_at<const CHECKED: bool>(
+    data: &[u8],
+    pos: &mut usize,
+) -> Result<CborKind, CborError> {
+    let off = *pos;
+    let ib = if CHECKED {
+        wire::read_u8(data, pos)?
+    } else {
+        wire::read_u8_trusted_canonical(data, pos)?
+    };
+    let major = ib >> 5;
+    let ai = ib & 0x1f;
+
+    match major {
+        0 | 1 => Ok(CborKind::Integer),
+        2 => Ok(CborKind::Bytes),
+        3 => Ok(CborKind::Text),
+        4 => Ok(CborKind::Array),
+        5 => Ok(CborKind::Map),
+        6 => {
+            let tag = if CHECKED {
+                wire::read_uint_arg_at::<true>(data, pos, ai, off)?
+            } else {
+                wire::read_uint_trusted_canonical(data, pos, ai, off)?
+            };
+            match tag {
+                2 | 3 => Ok(CborKind::Integer),
+                _ => Err(malformed(off)),
+            }
+        }
+        7 => match ai {
+            20 | 21 => Ok(CborKind::Bool),
+            22 => Ok(CborKind::Null),
+            27 => Ok(CborKind::Float),
+            24 => {
+                if !CHECKED {
+                    return Err(malformed(off));
+                }
+                let simple = wire::read_u8(data, pos)?;
+                if simple < 24 {
+                    Err(err(ErrorCode::NonCanonicalEncoding, off))
+                } else {
+                    Err(err(ErrorCode::UnsupportedSimpleValue, off))
+                }
+            }
+            28..=30 => {
+                if CHECKED {
+                    Err(err(ErrorCode::ReservedAdditionalInfo, off))
+                } else {
+                    Err(malformed(off))
+                }
+            }
+            _ => {
+                if CHECKED {
+                    Err(err(ErrorCode::UnsupportedSimpleValue, off))
+                } else {
+                    Err(malformed(off))
+                }
+            }
+        },
+        _ => Err(malformed(off)),
+    }
 }
 
 const fn expected_map(offset: usize) -> CborError {
@@ -131,14 +194,14 @@ impl<'a> BigIntRef<'a> {
 
 /// A borrowed view of an integer (safe or bignum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CborIntegerRef<'a> {
+pub enum IntegerRef<'a> {
     /// Safe-range integer (major 0/1).
     Safe(i64),
     /// Bignum integer (tag 2/3).
     Big(BigIntRef<'a>),
 }
 
-impl<'a> CborIntegerRef<'a> {
+impl<'a> IntegerRef<'a> {
     /// Return the safe integer value, if present.
     #[must_use]
     pub const fn as_i64(self) -> Option<i64> {
@@ -206,14 +269,9 @@ impl<'a> CborValueRef<'a> {
 
     /// Returns the byte length of this value's canonical encoding.
     #[must_use]
-    pub const fn len(self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
-    /// Returns whether this value's canonical encoding is empty.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.start >= self.end
+    pub fn byte_len(self) -> usize {
+        debug_assert!(self.start <= self.end);
+        self.end - self.start
     }
 
     /// Returns the kind of this value.
@@ -223,32 +281,7 @@ impl<'a> CborValueRef<'a> {
     /// Returns `CborError` if the underlying bytes are malformed.
     pub fn kind(self) -> Result<CborKind, CborError> {
         let mut pos = self.start;
-        let off = self.start;
-        let ib = read_u8_trusted(self.data, &mut pos)?;
-        let major = ib >> 5;
-        let ai = ib & 0x1f;
-
-        match major {
-            0 | 1 => Ok(CborKind::Integer),
-            2 => Ok(CborKind::Bytes),
-            3 => Ok(CborKind::Text),
-            4 => Ok(CborKind::Array),
-            5 => Ok(CborKind::Map),
-            6 => {
-                let tag = read_uint_trusted(self.data, &mut pos, ai, off)?;
-                match tag {
-                    2 | 3 => Ok(CborKind::Integer),
-                    _ => Err(malformed(off)),
-                }
-            }
-            7 => match ai {
-                20 | 21 => Ok(CborKind::Bool),
-                22 => Ok(CborKind::Null),
-                27 => Ok(CborKind::Float),
-                _ => Err(malformed(off)),
-            },
-            _ => Err(malformed(off)),
-        }
+        peek_kind_at::<false>(self.data, &mut pos)
     }
 
     /// Returns `true` if this value is CBOR `null`.
@@ -335,26 +368,26 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedInteger` if the value is not an integer or is malformed.
-    pub fn integer(self) -> Result<CborIntegerRef<'a>, CborError> {
+    pub fn integer(self) -> Result<IntegerRef<'a>, CborError> {
         let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8_trusted(self.data, &mut pos)?;
+        let ib = wire::read_u8_trusted_canonical(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
         match major {
             0 => {
-                let u = read_uint_trusted(self.data, &mut pos, ai, off)?;
+                let u = wire::read_uint_trusted_canonical(self.data, &mut pos, ai, off)?;
                 let i = i64::try_from(u).map_err(|_| malformed(off))?;
-                Ok(CborIntegerRef::Safe(i))
+                Ok(IntegerRef::Safe(i))
             }
             1 => {
-                let n = read_uint_trusted(self.data, &mut pos, ai, off)?;
+                let n = wire::read_uint_trusted_canonical(self.data, &mut pos, ai, off)?;
                 let n_i = i64::try_from(n).map_err(|_| malformed(off))?;
-                Ok(CborIntegerRef::Safe(-1 - n_i))
+                Ok(IntegerRef::Safe(-1 - n_i))
             }
             6 => {
-                let tag = read_uint_trusted(self.data, &mut pos, ai, off)?;
+                let tag = wire::read_uint_trusted_canonical(self.data, &mut pos, ai, off)?;
                 let negative = match tag {
                     2 => false,
                     3 => true,
@@ -362,17 +395,17 @@ impl<'a> CborValueRef<'a> {
                 };
 
                 let m_off = pos;
-                let first = read_u8_trusted(self.data, &mut pos)?;
+                let first = wire::read_u8_trusted_canonical(self.data, &mut pos)?;
                 let m_major = first >> 5;
                 let m_ai = first & 0x1f;
                 if m_major != 2 {
                     return Err(malformed(m_off));
                 }
 
-                let m_len = read_len_trusted(self.data, &mut pos, m_ai, m_off)?;
-                let mag = read_exact_trusted(self.data, &mut pos, m_len)?;
+                let m_len = wire::read_len_trusted_canonical(self.data, &mut pos, m_ai, m_off)?;
+                let mag = wire::read_exact_trusted_canonical(self.data, &mut pos, m_len)?;
 
-                Ok(CborIntegerRef::Big(BigIntRef {
+                Ok(IntegerRef::Big(BigIntRef {
                     negative,
                     magnitude: mag,
                 }))
@@ -389,7 +422,7 @@ impl<'a> CborValueRef<'a> {
     pub fn text(self) -> Result<&'a str, CborError> {
         let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8_trusted(self.data, &mut pos)?;
+        let ib = wire::read_u8_trusted_canonical(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -397,10 +430,9 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_text(off));
         }
 
-        let len = read_len_trusted(self.data, &mut pos, ai, off)?;
-        let bytes = read_exact_trusted(self.data, &mut pos, len)?;
-        let s = utf8::trusted(bytes).map_err(|()| malformed(off))?;
-        Ok(s)
+        let len = wire::read_len_trusted_canonical(self.data, &mut pos, ai, off)?;
+        let bytes = wire::read_exact_trusted_canonical(self.data, &mut pos, len)?;
+        crate::utf8::trusted(bytes).map_err(|()| malformed(off))
     }
 
     /// Decodes this value as a CBOR byte string.
@@ -411,7 +443,7 @@ impl<'a> CborValueRef<'a> {
     pub fn bytes(self) -> Result<&'a [u8], CborError> {
         let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8_trusted(self.data, &mut pos)?;
+        let ib = wire::read_u8_trusted_canonical(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -419,8 +451,8 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_bytes(off));
         }
 
-        let len = read_len_trusted(self.data, &mut pos, ai, off)?;
-        let bytes = read_exact_trusted(self.data, &mut pos, len)?;
+        let len = wire::read_len_trusted_canonical(self.data, &mut pos, ai, off)?;
+        let bytes = wire::read_exact_trusted_canonical(self.data, &mut pos, len)?;
         Ok(bytes)
     }
 
@@ -448,7 +480,7 @@ impl<'a> CborValueRef<'a> {
     pub fn float64(self) -> Result<f64, CborError> {
         let mut pos = self.start;
         let off = self.start;
-        let ib = read_u8_trusted(self.data, &mut pos)?;
+        let ib = wire::read_u8_trusted_canonical(self.data, &mut pos)?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
@@ -456,7 +488,7 @@ impl<'a> CborValueRef<'a> {
             return Err(expected_float(off));
         }
 
-        let b = read_exact_trusted(self.data, &mut pos, 8)?;
+        let b = wire::read_exact_trusted_canonical(self.data, &mut pos, 8)?;
         let bits = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
         Ok(f64::from_bits(bits))
     }
@@ -545,6 +577,8 @@ impl<'a> MapRef<'a> {
 
     /// Looks up multiple required keys in a single pass.
     ///
+    /// Query keys must be strictly increasing by canonical text-key order.
+    ///
     /// # Errors
     ///
     /// Returns `CborError::MissingKey` if any key is not present.
@@ -578,7 +612,8 @@ impl<'a> MapRef<'a> {
 
     /// Looks up multiple keys in a single pass.
     ///
-    /// Keys may be in any order; results preserve the input key order. Missing keys yield `None`.
+    /// Query keys must be strictly increasing by canonical text-key order. Missing keys yield
+    /// `None`.
     ///
     /// # Errors
     ///
@@ -590,23 +625,15 @@ impl<'a> MapRef<'a> {
         let mut out: [Option<CborValueRef<'a>>; N] = [None; N];
 
         validate_query_keys(&keys, self.map_off)?;
+        ensure_strictly_increasing_keys(&keys, self.map_off)?;
 
         if keys.is_empty() || self.len == 0 {
             return Ok(out);
         }
 
-        let mut idxs: [usize; N] = core::array::from_fn(|i| i);
-        idxs[..].sort_unstable_by(|&i, &j| cmp_text_keys_canonical(keys[i], keys[j]));
-
-        for w in idxs.windows(2) {
-            if keys[w[0]] == keys[w[1]] {
-                return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
-            }
-        }
-
         let mut state = MapScanState::new(self.data, self.entries_start, self.len);
-        state.scan_sorted(&keys, &idxs, |out_idx, value_start, end| {
-            out[out_idx] = Some(CborValueRef::new(self.data, value_start, end));
+        state.scan_sorted_in_order(&keys, |idx, value_start, end| {
+            out[idx] = Some(CborValueRef::new(self.data, value_start, end));
         })?;
 
         Ok(out)
@@ -614,18 +641,38 @@ impl<'a> MapRef<'a> {
 
     /// The slice-based form of [`MapRef::get_many_sorted`].
     ///
+    /// Query keys must be strictly increasing by canonical text-key order. This method does not
+    /// allocate or sort.
+    ///
     /// `out` is cleared to `None` for all entries before results are written.
     ///
     /// # Errors
     ///
     /// Returns `CborError` for invalid query inputs or malformed canonical data.
-    #[cfg(feature = "alloc")]
     pub fn get_many_sorted_into(
         self,
         keys: &[&str],
         out: &mut [Option<CborValueRef<'a>>],
     ) -> Result<(), CborError> {
-        self.get_many_into(keys, out)
+        if keys.len() != out.len() {
+            return Err(CborError::new(ErrorCode::InvalidQuery, self.map_off));
+        }
+
+        validate_query_keys(keys, self.map_off)?;
+        ensure_strictly_increasing_keys(keys, self.map_off)?;
+
+        for slot in out.iter_mut() {
+            *slot = None;
+        }
+
+        if keys.is_empty() || self.len == 0 {
+            return Ok(());
+        }
+
+        let mut state = MapScanState::new(self.data, self.entries_start, self.len);
+        state.scan_sorted_in_order(keys, |idx, value_start, end| {
+            out[idx] = Some(CborValueRef::new(self.data, value_start, end));
+        })
     }
 
     /// Iterates over `(key, value)` pairs in canonical order.
@@ -643,7 +690,7 @@ impl<'a> MapRef<'a> {
     /// Iterates over `(key, encoded_key, value)` in canonical order.
     ///
     /// The encoded key is the canonical CBOR encoding of the text key.
-    #[cfg(feature = "alloc")]
+    #[cfg(feature = "edit")]
     pub(crate) fn iter_encoded(
         self,
     ) -> impl Iterator<Item = Result<EncodedMapEntry<'a>, CborError>> + 'a {
@@ -898,7 +945,7 @@ impl<'a> CanonicalCborRef<'a> {
     /// root value spans the full byte slice.
     #[must_use]
     pub const fn root(self) -> CborValueRef<'a> {
-        CborValueRef::new(self.as_bytes(), 0, self.len())
+        CborValueRef::new(self.as_bytes(), 0, self.as_bytes().len())
     }
 
     /// Convenience wrapper around `self.root().at(path)`.
@@ -933,35 +980,6 @@ impl CanonicalCbor {
 /* =========================
  * Internal parsing helpers
  * ========================= */
-
-#[inline]
-const fn map_trusted_err(cause: CborError) -> CborError {
-    err(ErrorCode::MalformedCanonical, cause.offset)
-}
-
-#[inline]
-fn read_u8_trusted(data: &[u8], pos: &mut usize) -> Result<u8, CborError> {
-    wire::read_u8(data, pos).map_err(map_trusted_err)
-}
-
-#[inline]
-fn read_exact_trusted<'a>(
-    data: &'a [u8],
-    pos: &mut usize,
-    n: usize,
-) -> Result<&'a [u8], CborError> {
-    wire::read_exact(data, pos, n).map_err(map_trusted_err)
-}
-
-#[inline]
-fn read_uint_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result<u64, CborError> {
-    wire::read_uint_trusted(data, pos, ai, off).map_err(map_trusted_err)
-}
-
-#[inline]
-fn read_len_trusted(data: &[u8], pos: &mut usize, ai: u8, off: usize) -> Result<usize, CborError> {
-    wire::read_len_trusted(data, pos, ai, off).map_err(map_trusted_err)
-}
 
 #[derive(Clone, Copy)]
 struct CachedKey<'a> {
@@ -1037,6 +1055,7 @@ impl<'a> MapScanState<'a> {
         }
     }
 
+    #[cfg(feature = "alloc")]
     fn scan_sorted<F>(
         &mut self,
         keys: &[&str],
@@ -1068,36 +1087,41 @@ impl<'a> MapScanState<'a> {
 
         Ok(())
     }
+
+    fn scan_sorted_in_order<F>(&mut self, keys: &[&str], mut on_match: F) -> Result<(), CborError>
+    where
+        F: FnMut(usize, usize, usize),
+    {
+        let mut q_pos = 0usize;
+
+        while q_pos < keys.len() {
+            if self.map_remaining == 0 {
+                break;
+            }
+
+            self.fill_cache()?;
+
+            let Some(ck) = self.cached else {
+                continue;
+            };
+
+            let out_idx = q_pos;
+            let value_start = ck.value_start;
+            q_pos = self.handle_query_match(keys[out_idx], q_pos, |end| {
+                on_match(out_idx, value_start, end);
+            })?;
+        }
+
+        Ok(())
+    }
 }
 
 fn read_text<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str, CborError> {
-    let off = *pos;
-    let ib = read_u8_trusted(data, pos)?;
-    let major = ib >> 5;
-    let ai = ib & 0x1f;
-
-    if major != 3 {
-        return Err(malformed(off));
-    }
-
-    let len = read_len_trusted(data, pos, ai, off)?;
-    let bytes = read_exact_trusted(data, pos, len)?;
-    let text = utf8::trusted(bytes).map_err(|()| malformed(off))?;
-    Ok(text)
+    wire::read_text_trusted(data, pos)
 }
 
 fn read_text_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], CborError> {
-    let off = *pos;
-    let ib = read_u8_trusted(data, pos)?;
-    let major = ib >> 5;
-    let ai = ib & 0x1f;
-
-    if major != 3 {
-        return Err(malformed(off));
-    }
-
-    let len = read_len_trusted(data, pos, ai, off)?;
-    read_exact_trusted(data, pos, len)
+    wire::read_text_payload_trusted(data, pos)
 }
 
 fn value_end_with_scratch(
@@ -1105,22 +1129,13 @@ fn value_end_with_scratch(
     start: usize,
     scratch: &mut wire::SkipScratch,
 ) -> Result<usize, CborError> {
-    let mut cursor = wire::Cursor::<CborError>::with_pos(data, start);
-    let mut items_seen = 0;
-    wire::skip_one_value_with_scratch::<false, CborError>(
-        &mut cursor,
-        None,
-        &mut items_seen,
-        0,
-        scratch,
-    )?;
-    Ok(cursor.position())
+    wire::value_end_trusted_with_scratch(data, start, scratch)
 }
 
 fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
     let mut pos = start;
     let off = start;
-    let ib = read_u8_trusted(data, &mut pos)?;
+    let ib = wire::read_u8_trusted_canonical(data, &mut pos)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
@@ -1128,14 +1143,14 @@ fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborErr
         return Err(expected_map(off));
     }
 
-    let len = read_len_trusted(data, &mut pos, ai, off)?;
+    let len = wire::read_len_trusted_canonical(data, &mut pos, ai, off)?;
     Ok((len, pos))
 }
 
 fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
     let mut pos = start;
     let off = start;
-    let ib = read_u8_trusted(data, &mut pos)?;
+    let ib = wire::read_u8_trusted_canonical(data, &mut pos)?;
     let major = ib >> 5;
     let ai = ib & 0x1f;
 
@@ -1143,7 +1158,7 @@ fn parse_array_header(data: &[u8], start: usize) -> Result<(usize, usize), CborE
         return Err(expected_array(off));
     }
 
-    let len = read_len_trusted(data, &mut pos, ai, off)?;
+    let len = wire::read_len_trusted_canonical(data, &mut pos, ai, off)?;
     Ok((len, pos))
 }
 
@@ -1253,10 +1268,10 @@ impl<'a> Iterator for MapIter<'a> {
     }
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "edit")]
 type EncodedMapEntry<'a> = (&'a str, EncodedTextKey<'a>, CborValueRef<'a>);
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "edit")]
 struct MapIterEncoded<'a> {
     data: &'a [u8],
     pos: usize,
@@ -1264,7 +1279,7 @@ struct MapIterEncoded<'a> {
     scratch: wire::SkipScratch,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "edit")]
 impl<'a> Iterator for MapIterEncoded<'a> {
     type Item = Result<EncodedMapEntry<'a>, CborError>;
 

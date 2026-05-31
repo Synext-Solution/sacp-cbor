@@ -59,9 +59,48 @@ pub const NEGATIVE_ZERO_BITS: u64 = 0x8000_0000_0000_0000;
 const EXP_MASK: u64 = 0x7ff0_0000_0000_0000;
 const MANT_MASK: u64 = 0x000f_ffff_ffff_ffff;
 
+#[allow(clippy::cast_possible_truncation)]
+#[cfg(any(feature = "alloc", kani))]
+pub(crate) const fn minimal_uint_ai(value: u64) -> u8 {
+    if value < 24 {
+        value as u8
+    } else if value <= 0xff {
+        24
+    } else if value <= 0xffff {
+        25
+    } else if value <= 0xffff_ffff {
+        26
+    } else {
+        27
+    }
+}
+
+#[cfg(any(feature = "alloc", kani))]
+pub(crate) const fn uint_argument_payload_len(ai: u8) -> Option<usize> {
+    match ai {
+        0..=23 => Some(0),
+        24 => Some(1),
+        25 => Some(2),
+        26 => Some(4),
+        27 => Some(8),
+        _ => None,
+    }
+}
+
+pub(crate) const fn is_minimal_uint_ai(ai: u8, value: u64) -> bool {
+    match ai {
+        0..=23 => value == ai as u64,
+        24 => value >= 24 && value <= 0xff,
+        25 => value > 0xff && value <= 0xffff,
+        26 => value > 0xffff && value <= 0xffff_ffff,
+        27 => value > 0xffff_ffff,
+        _ => false,
+    }
+}
+
 /// Validate an IEEE-754 f64 bit pattern for SACP-CBOR/1.
 #[inline]
-pub const fn validate_f64_bits(bits: u64) -> Result<(), ErrorCode> {
+pub(crate) const fn validate_f64_bits(bits: u64) -> Result<(), ErrorCode> {
     if bits == NEGATIVE_ZERO_BITS {
         return Err(ErrorCode::NegativeZeroForbidden);
     }
@@ -77,7 +116,7 @@ pub const fn validate_f64_bits(bits: u64) -> Result<(), ErrorCode> {
 /// Validate that an i64 is within the SACP-CBOR/1 safe integer range.
 #[inline]
 #[cfg(feature = "alloc")]
-pub const fn validate_int_safe_i64(v: i64) -> Result<(), ErrorCode> {
+pub(crate) const fn validate_int_safe_i64(v: i64) -> Result<(), ErrorCode> {
     if v < MIN_SAFE_INTEGER || v > MAX_SAFE_INTEGER_I64 {
         return Err(ErrorCode::IntegerOutsideSafeRange);
     }
@@ -85,7 +124,7 @@ pub const fn validate_int_safe_i64(v: i64) -> Result<(), ErrorCode> {
 }
 
 /// Validate that a bignum magnitude is canonical and outside the safe range.
-pub fn validate_bignum_bytes(negative: bool, magnitude: &[u8]) -> Result<(), ErrorCode> {
+pub(crate) fn validate_bignum_bytes(negative: bool, magnitude: &[u8]) -> Result<(), ErrorCode> {
     if magnitude.is_empty() || magnitude[0] == 0 {
         return Err(ErrorCode::BignumNotCanonical);
     }
@@ -108,8 +147,21 @@ pub fn validate_bignum_bytes(negative: bool, magnitude: &[u8]) -> Result<(), Err
 }
 
 fn cmp_big_endian(a: &[u8], b: &[u8]) -> Ordering {
+    cmp_len_then_bytes(a, b)
+}
+
+pub(crate) fn cmp_len_then_bytes(a: &[u8], b: &[u8]) -> Ordering {
     match a.len().cmp(&b.len()) {
-        Ordering::Equal => a.cmp(b),
+        Ordering::Equal => {
+            let mut idx = 0usize;
+            while idx < a.len() {
+                match a[idx].cmp(&b[idx]) {
+                    Ordering::Equal => idx += 1,
+                    other => return other,
+                }
+            }
+            Ordering::Equal
+        }
         other => other,
     }
 }
@@ -125,17 +177,14 @@ fn cmp_big_endian(a: &[u8], b: &[u8]) -> Ordering {
 #[inline]
 #[must_use]
 pub fn cmp_encoded_key_bytes(a: &[u8], b: &[u8]) -> Ordering {
-    match a.len().cmp(&b.len()) {
-        Ordering::Equal => a.cmp(b),
-        other => other,
-    }
+    cmp_len_then_bytes(a, b)
 }
 
 /// Validate canonical key ordering for two encoded CBOR text keys.
 ///
 /// Returns `DuplicateMapKey` or `NonCanonicalMapOrder` on failure.
 #[inline]
-pub fn check_encoded_key_order(prev: &[u8], curr: &[u8]) -> Result<(), ErrorCode> {
+pub(crate) fn check_encoded_key_order(prev: &[u8], curr: &[u8]) -> Result<(), ErrorCode> {
     match cmp_encoded_key_bytes(prev, curr) {
         Ordering::Less => Ok(()),
         Ordering::Equal => Err(ErrorCode::DuplicateMapKey),
@@ -156,10 +205,16 @@ pub fn check_encoded_key_order(prev: &[u8], curr: &[u8]) -> Result<(), ErrorCode
 #[inline]
 #[must_use]
 pub fn cmp_text_keys_canonical(a: &str, b: &str) -> Ordering {
-    match a.len().cmp(&b.len()) {
-        Ordering::Equal => a.as_bytes().cmp(b.as_bytes()),
-        other => other,
-    }
+    cmp_text_key_payloads_canonical(a.as_bytes(), b.as_bytes())
+}
+
+/// Compare UTF-8 text-key payload bytes by SACP-CBOR/1 canonical map ordering.
+///
+/// For valid text strings, this is equivalent to [`cmp_text_keys_canonical`].
+#[inline]
+#[must_use]
+pub(crate) fn cmp_text_key_payloads_canonical(a: &[u8], b: &[u8]) -> Ordering {
+    cmp_len_then_bytes(a, b)
 }
 
 /// Return the length in bytes of the canonical CBOR encoding of a text string payload of length `n`.
@@ -172,7 +227,7 @@ pub fn cmp_text_keys_canonical(a: &str, b: &str) -> Ordering {
 /// - `n <= 2^32-1` => 5-byte header
 /// - otherwise => 9-byte header
 #[inline]
-pub fn checked_text_len(n: usize) -> Result<u64, ErrorCode> {
+pub(crate) fn checked_text_len(n: usize) -> Result<u64, ErrorCode> {
     let n_u64 = u64::try_from(n).map_err(|_| ErrorCode::LengthOverflow)?;
     let header = if n < 24 {
         1

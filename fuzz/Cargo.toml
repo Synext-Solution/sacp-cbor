@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-sacp-cbor = { path = "..", default-features = true }
+serde = { version = "1", features = ["derive"] }
+sacp-cbor = { path = "..", default-features = false, features = ["std", "derive", "collections", "edit", "serde", "sha2"] }
 
 [[bin]]
 name = "validate_only"
@@ -26,6 +27,24 @@ doc = false
 [[bin]]
 name = "query_only"
 path = "fuzz_targets/query_only.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_ignored"
+path = "fuzz_targets/decode_ignored.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "serde_from_slice"
+path = "fuzz_targets/serde_from_slice.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "edit_noop"
+path = "fuzz_targets/edit_noop.rs"
 test = false
 doc = false
 

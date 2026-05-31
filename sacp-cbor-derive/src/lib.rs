@@ -5,20 +5,19 @@
 
 extern crate proc_macro;
 
-mod attrs;
 mod cbor_bytes;
 mod decode;
 mod encode;
-mod types;
+mod schema;
 mod util;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, spanned::Spanned, Data, DataEnum, DeriveInput, Ident};
 
-use crate::attrs::parse_cbor_enum_attrs;
 use crate::cbor_bytes::expand as expand_cbor_bytes;
 use crate::decode::{decode_enum, decode_struct};
 use crate::encode::{encode_enum, encode_struct};
+use crate::schema::parse_cbor_enum_attrs;
 
 fn ensure_non_empty_enum(name: &Ident, data: &DataEnum, derive_name: &str) -> syn::Result<()> {
     if data.variants.is_empty() {

@@ -1,0 +1,5 @@
+error: `cbor(skip)` cannot be combined with `rename`
+ --> tests/ui/skipped_field_rename.rs:5:27
+  |
+5 |     #[cbor(skip, rename = "wire")]
+  |                           ^^^^^^

@@ -11,9 +11,10 @@ use serde::Serialize;
 
 use crate::alloc_util;
 use crate::canonical::{CanonicalCbor, CanonicalCborRef};
-use crate::codec::{ArrayDecoder, CborDecode, Decoder, MapDecoder};
-use crate::encode::Encoder;
-use crate::profile::{check_encoded_key_order, cmp_text_keys_canonical};
+use crate::codec::CborDecode;
+use crate::decode::{ArrayDecoder, Decoder, MapDecoder};
+use crate::encode::{Encoder, EncoderCheckpoint};
+use crate::profile::cmp_text_keys_canonical;
 use crate::query::{CborKind, CborValueRef};
 use crate::scalar::F64Bits;
 use crate::{CborError, DecodeLimits, ErrorCode};
@@ -26,54 +27,63 @@ enum MapKeyMode {
     SortKeys,
 }
 
-fn check_map_key_order(
-    enc: &mut Encoder,
-    prev_key_range: Option<(usize, usize)>,
-    key_start: usize,
-    key_end: usize,
-    entry_start: usize,
-) -> Result<(), SerdeError> {
-    if let Some((ps, pe)) = prev_key_range {
-        let buf = enc.as_bytes();
-        let prev = &buf[ps..pe];
-        let curr = &buf[key_start..key_end];
-        if let Err(code) = check_encoded_key_order(prev, curr) {
-            enc.truncate(entry_start);
-            return Err(SerdeError::with_code(code));
-        }
-    }
-    Ok(())
-}
-
 /// Serialize a Rust value into canonical SACP-CBOR/1 bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if the value cannot be represented under SACP-CBOR/1 constraints.
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, CborError> {
-    let mut enc = Encoder::new();
-    value
-        .serialize(EncoderSerializer::new(&mut enc))
-        .map_err(|err| CborError::new(err.code, 0))?;
-    Ok(enc.into_vec())
+    SerdeOptions::strict().to_vec(value)
 }
 
-/// Serialize a Rust value into canonical SACP-CBOR/1 bytes while sorting map keys.
-///
-/// This is an opt-in convenience API that allows encoding Rust map types with
-/// non-canonical iteration order (e.g., `HashMap`, or `BTreeMap` where canonical
-/// ordering differs from lexicographic ordering) by buffering and sorting map
-/// keys according to the SACP-CBOR/1 canonical ordering rule.
-///
-/// # Errors
-///
-/// Returns an error if the value cannot be represented under SACP-CBOR/1 constraints.
-pub fn to_vec_sorted_maps<T: Serialize>(value: &T) -> Result<Vec<u8>, CborError> {
+/// Serde encoding options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub struct SerdeOptions {
+    map_key_mode: MapKeyMode,
+}
+
+impl SerdeOptions {
+    /// Strict encoding: maps must already iterate in canonical key order.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            map_key_mode: MapKeyMode::Strict,
+        }
+    }
+
+    /// Sort map keys while encoding.
+    ///
+    /// This buffers map entries before writing them, then emits keys in SACP-CBOR/1 canonical order.
+    #[must_use]
+    pub const fn sorted_maps() -> Self {
+        Self {
+            map_key_mode: MapKeyMode::SortKeys,
+        }
+    }
+
+    /// Serialize a Rust value into canonical SACP-CBOR/1 bytes with these options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value cannot be represented under SACP-CBOR/1 constraints.
+    pub fn to_vec<T: Serialize>(self, value: &T) -> Result<Vec<u8>, CborError> {
+        serialize_to_vec(value, self.map_key_mode)
+    }
+}
+
+impl Default for SerdeOptions {
+    fn default() -> Self {
+        Self::strict()
+    }
+}
+
+fn serialize_to_vec<T: Serialize>(value: &T, mode: MapKeyMode) -> Result<Vec<u8>, CborError> {
     let mut enc = Encoder::new();
     value
-        .serialize(EncoderSerializer::new_sorted_maps(&mut enc))
-        .map_err(|err| CborError::new(err.code, 0))?;
-    Ok(enc.into_vec())
+        .serialize(EncoderSerializer::with_mode(&mut enc, mode))
+        .map_err(SerdeError::into_cbor_error)?;
+    Ok(enc.finish()?.into_bytes())
 }
 
 /// Deserialize a Rust value from canonical SACP-CBOR/1 bytes.
@@ -97,19 +107,24 @@ pub fn from_slice<'de, T: Deserialize<'de>>(
 
 #[derive(Debug, Clone, Copy)]
 struct SerdeError {
-    code: ErrorCode,
+    error: CborError,
 }
 
 impl SerdeError {
     const fn with_code(code: ErrorCode) -> Self {
-        Self { code }
+        Self {
+            error: CborError::new(code, 0),
+        }
+    }
+
+    const fn into_cbor_error(self) -> CborError {
+        self.error
     }
 }
 
 impl fmt::Display for SerdeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let err = CborError::new(self.code, 0);
-        fmt::Display::fmt(&err, f)
+        fmt::Display::fmt(&self.error, f)
     }
 }
 
@@ -124,7 +139,7 @@ impl serde::ser::Error for SerdeError {
 
 impl From<CborError> for SerdeError {
     fn from(err: CborError) -> Self {
-        Self::with_code(err.code)
+        Self { error: err }
     }
 }
 
@@ -134,30 +149,16 @@ struct EncoderSerializer<'a> {
 }
 
 impl<'a> EncoderSerializer<'a> {
-    fn new(enc: &'a mut Encoder) -> Self {
-        Self::with_mode(enc, MapKeyMode::Strict)
-    }
-
-    fn new_sorted_maps(enc: &'a mut Encoder) -> Self {
-        Self::with_mode(enc, MapKeyMode::SortKeys)
-    }
-
     fn with_mode(enc: &'a mut Encoder, mode: MapKeyMode) -> Self {
         Self { enc, mode }
     }
 
     #[inline]
-    fn encode_with<FEmit, FRoot>(self, emit: FEmit, root: FRoot) -> Result<(), SerdeError>
+    fn encode_with<FEmit>(self, emit: FEmit) -> Result<(), SerdeError>
     where
         FEmit: FnOnce(&mut Encoder) -> Result<(), CborError>,
-        FRoot: FnOnce(&mut Encoder) -> Result<(), CborError>,
     {
-        let res = if self.enc.in_container() {
-            emit(self.enc)
-        } else {
-            root(self.enc)
-        };
-        res.map_err(SerdeError::from)
+        emit(self.enc).map_err(SerdeError::from)
     }
 }
 
@@ -174,68 +175,47 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     type SerializeStructVariant = StructVariantSerializer<'a>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_bool(v), |enc| enc.bool(v))
+        self.encode_with(|enc| enc.bool(v))
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int(v), |enc| enc.int(v))
+        self.encode_with(|enc| enc.int(v))
     }
 
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int_i128(v), |enc| enc.int_i128(v))
+        self.encode_with(|enc| enc.int_i128(v))
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int(i64::from(v)),
-            |enc| enc.int(i64::from(v)),
-        )
+        self.encode_with(|enc| enc.int(i64::from(v)))
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(
-            |enc| enc.emit_int_u128(u128::from(v)),
-            |enc| enc.int_u128(u128::from(v)),
-        )
+        self.encode_with(|enc| enc.int_u128(u128::from(v)))
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_int_u128(v), |enc| enc.int_u128(v))
+        self.encode_with(|enc| enc.int_u128(v))
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
@@ -244,37 +224,46 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
 
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
         let bits = F64Bits::try_from_f64(v).map_err(SerdeError::from)?;
-        self.encode_with(|enc| enc.emit_float(bits), |enc| enc.float(bits))
+        self.encode_with(|enc| enc.float(bits))
     }
 
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
         let s = v.encode_utf8(&mut buf);
-        self.encode_with(|enc| enc.emit_text(s), |enc| enc.text(s))
+        self.encode_with(|enc| enc.text(s))
     }
 
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_text(v), |enc| enc.text(v))
+        self.encode_with(|enc| enc.text(v))
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_bytes(v), |enc| enc.bytes(v))
+        self.encode_with(|enc| enc.bytes(v))
     }
 
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(Encoder::emit_null, Encoder::null)
+        self.encode_with(|enc| enc.map(1, |map| map.entry("none", Encoder::null)))
     }
 
     fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok, Self::Error> {
-        value.serialize(self)
+        let mode = self.mode;
+        self.encode_with(|enc| {
+            enc.map(1, |map| {
+                map.entry("some", |enc| {
+                    value
+                        .serialize(EncoderSerializer::with_mode(enc, mode))
+                        .map_err(SerdeError::into_cbor_error)
+                })
+            })
+        })
     }
 
     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(Encoder::emit_null, Encoder::null)
+        self.encode_with(Encoder::null)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(Encoder::emit_null, Encoder::null)
+        self.encode_with(Encoder::null)
     }
 
     fn serialize_unit_variant(
@@ -283,7 +272,7 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        self.encode_with(|enc| enc.emit_text(variant), |enc| enc.text(variant))
+        self.encode_with(|enc| enc.text(variant))
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
@@ -302,24 +291,26 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         value: &T,
     ) -> Result<Self::Ok, Self::Error> {
         let map = start_enum_map(self.enc, variant)?;
-        if let Err(err) = value.serialize(EncoderSerializer::with_mode(self.enc, self.mode)) {
-            self.enc.truncate(map.start);
-            self.enc.abort_container();
-            return Err(err);
-        }
-        self.enc.finish_container(map.root);
-        Ok(())
+        value
+            .serialize(EncoderSerializer::with_mode(self.enc, self.mode))
+            .and_then(|()| self.enc.finish_container().map_err(SerdeError::from))
+            .map_err(|err| {
+                self.enc.restore(map.checkpoint);
+                err
+            })
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
         let len = len.ok_or_else(|| SerdeError::with_code(ErrorCode::IndefiniteLengthForbidden))?;
-        let root = self.enc.array_header(len).map_err(SerdeError::from)?;
-        Ok(SeqSerializer::new(self.enc, len, root, self.mode))
+        let checkpoint = self.enc.checkpoint();
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len, checkpoint, self.mode))
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        let root = self.enc.array_header(len).map_err(SerdeError::from)?;
-        Ok(SeqSerializer::new(self.enc, len, root, self.mode))
+        let checkpoint = self.enc.checkpoint();
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len, checkpoint, self.mode))
     }
 
     fn serialize_tuple_struct(
@@ -327,8 +318,9 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        let root = self.enc.array_header(len).map_err(SerdeError::from)?;
-        Ok(SeqSerializer::new(self.enc, len, root, self.mode))
+        let checkpoint = self.enc.checkpoint();
+        self.enc.array_header(len).map_err(SerdeError::from)?;
+        Ok(SeqSerializer::new(self.enc, len, checkpoint, self.mode))
     }
 
     fn serialize_tuple_variant(
@@ -340,8 +332,7 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
     ) -> Result<Self::SerializeTupleVariant, Self::Error> {
         let map = start_enum_map(self.enc, variant)?;
         if let Err(err) = self.enc.array_header(len) {
-            self.enc.truncate(map.start);
-            self.enc.abort_container();
+            self.enc.restore(map.checkpoint);
             return Err(SerdeError::from(err));
         }
         Ok(TupleVariantSerializer::new(self.enc, len, map, self.mode))
@@ -349,8 +340,12 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
 
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
         let len = len.ok_or_else(|| SerdeError::with_code(ErrorCode::IndefiniteLengthForbidden))?;
-        let root = self.enc.map_header(len).map_err(SerdeError::from)?;
-        MapSerializer::new(self.enc, len, root, self.mode)
+        let state = MapState::new(len, self.mode)?;
+        let checkpoint = self.enc.checkpoint();
+        self.enc.map_header(len).map_err(SerdeError::from)?;
+        Ok(MapSerializer::new(
+            self.enc, len, checkpoint, self.mode, state,
+        ))
     }
 
     fn serialize_struct(
@@ -358,8 +353,12 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         _name: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
-        let root = self.enc.map_header(len).map_err(SerdeError::from)?;
-        StructSerializer::new(self.enc, len, root, self.mode)
+        let entries = SortedEntries::new(len)?;
+        let checkpoint = self.enc.checkpoint();
+        self.enc.map_header(len).map_err(SerdeError::from)?;
+        Ok(StructSerializer::new(
+            self.enc, entries, checkpoint, self.mode,
+        ))
     }
 
     fn serialize_struct_variant(
@@ -369,53 +368,57 @@ impl<'a> ser::Serializer for EncoderSerializer<'a> {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
+        let entries = SortedEntries::new(len)?;
         let map = start_enum_map(self.enc, variant)?;
         if let Err(err) = self.enc.map_header(len) {
-            self.enc.truncate(map.start);
-            self.enc.abort_container();
+            self.enc.restore(map.checkpoint);
             return Err(SerdeError::from(err));
         }
-        StructVariantSerializer::new(self.enc, len, map, self.mode)
+        Ok(StructVariantSerializer::new(
+            self.enc, entries, map, self.mode,
+        ))
     }
 }
 
 #[derive(Copy, Clone)]
 struct EnumMapState {
-    start: usize,
-    root: bool,
+    checkpoint: EncoderCheckpoint,
 }
 
 fn start_enum_map(enc: &mut Encoder, variant: &str) -> Result<EnumMapState, SerdeError> {
-    let start = enc.buf_len();
-    let root = match enc.map_header(1) {
-        Ok(root) => root,
-        Err(err) => {
-            enc.truncate(start);
-            return Err(SerdeError::from(err));
-        }
-    };
-    if let Err(err) = enc.emit_text(variant) {
-        enc.truncate(start);
-        enc.abort_container();
+    let checkpoint = enc.checkpoint();
+    let result = enc.map_header(1).and_then(|()| {
+        let key_start = enc.begin_map_key()?;
+        enc.write_text_key(variant)?;
+        let key_end = enc.buf_len();
+        enc.finish_map_key(key_start, key_end)
+    });
+    if let Err(err) = result {
+        enc.restore(checkpoint);
         return Err(SerdeError::from(err));
     }
-    Ok(EnumMapState { start, root })
+    Ok(EnumMapState { checkpoint })
 }
 
 struct SeqSerializer<'a> {
     enc: &'a mut Encoder,
+    checkpoint: EncoderCheckpoint,
     remaining: usize,
-    root: bool,
     finished: bool,
     mode: MapKeyMode,
 }
 
 impl<'a> SeqSerializer<'a> {
-    fn new(enc: &'a mut Encoder, remaining: usize, root: bool, mode: MapKeyMode) -> Self {
+    fn new(
+        enc: &'a mut Encoder,
+        remaining: usize,
+        checkpoint: EncoderCheckpoint,
+        mode: MapKeyMode,
+    ) -> Self {
         Self {
             enc,
+            checkpoint,
             remaining,
-            root,
             finished: false,
             mode,
         }
@@ -440,7 +443,7 @@ impl SerializeSeq for SeqSerializer<'_> {
             return Err(SerdeError::with_code(ErrorCode::ArrayLenMismatch));
         }
         let mut this = self;
-        this.enc.finish_container(this.root);
+        this.enc.finish_container().map_err(SerdeError::from)?;
         this.finished = true;
         Ok(())
     }
@@ -449,7 +452,7 @@ impl SerializeSeq for SeqSerializer<'_> {
 impl Drop for SeqSerializer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.enc.abort_container();
+            self.enc.restore(self.checkpoint);
         }
     }
 }
@@ -482,9 +485,8 @@ impl ser::SerializeTupleStruct for SeqSerializer<'_> {
 
 struct TupleVariantSerializer<'a> {
     enc: &'a mut Encoder,
+    checkpoint: EncoderCheckpoint,
     remaining: usize,
-    map_start: usize,
-    map_root: bool,
     finished: bool,
     mode: MapKeyMode,
 }
@@ -493,9 +495,8 @@ impl<'a> TupleVariantSerializer<'a> {
     fn new(enc: &'a mut Encoder, remaining: usize, map: EnumMapState, mode: MapKeyMode) -> Self {
         Self {
             enc,
+            checkpoint: map.checkpoint,
             remaining,
-            map_start: map.start,
-            map_root: map.root,
             finished: false,
             mode,
         }
@@ -520,8 +521,8 @@ impl ser::SerializeTupleVariant for TupleVariantSerializer<'_> {
             return Err(SerdeError::with_code(ErrorCode::ArrayLenMismatch));
         }
         let mut this = self;
-        this.enc.finish_container(false);
-        this.enc.finish_container(this.map_root);
+        this.enc.finish_container().map_err(SerdeError::from)?;
+        this.enc.finish_container().map_err(SerdeError::from)?;
         this.finished = true;
         Ok(())
     }
@@ -530,17 +531,13 @@ impl ser::SerializeTupleVariant for TupleVariantSerializer<'_> {
 impl Drop for TupleVariantSerializer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.enc.truncate(self.map_start);
-            self.enc.abort_container();
-            self.enc.abort_container();
+            self.enc.restore(self.checkpoint);
         }
     }
 }
 
 struct PendingKey {
-    entry_start: usize,
-    key_start: usize,
-    key_end: usize,
+    checkpoint: EncoderCheckpoint,
 }
 
 struct SortedEntry {
@@ -548,69 +545,107 @@ struct SortedEntry {
     value: Vec<u8>,
 }
 
-fn push_sorted_entry<T: ?Sized + Serialize>(
-    entries: &mut Vec<SortedEntry>,
-    key: &'static str,
-    value: &T,
-    remaining: &mut usize,
-    mode: MapKeyMode,
-) -> Result<(), SerdeError> {
-    if *remaining == 0 {
-        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
-    }
-
-    let mut tmp = Encoder::new();
-    value.serialize(EncoderSerializer::with_mode(&mut tmp, mode))?;
-    let value = tmp.into_canonical().map_err(SerdeError::from)?.into_bytes();
-    let key = alloc_util::try_string_from_str(key, 0).map_err(SerdeError::from)?;
-    entries.push(SortedEntry { key, value });
-    *remaining -= 1;
-    Ok(())
+struct SortedEntries {
+    entries: Vec<SortedEntry>,
+    remaining: usize,
 }
 
-fn finish_sorted_entries(
-    enc: &mut Encoder,
-    entries: &mut [SortedEntry],
-    remaining: usize,
-    roots: &[bool],
-) -> Result<(), SerdeError> {
-    if remaining != 0 {
-        return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+impl SortedEntries {
+    fn new(remaining: usize) -> Result<Self, SerdeError> {
+        Ok(Self {
+            entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
+                .map_err(SerdeError::from)?,
+            remaining,
+        })
     }
 
-    entries.sort_by(|a, b| cmp_text_keys_canonical(&a.key, &b.key));
-    for window in entries.windows(2) {
-        if window[0].key == window[1].key {
-            return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
+    fn push<T: ?Sized + Serialize>(
+        &mut self,
+        key: String,
+        value: &T,
+        mode: MapKeyMode,
+    ) -> Result<(), SerdeError> {
+        if self.remaining == 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
         }
+        let mut tmp = Encoder::new();
+        value.serialize(EncoderSerializer::with_mode(&mut tmp, mode))?;
+        let value = tmp.finish().map_err(SerdeError::from)?.into_bytes();
+        self.entries.push(SortedEntry { key, value });
+        self.remaining -= 1;
+        Ok(())
     }
 
-    for entry in entries.iter() {
-        enc.emit_text(&entry.key).map_err(SerdeError::from)?;
-        enc.emit_raw_bytes(&entry.value).map_err(SerdeError::from)?;
+    fn push_static<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+        mode: MapKeyMode,
+    ) -> Result<(), SerdeError> {
+        let key = alloc_util::try_string_from_str(key, 0).map_err(SerdeError::from)?;
+        self.push(key, value, mode)
     }
 
-    for &root in roots {
-        enc.finish_container(root);
+    fn finish_into(
+        &mut self,
+        enc: &mut Encoder,
+        containers_to_close: usize,
+    ) -> Result<(), SerdeError> {
+        if self.remaining != 0 {
+            return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
+        }
+
+        self.entries
+            .sort_by(|a, b| cmp_text_keys_canonical(&a.key, &b.key));
+        for window in self.entries.windows(2) {
+            if window[0].key == window[1].key {
+                return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
+            }
+        }
+
+        for entry in &self.entries {
+            let key_start = enc.begin_map_key().map_err(SerdeError::from)?;
+            enc.write_text_key(&entry.key).map_err(SerdeError::from)?;
+            let key_end = enc.buf_len();
+            enc.finish_map_key(key_start, key_end)
+                .map_err(SerdeError::from)?;
+            enc.raw_trusted_canonical_bytes(&entry.value)
+                .map_err(SerdeError::from)?;
+        }
+
+        for _ in 0..containers_to_close {
+            enc.finish_container().map_err(SerdeError::from)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 enum MapState {
     Strict {
-        prev_key_range: Option<(usize, usize)>,
         pending: Option<PendingKey>,
     },
     Sorted {
-        entries: Vec<SortedEntry>,
+        entries: SortedEntries,
         pending_key: Option<String>,
     },
 }
 
+impl MapState {
+    fn new(remaining: usize, mode: MapKeyMode) -> Result<Self, SerdeError> {
+        Ok(match mode {
+            MapKeyMode::Strict => Self::Strict { pending: None },
+            MapKeyMode::SortKeys => Self::Sorted {
+                entries: SortedEntries::new(remaining)?,
+                pending_key: None,
+            },
+        })
+    }
+}
+
 struct MapSerializer<'a> {
     enc: &'a mut Encoder,
+    checkpoint: EncoderCheckpoint,
     remaining: usize,
-    root: bool,
     finished: bool,
     mode: MapKeyMode,
     state: MapState,
@@ -620,45 +655,35 @@ impl<'a> MapSerializer<'a> {
     fn new(
         enc: &'a mut Encoder,
         remaining: usize,
-        root: bool,
+        checkpoint: EncoderCheckpoint,
         mode: MapKeyMode,
-    ) -> Result<Self, SerdeError> {
-        let state = match mode {
-            MapKeyMode::Strict => MapState::Strict {
-                prev_key_range: None,
-                pending: None,
-            },
-            MapKeyMode::SortKeys => MapState::Sorted {
-                entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
-                    .map_err(SerdeError::from)?,
-                pending_key: None,
-            },
-        };
-        Ok(Self {
+        state: MapState,
+    ) -> Self {
+        Self {
             enc,
+            checkpoint,
             remaining,
-            root,
             finished: false,
             mode,
             state,
-        })
+        }
     }
 
     fn write_pending_key<T: ?Sized + Serialize>(
         &mut self,
         key: &T,
-        prev_key_range: Option<(usize, usize)>,
     ) -> Result<PendingKey, SerdeError> {
-        let entry_start = self.enc.buf_len();
-        let (key_start, key_end) = key.serialize(MapKeySerializer::new(self.enc, entry_start))?;
-
-        check_map_key_order(self.enc, prev_key_range, key_start, key_end, entry_start)?;
-
-        Ok(PendingKey {
+        let checkpoint = self.enc.checkpoint();
+        let entry_start = self.enc.begin_map_key().map_err(SerdeError::from)?;
+        let result = key.serialize(TextKeySerializer::new(DirectMapKey {
+            enc: self.enc,
             entry_start,
-            key_start,
-            key_end,
-        })
+        }));
+        if let Err(err) = result {
+            self.enc.restore(checkpoint);
+            return Err(err);
+        }
+        Ok(PendingKey { checkpoint })
     }
 }
 
@@ -669,12 +694,10 @@ impl SerializeMap for MapSerializer<'_> {
     fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), SerdeError> {
         match &mut self.state {
             MapState::Strict { .. } => {
-                let (has_pending, prev) = match &self.state {
-                    MapState::Strict {
-                        pending,
-                        prev_key_range,
-                    } => (pending.is_some(), *prev_key_range),
-                    MapState::Sorted { .. } => unreachable!(),
+                let has_pending = if let MapState::Strict { pending } = &self.state {
+                    pending.is_some()
+                } else {
+                    return Err(SerdeError::with_code(ErrorCode::SerdeError));
                 };
                 if has_pending {
                     return Err(SerdeError::with_code(ErrorCode::SerdeError));
@@ -682,7 +705,7 @@ impl SerializeMap for MapSerializer<'_> {
                 if self.remaining == 0 {
                     return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
                 }
-                let p = self.write_pending_key(key, prev)?;
+                let p = self.write_pending_key(key)?;
                 if let MapState::Strict { pending, .. } = &mut self.state {
                     *pending = Some(p);
                 }
@@ -695,7 +718,7 @@ impl SerializeMap for MapSerializer<'_> {
                 if self.remaining == 0 {
                     return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
                 }
-                let k = key.serialize(MapKeyStringSerializer)?;
+                let k = key.serialize(TextKeySerializer::new(OwnedMapKey))?;
                 *pending_key = Some(k);
                 Ok(())
             }
@@ -704,21 +727,17 @@ impl SerializeMap for MapSerializer<'_> {
 
     fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
         match &mut self.state {
-            MapState::Strict {
-                prev_key_range,
-                pending,
-            } => {
+            MapState::Strict { pending } => {
                 let p = pending
                     .take()
                     .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
 
                 if let Err(err) = value.serialize(EncoderSerializer::with_mode(self.enc, self.mode))
                 {
-                    self.enc.truncate(p.entry_start);
+                    self.enc.restore(p.checkpoint);
                     return Err(err);
                 }
 
-                *prev_key_range = Some((p.key_start, p.key_end));
                 self.remaining -= 1;
                 Ok(())
             }
@@ -730,11 +749,7 @@ impl SerializeMap for MapSerializer<'_> {
                     .take()
                     .ok_or_else(|| SerdeError::with_code(ErrorCode::SerdeError))?;
 
-                let mut tmp = Encoder::new();
-                value.serialize(EncoderSerializer::with_mode(&mut tmp, self.mode))?;
-                let value = tmp.into_canonical().map_err(SerdeError::from)?.into_bytes();
-
-                entries.push(SortedEntry { key, value });
+                entries.push(key, value, self.mode)?;
                 self.remaining -= 1;
                 Ok(())
             }
@@ -751,18 +766,11 @@ impl SerializeMap for MapSerializer<'_> {
                 if self.remaining == 0 {
                     return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
                 }
-                let prev = match &self.state {
-                    MapState::Strict { prev_key_range, .. } => *prev_key_range,
-                    MapState::Sorted { .. } => unreachable!(),
-                };
-                let p = self.write_pending_key(key, prev)?;
+                let p = self.write_pending_key(key)?;
                 if let Err(err) = value.serialize(EncoderSerializer::with_mode(self.enc, self.mode))
                 {
-                    self.enc.truncate(p.entry_start);
+                    self.enc.restore(p.checkpoint);
                     return Err(err);
-                }
-                if let MapState::Strict { prev_key_range, .. } = &mut self.state {
-                    *prev_key_range = Some((p.key_start, p.key_end));
                 }
                 self.remaining -= 1;
                 Ok(())
@@ -771,13 +779,9 @@ impl SerializeMap for MapSerializer<'_> {
                 if self.remaining == 0 {
                     return Err(SerdeError::with_code(ErrorCode::MapLenMismatch));
                 }
-                let key = key.serialize(MapKeyStringSerializer)?;
+                let key = key.serialize(TextKeySerializer::new(OwnedMapKey))?;
 
-                let mut tmp = Encoder::new();
-                value.serialize(EncoderSerializer::with_mode(&mut tmp, self.mode))?;
-                let value = tmp.into_canonical().map_err(SerdeError::from)?.into_bytes();
-
-                entries.push(SortedEntry { key, value });
+                entries.push(key, value, self.mode)?;
                 self.remaining -= 1;
                 Ok(())
             }
@@ -804,23 +808,11 @@ impl SerializeMap for MapSerializer<'_> {
                     return Err(SerdeError::with_code(ErrorCode::SerdeError));
                 }
 
-                entries.sort_by(|a, b| cmp_text_keys_canonical(&a.key, &b.key));
-                for w in entries.windows(2) {
-                    if w[0].key == w[1].key {
-                        return Err(SerdeError::with_code(ErrorCode::DuplicateMapKey));
-                    }
-                }
-
-                for e in entries.iter() {
-                    this.enc.emit_text(&e.key).map_err(SerdeError::from)?;
-                    this.enc
-                        .emit_raw_bytes(&e.value)
-                        .map_err(SerdeError::from)?;
-                }
+                entries.finish_into(this.enc, 0)?;
             }
         }
 
-        this.enc.finish_container(this.root);
+        this.enc.finish_container().map_err(SerdeError::from)?;
         this.finished = true;
         Ok(())
     }
@@ -829,16 +821,15 @@ impl SerializeMap for MapSerializer<'_> {
 impl Drop for MapSerializer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.enc.abort_container();
+            self.enc.restore(self.checkpoint);
         }
     }
 }
 
 struct StructSerializer<'a> {
     enc: &'a mut Encoder,
-    remaining: usize,
-    entries: Vec<SortedEntry>,
-    root: bool,
+    checkpoint: EncoderCheckpoint,
+    entries: SortedEntries,
     finished: bool,
     mode: MapKeyMode,
 }
@@ -846,19 +837,17 @@ struct StructSerializer<'a> {
 impl<'a> StructSerializer<'a> {
     fn new(
         enc: &'a mut Encoder,
-        remaining: usize,
-        root: bool,
+        entries: SortedEntries,
+        checkpoint: EncoderCheckpoint,
         mode: MapKeyMode,
-    ) -> Result<Self, SerdeError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             enc,
-            remaining,
-            entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
-                .map_err(SerdeError::from)?,
-            root,
+            checkpoint,
+            entries,
             finished: false,
             mode,
-        })
+        }
     }
 }
 
@@ -871,18 +860,12 @@ impl ser::SerializeStruct for StructSerializer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), SerdeError> {
-        push_sorted_entry(
-            &mut self.entries,
-            key,
-            value,
-            &mut self.remaining,
-            self.mode,
-        )
+        self.entries.push_static(key, value, self.mode)
     }
 
     fn end(self) -> Result<(), SerdeError> {
         let mut this = self;
-        finish_sorted_entries(this.enc, &mut this.entries, this.remaining, &[this.root])?;
+        this.entries.finish_into(this.enc, 1)?;
         this.finished = true;
         Ok(())
     }
@@ -891,17 +874,15 @@ impl ser::SerializeStruct for StructSerializer<'_> {
 impl Drop for StructSerializer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.enc.abort_container();
+            self.enc.restore(self.checkpoint);
         }
     }
 }
 
 struct StructVariantSerializer<'a> {
     enc: &'a mut Encoder,
-    remaining: usize,
-    entries: Vec<SortedEntry>,
-    map_start: usize,
-    map_root: bool,
+    checkpoint: EncoderCheckpoint,
+    entries: SortedEntries,
     finished: bool,
     mode: MapKeyMode,
 }
@@ -909,20 +890,17 @@ struct StructVariantSerializer<'a> {
 impl<'a> StructVariantSerializer<'a> {
     fn new(
         enc: &'a mut Encoder,
-        remaining: usize,
+        entries: SortedEntries,
         map: EnumMapState,
         mode: MapKeyMode,
-    ) -> Result<Self, SerdeError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             enc,
-            remaining,
-            entries: alloc_util::try_vec_with_capacity::<SortedEntry>(remaining, 0)
-                .map_err(SerdeError::from)?,
-            map_start: map.start,
-            map_root: map.root,
+            checkpoint: map.checkpoint,
+            entries,
             finished: false,
             mode,
-        })
+        }
     }
 }
 
@@ -935,23 +913,12 @@ impl ser::SerializeStructVariant for StructVariantSerializer<'_> {
         key: &'static str,
         value: &T,
     ) -> Result<(), SerdeError> {
-        push_sorted_entry(
-            &mut self.entries,
-            key,
-            value,
-            &mut self.remaining,
-            self.mode,
-        )
+        self.entries.push_static(key, value, self.mode)
     }
 
     fn end(self) -> Result<(), SerdeError> {
         let mut this = self;
-        finish_sorted_entries(
-            this.enc,
-            &mut this.entries,
-            this.remaining,
-            &[false, this.map_root],
-        )?;
+        this.entries.finish_into(this.enc, 2)?;
         this.finished = true;
         Ok(())
     }
@@ -960,343 +927,232 @@ impl ser::SerializeStructVariant for StructVariantSerializer<'_> {
 impl Drop for StructVariantSerializer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.enc.truncate(self.map_start);
-            self.enc.abort_container();
-            self.enc.abort_container();
+            self.enc.restore(self.checkpoint);
         }
     }
 }
 
-struct MapKeySerializer<'a> {
+macro_rules! reject_non_text_map_key_serializer_methods {
+    () => {
+        fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_i128(self, _v: i128) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_u8(self, _v: u8) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_u16(self, _v: u16) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_u32(self, _v: u32) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_u64(self, _v: u64) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_u128(self, _v: u128) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_some<T: ?Sized + Serialize>(
+            self,
+            _value: &T,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            _variant_index: u32,
+            _variant: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            _value: &T,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            _variant_index: u32,
+            _variant: &'static str,
+            _value: &T,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_tuple_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            _variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            _variant_index: u32,
+            _variant: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+        }
+    };
+}
+
+trait TextKeySink {
+    type Ok;
+
+    fn write_str(self, value: &str) -> Result<Self::Ok, SerdeError>;
+}
+
+struct DirectMapKey<'a> {
     enc: &'a mut Encoder,
     entry_start: usize,
 }
 
-impl<'a> MapKeySerializer<'a> {
-    fn new(enc: &'a mut Encoder, entry_start: usize) -> Self {
-        Self { enc, entry_start }
-    }
-}
-
-impl ser::Serializer for MapKeySerializer<'_> {
+impl TextKeySink for DirectMapKey<'_> {
     type Ok = (usize, usize);
-    type Error = SerdeError;
 
-    type SerializeSeq = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeTuple = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeTupleStruct = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeTupleVariant = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeMap = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeStruct = ser::Impossible<(usize, usize), SerdeError>;
-    type SerializeStructVariant = ser::Impossible<(usize, usize), SerdeError>;
-
-    fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
+    fn write_str(self, value: &str) -> Result<Self::Ok, SerdeError> {
         let key_start = self.entry_start;
-        if let Err(err) = self.enc.emit_text(v) {
-            self.enc.truncate(self.entry_start);
-            return Err(SerdeError::from(err));
-        }
+        self.enc.write_text_key(value).map_err(SerdeError::from)?;
         let key_end = self.enc.buf_len();
+        self.enc
+            .finish_map_key(key_start, key_end)
+            .map_err(SerdeError::from)?;
         Ok((key_start, key_end))
     }
+}
 
-    fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-        let mut buf = [0u8; 4];
-        let s = v.encode_utf8(&mut buf);
-        self.serialize_str(s)
-    }
+struct OwnedMapKey;
 
-    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
+impl TextKeySink for OwnedMapKey {
+    type Ok = String;
 
-    fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_i128(self, _v: i128) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_u8(self, _v: u8) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_u16(self, _v: u16) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_u32(self, _v: u32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_u64(self, _v: u64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_u128(self, _v: u128) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_some<T: ?Sized + Serialize>(self, _value: &T) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_newtype_variant<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStruct, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
+    fn write_str(self, value: &str) -> Result<Self::Ok, SerdeError> {
+        alloc_util::try_string_from_str(value, 0).map_err(SerdeError::from)
     }
 }
 
-struct MapKeyStringSerializer;
+struct TextKeySerializer<S> {
+    sink: S,
+}
 
-impl ser::Serializer for MapKeyStringSerializer {
-    type Ok = String;
+impl<S> TextKeySerializer<S> {
+    const fn new(sink: S) -> Self {
+        Self { sink }
+    }
+}
+
+impl<S: TextKeySink> ser::Serializer for TextKeySerializer<S> {
+    type Ok = S::Ok;
     type Error = SerdeError;
 
-    type SerializeSeq = ser::Impossible<String, SerdeError>;
-    type SerializeTuple = ser::Impossible<String, SerdeError>;
-    type SerializeTupleStruct = ser::Impossible<String, SerdeError>;
-    type SerializeTupleVariant = ser::Impossible<String, SerdeError>;
-    type SerializeMap = ser::Impossible<String, SerdeError>;
-    type SerializeStruct = ser::Impossible<String, SerdeError>;
-    type SerializeStructVariant = ser::Impossible<String, SerdeError>;
+    type SerializeSeq = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeTuple = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeTupleStruct = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeTupleVariant = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeMap = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeStruct = ser::Impossible<S::Ok, SerdeError>;
+    type SerializeStructVariant = ser::Impossible<S::Ok, SerdeError>;
 
-    fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        alloc_util::try_string_from_str(v, 0).map_err(SerdeError::from)
+    fn serialize_str(self, value: &str) -> Result<Self::Ok, Self::Error> {
+        self.sink.write_str(value)
     }
 
-    fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
+    fn serialize_char(self, value: char) -> Result<Self::Ok, Self::Error> {
         let mut buf = [0u8; 4];
-        let s = v.encode_utf8(&mut buf);
-        self.serialize_str(s)
+        self.serialize_str(value.encode_utf8(&mut buf))
     }
 
-    fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_i128(self, _v: i128) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_u8(self, _v: u8) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_u16(self, _v: u16) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_u32(self, _v: u32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_u64(self, _v: u64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_u128(self, _v: u128) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_some<T: ?Sized + Serialize>(self, _value: &T) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_newtype_variant<T: ?Sized + Serialize>(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _value: &T,
-    ) -> Result<Self::Ok, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleStruct, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeTupleVariant, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStruct, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        Err(SerdeError::with_code(ErrorCode::MapKeyMustBeText))
-    }
+    reject_non_text_map_key_serializer_methods!();
 }
 
 /// A serde decoding error that preserves an [`ErrorCode`] plus an input offset.
@@ -1347,13 +1203,6 @@ impl From<CborError> for DeError {
     }
 }
 
-impl crate::wire::DecodeError for DeError {
-    #[inline]
-    fn new(code: ErrorCode, offset: usize) -> Self {
-        Self::new(code, offset)
-    }
-}
-
 struct ArrayAccess<'a, 'de, const CHECKED: bool> {
     array: ArrayDecoder<'a, 'de, CHECKED>,
 }
@@ -1386,10 +1235,10 @@ impl<'de, const CHECKED: bool> MapAccess<'de> for MapAccessImpl<'_, 'de, CHECKED
     where
         K: DeserializeSeed<'de>,
     {
-        let Some(key) = self.map.next_key().map_err(DeError::from)? else {
+        let Some(key) = self.map.next_key_ref().map_err(DeError::from)? else {
             return Ok(None);
         };
-        seed.deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(key))
+        seed.deserialize(<&'de str as IntoDeserializer<'de, DeError>>::into_deserializer(key.text))
             .map(Some)
     }
 
@@ -1451,7 +1300,12 @@ impl<'de, const CHECKED: bool> VariantAccess<'de> for VariantAccessImpl<'_, 'de,
     fn unit_variant(self) -> Result<(), DeError> {
         match self.payload {
             EnumPayload::Unit => Ok(()),
-            EnumPayload::Map(_) => Err(DeError::new(ErrorCode::ExpectedEnum, self.offset)),
+            EnumPayload::Map(mut map) => map
+                .decode_value(|decoder| {
+                    let _: () = CborDecode::decode(decoder)?;
+                    Ok(())
+                })
+                .map_err(DeError::from),
         }
     }
 
@@ -1679,19 +1533,39 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
     where
         V: Visitor<'de>,
     {
-        let value: Vec<u8> = CborDecode::decode(self).map_err(DeError::from)?;
-        visitor.visit_byte_buf(value)
+        let value: crate::bytes::Bytes = CborDecode::decode(self).map_err(DeError::from)?;
+        visitor.visit_byte_buf(value.into_vec())
     }
 
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, DeError>
     where
         V: Visitor<'de>,
     {
-        if matches!(self.peek_kind().map_err(DeError::from)?, CborKind::Null) {
-            let _: () = CborDecode::decode(self).map_err(DeError::from)?;
-            visitor.visit_none()
-        } else {
-            visitor.visit_some(self)
+        let off = self.position();
+        let mut map = self.map().map_err(DeError::from)?;
+        if map.remaining() != 1 {
+            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+        }
+        let Some(key) = map.next_key_ref().map_err(DeError::from)? else {
+            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+        };
+        match key.text {
+            "none" => {
+                map.decode_value(|decoder| {
+                    let _: () = CborDecode::decode(decoder)?;
+                    Ok(())
+                })
+                .map_err(DeError::from)?;
+                visitor.visit_none()
+            }
+            "some" => map
+                .decode_value(|decoder| {
+                    visitor
+                        .visit_some(decoder)
+                        .map_err(DeError::into_cbor_error)
+                })
+                .map_err(DeError::from),
+            _ => Err(DeError::new(ErrorCode::UnknownEnumVariant, key.offset)),
         }
     }
 
@@ -1794,31 +1668,29 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
         V: Visitor<'de>,
     {
         let off = self.position();
-        match self.peek_kind().map_err(DeError::from)? {
-            CborKind::Text => {
-                let key: &'de str = CborDecode::decode(self).map_err(DeError::from)?;
-                visitor.visit_enum(EnumAccessImpl {
-                    key,
-                    payload: EnumPayload::<CHECKED>::Unit,
-                    offset: off,
-                })
-            }
-            CborKind::Map => {
-                let mut map = self.map().map_err(DeError::from)?;
-                if map.remaining() != 1 {
-                    return Err(DeError::new(ErrorCode::MapLenMismatch, off));
-                }
-                let Some(key) = map.next_key().map_err(DeError::from)? else {
-                    return Err(DeError::new(ErrorCode::MapLenMismatch, off));
-                };
-                visitor.visit_enum(EnumAccessImpl {
-                    key,
-                    payload: EnumPayload::Map(map),
-                    offset: off,
-                })
-            }
-            _ => Err(DeError::new(ErrorCode::ExpectedEnum, off)),
+        if matches!(self.peek_kind().map_err(DeError::from)?, CborKind::Text) {
+            let key: &'de str = CborDecode::decode(self).map_err(DeError::from)?;
+            return visitor.visit_enum(EnumAccessImpl {
+                key,
+                payload: EnumPayload::<CHECKED>::Unit,
+                offset: off,
+            });
         }
+        if !matches!(self.peek_kind().map_err(DeError::from)?, CborKind::Map) {
+            return Err(DeError::new(ErrorCode::ExpectedEnum, off));
+        }
+        let mut map = self.map().map_err(DeError::from)?;
+        if map.remaining() != 1 {
+            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+        }
+        let Some(key) = map.next_key_ref().map_err(DeError::from)? else {
+            return Err(DeError::new(ErrorCode::MapLenMismatch, off));
+        };
+        visitor.visit_enum(EnumAccessImpl {
+            key: key.text,
+            payload: EnumPayload::Map(map),
+            offset: key.offset,
+        })
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -1837,24 +1709,6 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
     }
 }
 
-/// Deserialize `T` with zero-copy borrows, validating during parsing.
-///
-/// # Errors
-///
-/// Returns an error if validation fails or if deserialization fails.
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub fn from_slice_borrowed<'de, T>(bytes: &'de [u8], limits: DecodeLimits) -> Result<T, CborError>
-where
-    T: Deserialize<'de>,
-{
-    let mut decoder = Decoder::<true>::new_checked(bytes, limits)?;
-    let value = T::deserialize(&mut decoder).map_err(DeError::into_cbor_error)?;
-    if decoder.position() != bytes.len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
-    }
-    Ok(value)
-}
-
 /// Deserialize `T` from validated canonical bytes without re-checking canonical encodings.
 ///
 /// This assumes `canon` was produced by `validate_canonical`.
@@ -1867,10 +1721,10 @@ pub fn from_canonical_bytes_ref<'de, T>(canon: CanonicalCborRef<'de>) -> Result<
 where
     T: Deserialize<'de>,
 {
-    let limits = DecodeLimits::for_bytes(canon.len());
+    let limits = DecodeLimits::for_bytes(canon.as_bytes().len());
     let mut decoder = Decoder::<false>::new_trusted(canon, limits)?;
     let value = T::deserialize(&mut decoder).map_err(DeError::into_cbor_error)?;
-    if decoder.position() != canon.len() {
+    if decoder.position() != canon.as_bytes().len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
     }
     Ok(value)
@@ -1888,7 +1742,7 @@ pub fn from_canonical_bytes<'de, T>(canon: &'de CanonicalCbor) -> Result<T, Cbor
 where
     T: Deserialize<'de>,
 {
-    from_canonical_bytes_ref(canon.as_ref())
+    from_canonical_bytes_ref(canon.as_canonical_ref())
 }
 
 impl<'de> Deserialize<'de> for CborValueRef<'de> {

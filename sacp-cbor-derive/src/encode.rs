@@ -1,12 +1,12 @@
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::{spanned::Spanned, DataEnum, DataStruct, Fields, Generics, Ident, LitStr, Type};
 
-use crate::attrs::{
-    ensure_no_cbor_attrs, parse_cbor_field_attrs, validate_internal_tagging, variant_has_rename,
-    variant_name, CborEnumAttr, EnumTagging,
+use crate::schema::{
+    cbor_text_key_bytes, enum_variants, internal_tagged_tuple_variant_error, named_fields,
+    tuple_fields, type_needs_trait_bound, validate_internal_tagging, CborEnumAttr, EnumTagging,
+    NamedFieldSpec, TupleFieldSpec, VariantSpec,
 };
-use crate::types::type_mentions_self;
-use crate::util::add_where_bound;
+use crate::util::add_where_bounds;
 
 struct SortedMapEntry {
     key_bytes: Vec<u8>,
@@ -24,45 +24,121 @@ fn sort_entries(mut entries: Vec<SortedMapEntry>) -> Vec<proc_macro2::TokenStrea
     entries.into_iter().map(|entry| entry.entry).collect()
 }
 
+fn entries_into_tokens(entries: Vec<SortedMapEntry>) -> Vec<proc_macro2::TokenStream> {
+    entries.into_iter().map(|entry| entry.entry).collect()
+}
+
 fn map_entry(key: &LitStr, entry: proc_macro2::TokenStream) -> SortedMapEntry {
     SortedMapEntry {
-        key_bytes: key.value().into_bytes(),
+        key_bytes: cbor_text_key_bytes(key),
         entry,
+    }
+}
+
+fn encode_impl(
+    name: &Ident,
+    impl_generics: impl ToTokens,
+    ty_generics: impl ToTokens,
+    where_clause: impl ToTokens,
+    body: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #where_clause {
+            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
+                #body
+            }
+        }
+    }
+}
+
+fn encode_match_impl(
+    name: &Ident,
+    impl_generics: impl ToTokens,
+    ty_generics: impl ToTokens,
+    where_clause: impl ToTokens,
+    arms: &[proc_macro2::TokenStream],
+) -> proc_macro2::TokenStream {
+    encode_impl(
+        name,
+        impl_generics,
+        ty_generics,
+        where_clause,
+        quote! { match self { #(#arms),* } },
+    )
+}
+
+fn finish_encode_match_impl<'a>(
+    name: &Ident,
+    impl_generics: impl ToTokens,
+    ty_generics: impl ToTokens,
+    base_where_clause: Option<&syn::WhereClause>,
+    bounds: impl IntoIterator<Item = &'a Type>,
+    arms: &[proc_macro2::TokenStream],
+) -> proc_macro2::TokenStream {
+    let encode_where_clause =
+        add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
+    encode_match_impl(name, impl_generics, ty_generics, encode_where_clause, arms)
+}
+
+struct EncodeImplParts<'a> {
+    generics: &'a Generics,
+    base_where_clause: Option<&'a syn::WhereClause>,
+}
+
+impl<'a> EncodeImplParts<'a> {
+    fn new(generics: &'a Generics) -> Self {
+        let (_, _, base_where_clause) = generics.split_for_impl();
+        Self {
+            generics,
+            base_where_clause,
+        }
+    }
+
+    fn finish_match<'b>(
+        &self,
+        name: &Ident,
+        bounds: impl IntoIterator<Item = &'b Type>,
+        arms: &[proc_macro2::TokenStream],
+    ) -> proc_macro2::TokenStream {
+        let (impl_generics, ty_generics, _) = self.generics.split_for_impl();
+        finish_encode_match_impl(
+            name,
+            impl_generics,
+            ty_generics,
+            self.base_where_clause,
+            bounds,
+            arms,
+        )
     }
 }
 
 fn named_entries_with_pats<'a, F>(
     name: &Ident,
-    fields: &'a syn::FieldsNamed,
+    fields: &[NamedFieldSpec<'a>],
     bounds: &mut Vec<&'a Type>,
     value: F,
-) -> syn::Result<(Vec<Ident>, Vec<SortedMapEntry>)>
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<SortedMapEntry>)>
 where
     F: Fn(&Ident) -> proc_macro2::TokenStream,
 {
     let mut pats = Vec::new();
     let mut entries = Vec::new();
 
-    for field in &fields.named {
-        let attr = parse_cbor_field_attrs(&field.attrs)?;
-        let f_ident = field.ident.as_ref().unwrap();
-        pats.push(f_ident.clone());
-
-        if attr.skip {
+    for field in fields {
+        let f_ident = field.ident;
+        let Some(key) = field.wire_key.as_ref() else {
+            pats.push(quote! { #f_ident: _ });
             continue;
-        }
+        };
+        pats.push(quote! { #f_ident });
 
-        let key = attr
-            .rename
-            .unwrap_or_else(|| LitStr::new(&f_ident.to_string(), f_ident.span()));
-
-        if !type_mentions_self(&field.ty, name) {
-            bounds.push(&field.ty);
+        if type_needs_trait_bound(field.ty, name) {
+            bounds.push(field.ty);
         }
 
         let value_ts = value(f_ident);
         entries.push(map_entry(
-            &key,
+            key,
             quote! {
                 m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#value_ts, enc))?;
             },
@@ -74,19 +150,19 @@ where
 
 fn tuple_variant_parts<'a>(
     name: &Ident,
-    fields: &'a syn::FieldsUnnamed,
+    fields: &[TupleFieldSpec<'a>],
     bounds: &mut Vec<&'a Type>,
 ) -> syn::Result<(Vec<Ident>, Vec<proc_macro2::TokenStream>)> {
     let mut pats = Vec::new();
     let mut items = Vec::new();
 
-    for (idx, field) in fields.unnamed.iter().enumerate() {
-        ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
+    for field in fields {
+        let idx = field.index;
         let var = format_ident!("v{idx}");
         pats.push(var.clone());
 
-        if !type_mentions_self(&field.ty, name) {
-            bounds.push(&field.ty);
+        if type_needs_trait_bound(field.ty, name) {
+            bounds.push(field.ty);
         }
         items.push(quote! { a.value(#var)?; });
     }
@@ -105,87 +181,74 @@ pub(crate) fn encode_struct(
     match &data.fields {
         Fields::Named(fields) => {
             let mut bounds = Vec::new();
+            let field_specs = named_fields(fields)?;
 
-            let (_, entries) =
-                named_entries_with_pats(name, fields, &mut bounds, |ident| quote!(&self.#ident))?;
-            let entries = sort_entries(entries);
+            let (_, entries) = named_entries_with_pats(
+                name,
+                &field_specs,
+                &mut bounds,
+                |ident| quote!(&self.#ident),
+            )?;
+            let entries = entries_into_tokens(entries);
 
             let len = entries.len();
-            let mut encode_where_clause = base_where_clause.cloned();
-            if !bounds.is_empty() {
-                let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-                    where_token: Default::default(),
-                    predicates: Default::default(),
-                });
-                for ty in bounds {
-                    add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-                }
-            }
+            let encode_where_clause =
+                add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
 
-            Ok(quote! {
-                impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                        enc.map(#len, |m| {
-                            #(#entries)*
-                            Ok(())
-                        })
-                    }
-                }
-
-                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-            })
+            Ok(encode_impl(
+                name,
+                impl_generics,
+                ty_generics,
+                encode_where_clause,
+                quote! {
+                    enc.map(#len, |m| {
+                        #(#entries)*
+                        Ok(())
+                    })
+                },
+            ))
         }
 
         Fields::Unnamed(fields) => {
             let mut items = Vec::new();
             let mut bounds = Vec::new();
 
-            for (idx, field) in fields.unnamed.iter().enumerate() {
-                ensure_no_cbor_attrs(&field.attrs, "tuple struct fields")?;
+            for field in tuple_fields(fields, "tuple struct fields")? {
+                let idx = field.index;
                 let index = syn::Index::from(idx);
 
-                if !type_mentions_self(&field.ty, name) {
-                    bounds.push(&field.ty);
+                if type_needs_trait_bound(field.ty, name) {
+                    bounds.push(field.ty);
                 }
 
                 items.push(quote! { a.value(&self.#index)?; });
             }
 
             let len = items.len();
-            let mut encode_where_clause = base_where_clause.cloned();
-            if !bounds.is_empty() {
-                let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-                    where_token: Default::default(),
-                    predicates: Default::default(),
-                });
-                for ty in bounds {
-                    add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-                }
-            }
+            let encode_where_clause =
+                add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
 
-            Ok(quote! {
-                impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-                    fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                        enc.array(#len, |a| {
-                            #(#items)*
-                            Ok(())
-                        })
-                    }
-                }
-
-                impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-            })
+            Ok(encode_impl(
+                name,
+                impl_generics,
+                ty_generics,
+                encode_where_clause,
+                quote! {
+                    enc.array(#len, |a| {
+                        #(#items)*
+                        Ok(())
+                    })
+                },
+            ))
         }
 
-        Fields::Unit => Ok(quote! {
-            impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #base_where_clause {
-                fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                    enc.null()
-                }
-            }
-
-            impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #base_where_clause {}
-        }),
+        Fields::Unit => Ok(encode_impl(
+            name,
+            impl_generics,
+            ty_generics,
+            base_where_clause,
+            quote! { enc.null() },
+        )),
     }
 }
 
@@ -195,12 +258,12 @@ pub(crate) fn encode_enum(
     data: &DataEnum,
     attrs: &CborEnumAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    let variants = enum_variants(data, attrs.rename_all)?;
     match &attrs.tagging {
-        EnumTagging::External => encode_enum_external(name, generics, data, attrs),
-        EnumTagging::Untagged => encode_enum_untagged(name, generics, data),
-        EnumTagging::Internal { tag } => encode_enum_internal(name, generics, data, attrs, tag),
+        EnumTagging::External => encode_enum_external(name, generics, &variants),
+        EnumTagging::Internal { tag } => encode_enum_internal(name, generics, data, &variants, tag),
         EnumTagging::Adjacent { tag, content } => {
-            encode_enum_adjacent(name, generics, data, attrs, tag, content)
+            encode_enum_adjacent(name, generics, &variants, tag, content)
         }
     }
 }
@@ -208,28 +271,30 @@ pub(crate) fn encode_enum(
 fn encode_enum_external(
     name: &Ident,
     generics: &Generics,
-    data: &DataEnum,
-    attrs: &CborEnumAttr,
+    variants: &[VariantSpec<'_>],
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let base_where_clause = where_clause;
+    let impl_parts = EncodeImplParts::new(generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
 
-    for variant in &data.variants {
-        let vname = variant_name(variant, attrs.rename_all)?;
-        let ident = &variant.ident;
+    for variant in variants {
+        let vname = &variant.name;
+        let ident = variant.ident;
 
-        match &variant.fields {
+        match variant.fields {
             Fields::Unit => {
                 arms.push(quote! {
-                    Self::#ident => ::sacp_cbor::CborEncode::encode(&#vname, enc)
+                    Self::#ident => enc.map(1, |m| {
+                        m.entry(#vname, ::sacp_cbor::Encoder::null)?;
+                        Ok(())
+                    })
                 });
             }
 
             Fields::Unnamed(fields) => {
-                let (pats, items) = tuple_variant_parts(name, fields, &mut bounds)?;
+                let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
+                let (pats, items) = tuple_variant_parts(name, &field_specs, &mut bounds)?;
 
                 let len = items.len();
                 if len == 1 {
@@ -256,9 +321,14 @@ fn encode_enum_external(
             }
 
             Fields::Named(fields) => {
-                let (pats, entries) =
-                    named_entries_with_pats(name, fields, &mut bounds, |ident| quote!(#ident))?;
-                let entries = sort_entries(entries);
+                let field_specs = named_fields(fields)?;
+                let (pats, entries) = named_entries_with_pats(
+                    name,
+                    &field_specs,
+                    &mut bounds,
+                    |ident| quote!(#ident),
+                )?;
+                let entries = entries_into_tokens(entries);
 
                 let len = entries.len();
                 arms.push(quote! {
@@ -276,48 +346,28 @@ fn encode_enum_external(
         }
     }
 
-    let mut encode_where_clause = base_where_clause.cloned();
-    if !bounds.is_empty() {
-        let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: Default::default(),
-        });
-        for ty in bounds {
-            add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-        }
-    }
-
-    Ok(quote! {
-        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                match self { #(#arms),* }
-            }
-        }
-
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-    })
+    Ok(impl_parts.finish_match(name, bounds, &arms))
 }
 
 fn encode_enum_internal(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
-    attrs: &CborEnumAttr,
+    variants: &[VariantSpec<'_>],
     tag: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     validate_internal_tagging(data, tag)?;
 
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let base_where_clause = where_clause;
+    let impl_parts = EncodeImplParts::new(generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
 
-    for variant in &data.variants {
-        let vname = variant_name(variant, attrs.rename_all)?;
-        let ident = &variant.ident;
+    for variant in variants {
+        let vname = &variant.name;
+        let ident = variant.ident;
 
-        match &variant.fields {
+        match variant.fields {
             Fields::Unit => {
                 arms.push(quote! {
                     Self::#ident => enc.map(1, |m| {
@@ -327,8 +377,13 @@ fn encode_enum_internal(
                 });
             }
             Fields::Named(fields) => {
-                let (pats, mut entries) =
-                    named_entries_with_pats(name, fields, &mut bounds, |ident| quote!(#ident))?;
+                let field_specs = named_fields(fields)?;
+                let (pats, mut entries) = named_entries_with_pats(
+                    name,
+                    &field_specs,
+                    &mut bounds,
+                    |ident| quote!(#ident),
+                )?;
                 entries.push(map_entry(
                     tag,
                     quote! {
@@ -345,61 +400,57 @@ fn encode_enum_internal(
                     })
                 });
             }
-            Fields::Unnamed(_) => unreachable!(),
-        }
-    }
-
-    let mut encode_where_clause = base_where_clause.cloned();
-    if !bounds.is_empty() {
-        let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: Default::default(),
-        });
-        for ty in bounds {
-            add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-        }
-    }
-
-    Ok(quote! {
-        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                match self { #(#arms),* }
+            Fields::Unnamed(fields) => {
+                return Err(internal_tagged_tuple_variant_error(fields.span()))
             }
         }
+    }
 
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-    })
+    Ok(impl_parts.finish_match(name, bounds, &arms))
 }
 
 fn encode_enum_adjacent(
     name: &Ident,
     generics: &Generics,
-    data: &DataEnum,
-    attrs: &CborEnumAttr,
+    variants: &[VariantSpec<'_>],
     tag: &LitStr,
     content: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let base_where_clause = where_clause;
+    let impl_parts = EncodeImplParts::new(generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
 
-    for variant in &data.variants {
-        let vname = variant_name(variant, attrs.rename_all)?;
-        let ident = &variant.ident;
+    for variant in variants {
+        let vname = &variant.name;
+        let ident = variant.ident;
 
-        match &variant.fields {
+        match variant.fields {
             Fields::Unit => {
+                let entries = sort_entries(vec![
+                    map_entry(
+                        tag,
+                        quote! {
+                            m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                        },
+                    ),
+                    map_entry(
+                        content,
+                        quote! {
+                            m.entry(#content, ::sacp_cbor::Encoder::null)?;
+                        },
+                    ),
+                ]);
                 arms.push(quote! {
-                    Self::#ident => enc.map(1, |m| {
-                        m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                    Self::#ident => enc.map(2, |m| {
+                        #(#entries)*
                         Ok(())
                     })
                 });
             }
             Fields::Unnamed(fields) => {
-                let (pats, items) = tuple_variant_parts(name, fields, &mut bounds)?;
+                let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
+                let (pats, items) = tuple_variant_parts(name, &field_specs, &mut bounds)?;
                 let len = items.len();
                 let content_entry = if len == 1 {
                     let value = &pats[0];
@@ -441,9 +492,14 @@ fn encode_enum_adjacent(
                 });
             }
             Fields::Named(fields) => {
-                let (pats, entries) =
-                    named_entries_with_pats(name, fields, &mut bounds, |ident| quote!(#ident))?;
-                let entries = sort_entries(entries);
+                let field_specs = named_fields(fields)?;
+                let (pats, entries) = named_entries_with_pats(
+                    name,
+                    &field_specs,
+                    &mut bounds,
+                    |ident| quote!(#ident),
+                )?;
+                let entries = entries_into_tokens(entries);
                 let len = entries.len();
                 let top_entries = sort_entries(vec![
                     map_entry(
@@ -475,111 +531,5 @@ fn encode_enum_adjacent(
         }
     }
 
-    let mut encode_where_clause = base_where_clause.cloned();
-    if !bounds.is_empty() {
-        let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: Default::default(),
-        });
-        for ty in bounds {
-            add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-        }
-    }
-
-    Ok(quote! {
-        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                match self { #(#arms),* }
-            }
-        }
-
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-    })
-}
-
-pub(crate) fn encode_enum_untagged(
-    name: &Ident,
-    generics: &Generics,
-    data: &DataEnum,
-) -> syn::Result<proc_macro2::TokenStream> {
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let base_where_clause = where_clause;
-
-    let mut arms = Vec::new();
-    let mut bounds = Vec::new();
-
-    for variant in &data.variants {
-        if variant_has_rename(variant)? {
-            return Err(syn::Error::new(
-                variant.span(),
-                "variant `cbor(rename=...)` is meaningless for `#[cbor(untagged)]` enums",
-            ));
-        }
-
-        let ident = &variant.ident;
-        match &variant.fields {
-            Fields::Unit => {
-                arms.push(quote! { Self::#ident => enc.null() });
-            }
-
-            Fields::Unnamed(fields) => {
-                let n = fields.unnamed.len();
-                if n == 1 {
-                    let field = fields.unnamed.first().unwrap();
-                    ensure_no_cbor_attrs(&field.attrs, "tuple enum variant fields")?;
-                    if !type_mentions_self(&field.ty, name) {
-                        bounds.push(&field.ty);
-                    }
-                    let v0 = format_ident!("v0");
-                    arms.push(quote! {
-                        Self::#ident(#v0) => ::sacp_cbor::CborEncode::encode(#v0, enc)
-                    });
-                } else {
-                    let (pats, items) = tuple_variant_parts(name, fields, &mut bounds)?;
-
-                    arms.push(quote! {
-                        Self::#ident( #(#pats),* ) => enc.array(#n, |a| {
-                            #(#items)*
-                            Ok(())
-                        })
-                    });
-                }
-            }
-
-            Fields::Named(fields) => {
-                let (pats, entries) =
-                    named_entries_with_pats(name, fields, &mut bounds, |ident| quote!(#ident))?;
-                let entries = sort_entries(entries);
-
-                let len = entries.len();
-                arms.push(quote! {
-                    Self::#ident { #(#pats),* } => enc.map(#len, |m| {
-                        #(#entries)*
-                        Ok(())
-                    })
-                });
-            }
-        }
-    }
-
-    let mut encode_where_clause = base_where_clause.cloned();
-    if !bounds.is_empty() {
-        let wc = encode_where_clause.get_or_insert_with(|| syn::WhereClause {
-            where_token: Default::default(),
-            predicates: Default::default(),
-        });
-        for ty in bounds {
-            add_where_bound(wc, ty, quote!(::sacp_cbor::CborEncode));
-        }
-    }
-
-    Ok(quote! {
-        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #encode_where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
-                match self { #(#arms),* }
-            }
-        }
-
-        impl #impl_generics ::sacp_cbor::CborArrayElem for #name #ty_generics #encode_where_clause {}
-    })
+    Ok(impl_parts.finish_match(name, bounds, &arms))
 }

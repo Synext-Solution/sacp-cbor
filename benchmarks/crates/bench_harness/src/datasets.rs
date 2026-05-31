@@ -22,8 +22,8 @@ pub struct Dataset {
 
 pub fn load_appendix_a(path: &Path) -> Result<Dataset, String> {
     let data = fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let entries: Vec<AppendixEntry> = serde_json::from_str(&data)
-        .map_err(|e| format!("parse {path:?}: {e}"))?;
+    let entries: Vec<AppendixEntry> =
+        serde_json::from_str(&data).map_err(|e| format!("parse {path:?}: {e}"))?;
     let mut items = Vec::with_capacity(entries.len());
     for entry in entries {
         let bytes = B64

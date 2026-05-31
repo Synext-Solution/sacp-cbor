@@ -27,14 +27,14 @@ fn canonical_from_slice_rejects_invalid() {
 fn canonical_sha256_matches_manual_hash() {
     use sha2::{Digest, Sha256};
 
-    let bytes = sacp_cbor::cbor_bytes!([1, true]).unwrap();
-    let limits = DecodeLimits::for_bytes(bytes.as_bytes().len());
+    let bytes = [0x82, 0x01, 0xf5];
+    let limits = DecodeLimits::for_bytes(bytes.len());
 
-    let canon = CanonicalCbor::from_slice(bytes.as_bytes(), limits).unwrap();
+    let canon = CanonicalCbor::from_slice(&bytes, limits).unwrap();
     let h1 = canon.sha256();
 
     let mut hasher = Sha256::new();
-    hasher.update(bytes.as_bytes());
+    hasher.update(bytes);
     let digest = hasher.finalize();
     let mut h2 = [0u8; 32];
     h2.copy_from_slice(digest.as_slice());

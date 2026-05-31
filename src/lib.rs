@@ -11,11 +11,11 @@
 //! - **Hot-path validation is allocation-free.**
 //!   Use [`validate_canonical`] to validate a single CBOR data item with strict SACP-CBOR/1 rules.
 //! - **Encoding is streaming-first.**
-//!   Use [`Encoder`] or [`cbor_bytes!`] to emit canonical bytes without building an owned tree.
+//!   Use `Encoder` or `cbor_bytes!` to emit canonical bytes without building an owned tree.
 //!
 //! ## SACP-CBOR/1 profile (explicit)
 //!
-//! **Terminology note:** “canonical” in this crate means **canonical under the strict SACP-CBOR/1
+//! **Terminology note:** "canonical" in this crate means **canonical under the strict SACP-CBOR/1
 //! profile** defined here, not RFC 8949 canonical CBOR.
 //!
 //! **Allowed data model**
@@ -23,22 +23,57 @@
 //! - Single CBOR item only (no trailing bytes).
 //! - Definite-length items only (no indefinite-length encodings).
 //! - Map keys must be text strings (major 3) and valid UTF-8.
+//! - Duplicate map keys are rejected.
 //! - Only tags 2 and 3 are allowed (bignums), and bignums must be canonical and outside the safe-int range.
 //! - Integers (major 0/1) must be in the safe range `[-(2^53-1), +(2^53-1)]`.
-//! - Floats must be encoded as float64 (major 7, ai=27), forbid `-0.0`, and require the canonical NaN bit pattern.
+//! - Floats must be encoded as float64 (major 7, ai=27), forbid `-0.0`, and require NaN to be encoded as `0x7ff8_0000_0000_0000`.
 //! - Only simple values `false`, `true`, and `null` are allowed.
+//! - All other tags, simple values, float16/float32 encodings, break bytes, and reserved additional-info values are rejected.
 //!
 //! **Canonical encoding constraints**
 //!
 //! - Minimal integer/length encoding (no overlong forms).
 //! - Map keys are strictly increasing by canonical CBOR key ordering:
 //!   `(encoded length, then lexicographic encoded bytes)`.
+//! - Exactly one root value must be emitted or decoded.
+//!
+//! **Witness invariants**
+//!
+//! - [`CanonicalCborRef`] is a borrowed witness that its byte slice is one complete canonical item.
+//! - `CanonicalCbor` is the owned form of the same invariant.
+//! - [`query::CborValueRef`] is a borrowed sub-value view containing the original root bytes plus a byte
+//!   range for one complete canonical item inside that root.
+//! - [`Decoder::<true>`] validates canonical constraints while decoding.
+//! - [`Decoder::<false>`] is constructed only from [`CanonicalCborRef`] and relies on that witness.
+//! - `Encoder::finish` succeeds only after exactly one complete root value has been emitted and
+//!   every declared container has been closed with its exact element count.
+//! - With the `edit` feature, `edit::Editor::apply` emits through `Encoder::finish`, so successful
+//!   patch output is a new `CanonicalCbor`.
+//!
+//! **Decode limits**
+//!
+//! [`DecodeLimits`] contains deterministic resource limits:
+//! `max_input_bytes`, `max_depth`, `max_total_items`, `max_array_len`, `max_map_len`,
+//! `max_bytes_len`, and `max_text_len`. Maps count as two items per pair for
+//! `max_total_items` because both keys and values are scanned. [`DecodeLimits::validate`] rejects
+//! configurations this build cannot enforce, such as no-alloc depth values above the fixed stack.
+//!
+//! **Allocation policy**
+//!
+//! Validation and borrowed query traversal are allocation-free. Owned APIs use fallible reservation
+//! helpers for `Vec`, `String`, and `Box<str>` construction and report [`ErrorCode::AllocationFailed`]
+//! where Rust exposes allocation failure. Standard-library collections may still abort on process
+//! OOM inside their own insertion routines.
 //!
 //! ## Feature flags
 //!
-//! - `std` *(default)*: implements `std::error::Error` for [`CborError`].
-//! - `alloc` *(default)*: enables owned canonical bytes (`CanonicalCbor`), editing, and encoding helpers.
-//! - `sha2` *(default)*: enables SHA-256 hashing helpers for canonical bytes.
+//! - `std` *(default)*: implements `std::error::Error` for [`CborError`] and enables `alloc`.
+//! - `alloc`: enables owned canonical bytes (`CanonicalCbor`) and encoding helpers.
+//! - `derive` *(default)*: enables derive macros and `cbor_bytes!`.
+//! - `collections`: enables native collection impls and `collections::MapEntries`.
+//! - `edit`: enables canonical CBOR editing under `edit`.
+//! - `sha2`: enables SHA-256 hashing helpers for canonical bytes.
+//! - `serde`: enables serde integration under `serde`.
 //! - `simdutf8`: enables SIMD-accelerated UTF-8 validation where supported.
 //! - `unsafe`: allows unchecked UTF-8 for canonical-trusted inputs.
 //!
@@ -49,9 +84,9 @@
 //!
 //! ## `no_std`
 //!
-//! The crate is `no_std` compatible.
+//! The crate supports `no_std`.
 //! - Validation-only usage works without `alloc`.
-//! - Owned APIs (canonical bytes + editor) require `alloc` and therefore an allocator provided by your environment.
+//! - Owned APIs (canonical bytes, encoding, collections, and editor) require `alloc` and therefore an allocator provided by your environment.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -65,85 +100,72 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 mod alloc_util;
+pub mod bytes;
 mod canonical;
 mod codec;
-mod error;
-mod limits;
+#[cfg(feature = "alloc")]
+mod codec_impls;
+pub mod decode;
+pub mod error;
+pub mod limits;
 mod parse;
-mod profile;
-mod query;
-mod scalar;
+pub mod profile;
+#[cfg(all(kani, feature = "alloc"))]
+#[path = "../proofs/kani.rs"]
+mod proofs;
+pub mod query;
+pub mod scalar;
 #[cfg(feature = "serde")]
 mod serde_impl;
 pub(crate) mod utf8;
 mod wire;
 
-#[cfg(feature = "alloc")]
-mod edit;
-#[cfg(feature = "alloc")]
+#[cfg(feature = "edit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "edit")))]
+pub mod edit;
 mod int;
 
-pub use crate::canonical::{CanonicalCborRef, EncodedTextKey};
-pub use crate::codec::{
-    decode, decode_canonical, ArrayDecoder, CborDecode, CheckedDecoder, Decoder, MapDecoder,
-    TrustedDecoder,
-};
+pub use crate::canonical::CanonicalCborRef;
+pub use crate::codec::CborDecode;
+pub use crate::decode::{decode, decode_canonical, Decoder};
 pub use crate::error::{CborError, ErrorCode};
-pub use crate::limits::{CborLimits, DecodeLimits};
-pub use crate::parse::{validate, validate_canonical};
-pub use crate::profile::{MAX_SAFE_INTEGER, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
-pub use crate::query::{
-    ArrayRef, BigIntRef, CborIntegerRef, CborKind, CborValueRef, MapRef, PathElem,
-};
-pub use crate::scalar::F64Bits;
+pub use crate::limits::{DecodeLimits, EncodeLimits};
+pub use crate::parse::validate_canonical;
 
 #[cfg(feature = "alloc")]
-mod encode;
+pub mod encode;
 #[cfg(feature = "alloc")]
-mod macros;
-#[cfg(feature = "alloc")]
-mod value;
+pub mod value;
 #[cfg(feature = "alloc")]
 pub use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
-pub use crate::codec::{
-    decode_canonical_owned, encode_into, encode_to_canonical, encode_to_vec, CborArrayElem,
-    CborEncode, MapEntries,
-};
+pub use crate::codec::CborEncode;
 #[cfg(feature = "alloc")]
-pub use crate::edit::{
-    ArrayPos, ArraySpliceBuilder, DeleteMode, EditEncode, EditOptions, EditValue, Editor, SetMode,
-};
+pub use crate::codec_impls::{encode_to_canonical, encode_to_vec};
 #[cfg(feature = "alloc")]
-pub use crate::encode::{ArrayEncoder, Encoder, MapEncoder};
-#[cfg(feature = "alloc")]
-#[doc(hidden)]
-pub use crate::macros::__cbor_macro;
-#[cfg(feature = "alloc")]
-pub use crate::value::{BigInt, CborInteger};
-#[cfg(feature = "alloc")]
+pub use crate::encode::Encoder;
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use sacp_cbor_derive::cbor_bytes;
 
 #[cfg(feature = "serde")]
-pub use crate::serde_impl::{
-    from_canonical_bytes, from_canonical_bytes_ref, from_slice, from_slice_borrowed, to_vec,
-    to_vec_sorted_maps, DeError,
-};
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub mod serde {
+    //! Serde encode/decode integration for SACP-CBOR/1.
 
+    pub use crate::serde_impl::{
+        from_canonical_bytes, from_canonical_bytes_ref, from_slice, to_vec, DeError, SerdeOptions,
+    };
+}
+
+#[cfg(feature = "collections")]
+#[cfg_attr(docsrs, doc(cfg(feature = "collections")))]
+pub mod collections {
+    //! Native collection implementations and map-entry helper types.
+
+    pub use crate::decode::MapEntries;
+}
+
+#[cfg(feature = "derive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use sacp_cbor_derive::{CborDecode, CborEncode};
-
-/// Construct a path slice for query/edit operations.
-#[macro_export]
-macro_rules! path {
-    ($($seg:expr),* $(,)?) => {
-        &[$($crate::__path_elem!($seg)),*]
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __path_elem {
-    ($seg:expr) => {
-        $crate::PathElem::from($seg)
-    };
-}

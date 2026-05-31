@@ -1,3 +1,4 @@
+#[cfg(feature = "edit")]
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -77,11 +78,7 @@ pub fn try_vec_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborEr
     Ok(v)
 }
 
-#[inline]
-pub fn try_vec_u8_from_slice(bytes: &[u8], offset: usize) -> Result<Vec<u8>, CborError> {
-    try_vec_from_slice(bytes, offset)
-}
-
+#[cfg(feature = "edit")]
 #[inline]
 pub fn try_box_str_from_str(s: &str, offset: usize) -> Result<Box<str>, CborError> {
     let mut out = String::new();

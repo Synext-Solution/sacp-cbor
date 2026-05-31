@@ -1,7 +1,11 @@
+use sacp_cbor::bytes::{Bytes, BytesRef};
+use sacp_cbor::collections::MapEntries;
+use sacp_cbor::encode::ArrayEncoder;
+use sacp_cbor::query::CborKind;
+use sacp_cbor::{CborDecode, CborEncode, CborError, Decoder, Encoder};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
-use sacp_cbor::MapEntries;
 use std::fmt;
 
 #[derive(Clone, Debug)]
@@ -183,8 +187,7 @@ impl<'de> Deserialize<'de> for BenchValue {
     }
 }
 
-#[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
-#[cbor(untagged)]
+#[derive(Clone, Debug)]
 pub enum BenchValueNative {
     Null,
     Bool(bool),
@@ -195,8 +198,7 @@ pub enum BenchValueNative {
     Map(MapEntries<String, BenchValueNative>),
 }
 
-#[derive(Clone, Debug, sacp_cbor::CborEncode, sacp_cbor::CborDecode)]
-#[cbor(untagged)]
+#[derive(Clone, Debug)]
 pub enum BenchValueBorrowed<'a> {
     Null,
     Bool(bool),
@@ -207,6 +209,146 @@ pub enum BenchValueBorrowed<'a> {
     Map(MapEntries<&'a str, BenchValueBorrowed<'a>>),
 }
 
+impl CborEncode for BenchValueNative {
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        match self {
+            Self::Null => enc.null(),
+            Self::Bool(v) => enc.bool(*v),
+            Self::Int(v) => enc.int(*v),
+            Self::Bytes(v) => enc.bytes(v),
+            Self::Text(v) => enc.text(v),
+            Self::Array(items) => enc.array(items.len(), |arr| {
+                for item in items {
+                    arr.value(item)?;
+                }
+                Ok(())
+            }),
+            Self::Map(entries) => enc.map(entries.0.len(), |map| {
+                for (key, value) in &entries.0 {
+                    map.entry(key, |enc| value.encode(enc))?;
+                }
+                Ok(())
+            }),
+        }
+    }
+
+    fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
+        match self {
+            Self::Null => array.null(),
+            Self::Bool(v) => array.bool(*v),
+            Self::Int(v) => array.int(*v),
+            Self::Bytes(v) => array.bytes(v),
+            Self::Text(v) => array.text(v),
+            Self::Array(items) => array.array(items.len(), |arr| {
+                for item in items {
+                    arr.value(item)?;
+                }
+                Ok(())
+            }),
+            Self::Map(entries) => array.map(entries.0.len(), |map| {
+                for (key, value) in &entries.0 {
+                    map.entry(key, |enc| value.encode(enc))?;
+                }
+                Ok(())
+            }),
+        }
+    }
+}
+
+impl<'de> CborDecode<'de> for BenchValueNative {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        match decoder.peek_kind()? {
+            CborKind::Null => {
+                let _: () = CborDecode::decode(decoder)?;
+                Ok(Self::Null)
+            }
+            CborKind::Bool => Ok(Self::Bool(CborDecode::decode(decoder)?)),
+            CborKind::Integer => Ok(Self::Int(CborDecode::decode(decoder)?)),
+            CborKind::Bytes => {
+                let bytes: Bytes = CborDecode::decode(decoder)?;
+                Ok(Self::Bytes(bytes.into_vec()))
+            }
+            CborKind::Text => Ok(Self::Text(CborDecode::decode(decoder)?)),
+            CborKind::Array => Ok(Self::Array(CborDecode::decode(decoder)?)),
+            CborKind::Map => Ok(Self::Map(CborDecode::decode(decoder)?)),
+            CborKind::Float => {
+                let _: f64 = CborDecode::decode(decoder)?;
+                Ok(Self::Null)
+            }
+        }
+    }
+}
+
+impl CborEncode for BenchValueBorrowed<'_> {
+    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        match self {
+            Self::Null => enc.null(),
+            Self::Bool(v) => enc.bool(*v),
+            Self::Int(v) => enc.int(*v),
+            Self::Bytes(v) => enc.bytes(v),
+            Self::Text(v) => enc.text(v),
+            Self::Array(items) => enc.array(items.len(), |arr| {
+                for item in items {
+                    arr.value(item)?;
+                }
+                Ok(())
+            }),
+            Self::Map(entries) => enc.map(entries.0.len(), |map| {
+                for (key, value) in &entries.0 {
+                    map.entry(key, |enc| value.encode(enc))?;
+                }
+                Ok(())
+            }),
+        }
+    }
+
+    fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
+        match self {
+            Self::Null => array.null(),
+            Self::Bool(v) => array.bool(*v),
+            Self::Int(v) => array.int(*v),
+            Self::Bytes(v) => array.bytes(v),
+            Self::Text(v) => array.text(v),
+            Self::Array(items) => array.array(items.len(), |arr| {
+                for item in items {
+                    arr.value(item)?;
+                }
+                Ok(())
+            }),
+            Self::Map(entries) => array.map(entries.0.len(), |map| {
+                for (key, value) in &entries.0 {
+                    map.entry(key, |enc| value.encode(enc))?;
+                }
+                Ok(())
+            }),
+        }
+    }
+}
+
+impl<'de> CborDecode<'de> for BenchValueBorrowed<'de> {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        match decoder.peek_kind()? {
+            CborKind::Null => {
+                let _: () = CborDecode::decode(decoder)?;
+                Ok(Self::Null)
+            }
+            CborKind::Bool => Ok(Self::Bool(CborDecode::decode(decoder)?)),
+            CborKind::Integer => Ok(Self::Int(CborDecode::decode(decoder)?)),
+            CborKind::Bytes => {
+                let bytes: BytesRef<'de> = CborDecode::decode(decoder)?;
+                Ok(Self::Bytes(bytes.as_slice()))
+            }
+            CborKind::Text => Ok(Self::Text(CborDecode::decode(decoder)?)),
+            CborKind::Array => Ok(Self::Array(CborDecode::decode(decoder)?)),
+            CborKind::Map => Ok(Self::Map(CborDecode::decode(decoder)?)),
+            CborKind::Float => {
+                let _: f64 = CborDecode::decode(decoder)?;
+                Ok(Self::Null)
+            }
+        }
+    }
+}
+
 impl BenchValueNative {
     pub fn from_bench(value: &BenchValue) -> Self {
         match value {
@@ -215,9 +357,7 @@ impl BenchValueNative {
             BenchValue::Int(v) => Self::Int(*v),
             BenchValue::Bytes(b) => Self::Bytes(b.clone()),
             BenchValue::Text(s) => Self::Text(s.clone()),
-            BenchValue::Array(items) => {
-                Self::Array(items.iter().map(Self::from_bench).collect())
-            }
+            BenchValue::Array(items) => Self::Array(items.iter().map(Self::from_bench).collect()),
             BenchValue::Map(entries) => {
                 let mapped = entries
                     .iter()
@@ -237,9 +377,7 @@ impl<'a> BenchValueBorrowed<'a> {
             BenchValue::Int(v) => Self::Int(*v),
             BenchValue::Bytes(b) => Self::Bytes(b.as_slice()),
             BenchValue::Text(s) => Self::Text(s.as_str()),
-            BenchValue::Array(items) => {
-                Self::Array(items.iter().map(Self::from_bench).collect())
-            }
+            BenchValue::Array(items) => Self::Array(items.iter().map(Self::from_bench).collect()),
             BenchValue::Map(entries) => {
                 let mapped = entries
                     .iter()

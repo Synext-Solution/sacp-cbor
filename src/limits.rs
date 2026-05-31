@@ -1,3 +1,5 @@
+//! Deterministic decode and encode resource limits.
+
 use crate::{CborError, ErrorCode};
 
 /// Default maximum nesting depth limit.
@@ -31,7 +33,110 @@ pub struct DecodeLimits {
     pub max_text_len: usize,
 }
 
+/// Encode-time resource limits for canonical byte production.
+///
+/// The item/depth semantics match [`DecodeLimits`]: arrays count their contained values, maps
+/// count both keys and values, and container depth counts the root container as depth 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeLimits {
+    /// Maximum total output length in bytes.
+    pub max_output_bytes: usize,
+    /// Maximum nesting depth for arrays and maps.
+    pub max_depth: usize,
+    /// Maximum total count of container items:
+    /// `sum(array_len) + sum(2 * map_pairs)` across the emitted item.
+    pub max_total_items: usize,
+    /// Maximum array length.
+    pub max_array_len: usize,
+    /// Maximum map length (pairs).
+    pub max_map_len: usize,
+    /// Maximum byte-string length (also applies to bignum magnitudes).
+    pub max_bytes_len: usize,
+    /// Maximum text-string length in UTF-8 bytes.
+    pub max_text_len: usize,
+}
+
+impl EncodeLimits {
+    /// Return limits that do not impose semantic bounds beyond platform `usize` capacity.
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            max_output_bytes: usize::MAX,
+            max_depth: usize::MAX,
+            max_total_items: usize::MAX,
+            max_array_len: usize::MAX,
+            max_map_len: usize::MAX / 2,
+            max_bytes_len: usize::MAX,
+            max_text_len: usize::MAX,
+        }
+    }
+
+    /// Validate this limit set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidLimits` when item accounting cannot be enforced without overflow.
+    pub const fn validate(self) -> Result<(), CborError> {
+        if self.max_map_len > usize::MAX / 2 {
+            return Err(CborError::new(ErrorCode::InvalidLimits, 0));
+        }
+        Ok(())
+    }
+
+    /// Construct conservative encode limits from an output byte budget.
+    #[must_use]
+    pub fn for_bytes(max_output_bytes: usize) -> Self {
+        let max_container_len = max_output_bytes.min(DEFAULT_MAX_CONTAINER_LEN);
+        Self {
+            max_output_bytes,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_total_items: max_output_bytes,
+            max_array_len: max_container_len,
+            max_map_len: max_container_len,
+            max_bytes_len: max_output_bytes,
+            max_text_len: max_output_bytes,
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub(crate) const fn to_decode_limits(self, max_input_bytes: usize) -> DecodeLimits {
+        DecodeLimits {
+            max_input_bytes,
+            max_depth: self.max_depth,
+            max_total_items: self.max_total_items,
+            max_array_len: self.max_array_len,
+            max_map_len: self.max_map_len,
+            max_bytes_len: self.max_bytes_len,
+            max_text_len: self.max_text_len,
+        }
+    }
+}
+
+impl Default for EncodeLimits {
+    fn default() -> Self {
+        Self::unbounded()
+    }
+}
+
 impl DecodeLimits {
+    /// Validate this limit set for the active feature configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidLimits` when the configured limits cannot be enforced by this build.
+    pub const fn validate(self) -> Result<(), CborError> {
+        if self.max_map_len > usize::MAX / 2 {
+            return Err(CborError::new(ErrorCode::InvalidLimits, 0));
+        }
+        #[cfg(not(feature = "alloc"))]
+        {
+            if self.max_depth > DEFAULT_MAX_DEPTH {
+                return Err(CborError::new(ErrorCode::InvalidLimits, 0));
+            }
+        }
+        Ok(())
+    }
+
     /// Construct conservative limits derived from a maximum message size.
     ///
     /// The defaults are:
@@ -54,47 +159,5 @@ impl DecodeLimits {
             max_bytes_len: max_message_bytes,
             max_text_len: max_message_bytes,
         }
-    }
-}
-
-/// End-to-end limits used by SACP implementations.
-///
-/// SACP commonly distinguishes between:
-/// - maximum message size on the wire, and
-/// - maximum size of canonical CBOR stored durably as state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CborLimits {
-    /// Maximum bytes per message.
-    pub max_message_bytes: usize,
-    /// Maximum bytes per state blob (must be <= `max_message_bytes`).
-    pub max_state_bytes: usize,
-}
-
-impl CborLimits {
-    /// Construct new limits.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidLimits` if `max_state_bytes > max_message_bytes`.
-    pub const fn new(max_message_bytes: usize, max_state_bytes: usize) -> Result<Self, CborError> {
-        if max_state_bytes > max_message_bytes {
-            return Err(CborError::new(ErrorCode::InvalidLimits, 0));
-        }
-        Ok(Self {
-            max_message_bytes,
-            max_state_bytes,
-        })
-    }
-
-    /// Decode limits appropriate for validating incoming messages.
-    #[must_use]
-    pub fn message_limits(self) -> DecodeLimits {
-        DecodeLimits::for_bytes(self.max_message_bytes)
-    }
-
-    /// Decode limits appropriate for validating stored canonical state.
-    #[must_use]
-    pub fn state_limits(self) -> DecodeLimits {
-        DecodeLimits::for_bytes(self.max_state_bytes)
     }
 }

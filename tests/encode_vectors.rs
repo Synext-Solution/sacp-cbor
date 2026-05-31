@@ -1,11 +1,13 @@
 #![cfg(feature = "alloc")]
 
-use sacp_cbor::{CborError, Encoder, ErrorCode, F64Bits, MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
+use sacp_cbor::profile::{MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
+use sacp_cbor::scalar::F64Bits;
+use sacp_cbor::{CborError, Encoder, ErrorCode};
 
 fn encode_one(f: impl FnOnce(&mut Encoder) -> Result<(), CborError>) -> Vec<u8> {
     let mut enc = Encoder::new();
     f(&mut enc).unwrap();
-    enc.into_vec()
+    enc.finish().unwrap().into_bytes()
 }
 
 #[test]

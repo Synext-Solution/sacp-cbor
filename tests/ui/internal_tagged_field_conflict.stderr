@@ -1,0 +1,5 @@
+error: field key `kind` conflicts with internal enum tag `kind`
+ --> tests/ui/internal_tagged_field_conflict.rs:6:12
+  |
+6 |     Data { kind: u8 },
+  |            ^^^^

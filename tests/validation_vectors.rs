@@ -1,4 +1,5 @@
-use sacp_cbor::{validate_canonical, DecodeLimits, ErrorCode};
+use sacp_cbor::profile::MAX_SAFE_INTEGER;
+use sacp_cbor::{validate_canonical, DecodeLimits, Decoder, ErrorCode};
 
 fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) -> usize {
     let err = validate_canonical(bytes, limits).unwrap_err();
@@ -6,37 +7,29 @@ fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) -> usize 
     err.offset
 }
 
-fn tstr_encoded(len: usize, fill: u8) -> Vec<u8> {
+fn len_header(major: u8, len: usize) -> Vec<u8> {
     let mut out = Vec::new();
     if len < 24 {
-        out.push(0x60u8 | (len as u8));
+        out.push((major << 5) | (len as u8));
     } else if len <= u8::MAX as usize {
-        out.push(0x78);
-        out.push(len as u8);
+        out.extend_from_slice(&[(major << 5) | 24, len as u8]);
     } else if len <= u16::MAX as usize {
-        out.push(0x79);
+        out.push((major << 5) | 25);
         out.extend_from_slice(&(len as u16).to_be_bytes());
     } else {
         panic!("test helper only supports <= u16::MAX");
     }
+    out
+}
+
+fn tstr_encoded(len: usize, fill: u8) -> Vec<u8> {
+    let mut out = len_header(3, len);
     out.extend(std::iter::repeat(fill).take(len));
     out
 }
 
 fn bstr_encoded(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let len = bytes.len();
-    if len < 24 {
-        out.push(0x40u8 | (len as u8));
-    } else if len <= u8::MAX as usize {
-        out.push(0x58);
-        out.push(len as u8);
-    } else if len <= u16::MAX as usize {
-        out.push(0x59);
-        out.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        panic!("test helper only supports <= u16::MAX");
-    }
+    let mut out = len_header(2, bytes.len());
     out.extend_from_slice(bytes);
     out
 }
@@ -46,8 +39,75 @@ fn accepts_minimal_valid_map() {
     let bytes = [0xa1, 0x61, 0x61, 0x01]; // {"a":1}
     let canon = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(canon.as_bytes(), bytes);
+}
 
-    assert_eq!(canon.as_bytes(), bytes);
+#[test]
+fn dropping_partially_consumed_array_poisons_decoder() {
+    let bytes = [0x82, 0x01, 0x02];
+    let mut decoder =
+        Decoder::<true>::new_checked(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+
+    {
+        let mut array = decoder.array().unwrap();
+        assert_eq!(array.next_value::<u8>().unwrap(), Some(1));
+    }
+
+    let err = decoder.peek_kind().unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
+}
+
+#[test]
+fn dropping_map_with_pending_value_poisons_decoder() {
+    let bytes = [0xa1, 0x61, b'a', 0x01];
+    let mut decoder =
+        Decoder::<true>::new_checked(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+
+    {
+        let mut map = decoder.map().unwrap();
+        let key = map.next_key_ref().unwrap().unwrap();
+        assert_eq!(key.text, "a");
+    }
+
+    let err = decoder.peek_kind().unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
+}
+
+#[test]
+fn map_pending_value_misuse_is_rejected() {
+    let bytes = [0xa1, 0x61, b'a', 0x01];
+    let mut decoder =
+        Decoder::<true>::new_checked(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let mut map = decoder.map().unwrap();
+
+    let err = map.next_value::<u8>().unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
+
+    let key = map.next_key_ref().unwrap().unwrap();
+    assert_eq!(key.text, "a");
+    let err = map.next_key_ref().unwrap_err();
+    assert_eq!(err.code, ErrorCode::MalformedCanonical);
+    assert_eq!(map.next_value::<u8>().unwrap(), 1);
+    assert!(map.next_key_ref().unwrap().is_none());
+}
+
+#[test]
+fn array_and_map_over_read_return_none() {
+    let array_bytes = [0x81, 0x01];
+    let mut array_decoder =
+        Decoder::<true>::new_checked(&array_bytes, DecodeLimits::for_bytes(array_bytes.len()))
+            .unwrap();
+    let mut array = array_decoder.array().unwrap();
+    assert_eq!(array.next_value::<u8>().unwrap(), Some(1));
+    assert_eq!(array.next_value::<u8>().unwrap(), None);
+
+    let map_bytes = [0xa1, 0x61, b'a', 0x01];
+    let mut map_decoder =
+        Decoder::<true>::new_checked(&map_bytes, DecodeLimits::for_bytes(map_bytes.len())).unwrap();
+    let mut map = map_decoder.map().unwrap();
+    let key = map.next_key_ref().unwrap().unwrap();
+    assert_eq!(key.text, "a");
+    assert_eq!(map.next_value::<u8>().unwrap(), 1);
+    assert!(map.next_key_ref().unwrap().is_none());
 }
 
 #[test]
@@ -62,14 +122,26 @@ fn rejects_input_len_over_limit() {
 }
 
 #[test]
-fn ai_31_is_reserved_for_int_and_tag() {
-    let bytes = [0x1f]; // major 0, ai=31
-    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, ErrorCode::ReservedAdditionalInfo);
+fn rejects_reserved_additional_info_for_all_major_types() {
+    for major in 0..=7 {
+        for ai in 28..=30 {
+            let bytes = [(major << 5) | ai];
+            assert_invalid(
+                &bytes,
+                DecodeLimits::for_bytes(bytes.len()),
+                ErrorCode::ReservedAdditionalInfo,
+            );
+        }
+    }
 
-    let bytes = [0xdf]; // major 6 (tag), ai=31
-    let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
-    assert_eq!(err.code, ErrorCode::ReservedAdditionalInfo);
+    for major in [0, 1, 6] {
+        let bytes = [(major << 5) | 31];
+        assert_invalid(
+            &bytes,
+            DecodeLimits::for_bytes(bytes.len()),
+            ErrorCode::ReservedAdditionalInfo,
+        );
+    }
 }
 
 #[test]
@@ -248,10 +320,10 @@ fn accepts_canonical_nan_float64() {
 #[test]
 fn accepts_safe_integer_boundaries() {
     let mut max_uint = vec![0x1b];
-    max_uint.extend_from_slice(&sacp_cbor::MAX_SAFE_INTEGER.to_be_bytes());
+    max_uint.extend_from_slice(&MAX_SAFE_INTEGER.to_be_bytes());
     validate_canonical(&max_uint, DecodeLimits::for_bytes(max_uint.len())).unwrap();
 
-    let n = sacp_cbor::MAX_SAFE_INTEGER - 1;
+    let n = MAX_SAFE_INTEGER - 1;
     let mut min_int = vec![0x3b];
     min_int.extend_from_slice(&n.to_be_bytes());
     validate_canonical(&min_int, DecodeLimits::for_bytes(min_int.len())).unwrap();
@@ -260,7 +332,7 @@ fn accepts_safe_integer_boundaries() {
 #[test]
 fn rejects_safe_integer_overflow() {
     let mut too_big = vec![0x1b];
-    too_big.extend_from_slice(&(sacp_cbor::MAX_SAFE_INTEGER + 1).to_be_bytes());
+    too_big.extend_from_slice(&(MAX_SAFE_INTEGER + 1).to_be_bytes());
     assert_invalid(
         &too_big,
         DecodeLimits::for_bytes(too_big.len()),
@@ -268,7 +340,7 @@ fn rejects_safe_integer_overflow() {
     );
 
     let mut too_small = vec![0x3b];
-    too_small.extend_from_slice(&sacp_cbor::MAX_SAFE_INTEGER.to_be_bytes());
+    too_small.extend_from_slice(&MAX_SAFE_INTEGER.to_be_bytes());
     assert_invalid(
         &too_small,
         DecodeLimits::for_bytes(too_small.len()),
@@ -392,6 +464,20 @@ fn rejects_float16_float32_and_break() {
 }
 
 #[test]
+fn rejects_additional_info_24_simple_values() {
+    assert_invalid(
+        &[0xf8, 0x17],
+        DecodeLimits::for_bytes(2),
+        ErrorCode::NonCanonicalEncoding,
+    );
+    assert_invalid(
+        &[0xf8, 0x20],
+        DecodeLimits::for_bytes(2),
+        ErrorCode::UnsupportedSimpleValue,
+    );
+}
+
+#[test]
 fn rejects_indefinite_lengths() {
     let bytes_bstr = [0x5f, 0xff];
     assert_invalid(
@@ -416,66 +502,6 @@ fn rejects_indefinite_lengths() {
 }
 
 #[test]
-fn rejects_reserved_additional_info() {
-    let bytes = [0x1c];
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
-fn rejects_reserved_additional_info_for_text() {
-    let bytes = [0x7c]; // major 3, ai=28
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
-fn rejects_reserved_additional_info_for_bytes() {
-    let bytes = [0x5c]; // major 2, ai=28
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
-fn rejects_reserved_additional_info_for_array() {
-    let bytes = [0x9c]; // major 4, ai=28
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
-fn rejects_reserved_additional_info_for_map() {
-    let bytes = [0xbc]; // major 5, ai=28
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
-fn rejects_reserved_additional_info_for_simple() {
-    let bytes = [0xfc]; // major 7, ai=28
-    assert_invalid(
-        &bytes,
-        DecodeLimits::for_bytes(bytes.len()),
-        ErrorCode::ReservedAdditionalInfo,
-    );
-}
-
-#[test]
 fn unexpected_eof_offsets_are_stable() {
     let bytes = [0x18]; // uint8 additional info but missing byte
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
@@ -486,6 +512,18 @@ fn unexpected_eof_offsets_are_stable() {
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
     assert_eq!(err.code, ErrorCode::UnexpectedEof);
     assert_eq!(err.offset, 1);
+}
+
+#[test]
+fn rejects_truncated_valid_document_at_every_byte_position() {
+    let bytes = [0xa1, 0x61, b'a', 0x82, 0x01, 0xa1, 0x61, b'b', 0xf5];
+    for len in 0..bytes.len() {
+        assert_invalid(
+            &bytes[..len],
+            DecodeLimits::for_bytes(bytes.len()),
+            ErrorCode::UnexpectedEof,
+        );
+    }
 }
 
 #[test]
@@ -522,4 +560,56 @@ fn enforces_limits() {
     let mut limits = DecodeLimits::for_bytes(bytes_map.len());
     limits.max_total_items = 1;
     assert_invalid(&bytes_map, limits, ErrorCode::TotalItemsLimitExceeded);
+}
+
+#[test]
+fn accepts_limits_at_boundary_and_rejects_boundary_plus_one() {
+    let nested_array = [0x81, 0x80];
+    let mut limits = DecodeLimits::for_bytes(nested_array.len());
+    limits.max_depth = 2;
+    validate_canonical(&nested_array, limits).unwrap();
+    limits.max_depth = 1;
+    assert_invalid(&nested_array, limits, ErrorCode::DepthLimitExceeded);
+
+    let two_items = [0x82, 0x00, 0x01];
+    let mut limits = DecodeLimits::for_bytes(two_items.len());
+    limits.max_total_items = 2;
+    validate_canonical(&two_items, limits).unwrap();
+    limits.max_total_items = 1;
+    assert_invalid(&two_items, limits, ErrorCode::TotalItemsLimitExceeded);
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn accepts_nesting_beyond_inline_stack_capacity() {
+    let depth = 40usize;
+    let mut bytes = Vec::with_capacity(depth + 1);
+    bytes.extend(std::iter::repeat(0x81).take(depth));
+    bytes.push(0xf6);
+
+    let mut limits = DecodeLimits::for_bytes(bytes.len());
+    limits.max_depth = depth;
+    limits.max_total_items = depth + 1;
+    validate_canonical(&bytes, limits).unwrap();
+
+    limits.max_depth = depth - 1;
+    assert_invalid(&bytes, limits, ErrorCode::DepthLimitExceeded);
+}
+
+#[test]
+fn enforces_declared_length_limits_at_encoding_boundaries() {
+    let text_23 = tstr_encoded(23, b'a');
+    let text_24 = tstr_encoded(24, b'a');
+    let bytes_255 = bstr_encoded(&vec![0; 255]);
+    let bytes_256 = bstr_encoded(&vec![0; 256]);
+
+    let mut limits = DecodeLimits::for_bytes(text_24.len());
+    limits.max_text_len = 23;
+    validate_canonical(&text_23, limits).unwrap();
+    assert_invalid(&text_24, limits, ErrorCode::TextLenLimitExceeded);
+
+    let mut limits = DecodeLimits::for_bytes(bytes_256.len());
+    limits.max_bytes_len = 255;
+    validate_canonical(&bytes_255, limits).unwrap();
+    assert_invalid(&bytes_256, limits, ErrorCode::BytesLenLimitExceeded);
 }

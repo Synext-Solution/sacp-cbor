@@ -1,0 +1,5 @@
+error: `cbor(untagged)` is not part of the exact schema derive
+ --> tests/ui/ambiguous_untagged_enum.rs:4:8
+  |
+4 | #[cbor(untagged)]
+  |        ^^^^^^^^

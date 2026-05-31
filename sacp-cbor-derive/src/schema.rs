@@ -1,11 +1,14 @@
+use core::cmp::Ordering;
 use proc_macro2::Span;
-use syn::{spanned::Spanned, Attribute, DataEnum, Field, Fields, LitStr, Variant};
+use syn::{
+    spanned::Spanned, Attribute, DataEnum, Field, Fields, FieldsNamed, FieldsUnnamed,
+    GenericArgument, Ident, LitStr, Path, PathArguments, Type, Variant,
+};
 
 #[derive(Default, Clone)]
 pub(crate) struct CborFieldAttr {
     pub(crate) rename: Option<LitStr>,
     pub(crate) skip: bool,
-    pub(crate) default: bool,
 }
 
 #[derive(Default, Clone)]
@@ -23,7 +26,6 @@ pub(crate) struct CborEnumAttr {
 pub(crate) enum EnumTagging {
     #[default]
     External,
-    Untagged,
     Internal {
         tag: LitStr,
     },
@@ -31,6 +33,24 @@ pub(crate) enum EnumTagging {
         tag: LitStr,
         content: LitStr,
     },
+}
+
+pub(crate) struct NamedFieldSpec<'a> {
+    pub(crate) field: &'a Field,
+    pub(crate) ident: &'a Ident,
+    pub(crate) ty: &'a Type,
+    pub(crate) wire_key: Option<LitStr>,
+}
+
+pub(crate) struct TupleFieldSpec<'a> {
+    pub(crate) ty: &'a Type,
+    pub(crate) index: usize,
+}
+
+pub(crate) struct VariantSpec<'a> {
+    pub(crate) ident: &'a Ident,
+    pub(crate) fields: &'a Fields,
+    pub(crate) name: LitStr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +199,55 @@ fn split_words(value: &str) -> Vec<String> {
     words
 }
 
+fn path_might_be_self(path: &Path, self_ident: &Ident) -> bool {
+    let Some(last) = path.segments.last() else {
+        return false;
+    };
+    if last.ident != *self_ident {
+        return false;
+    }
+    if path.segments.len() == 1 {
+        return true;
+    }
+    path.segments
+        .iter()
+        .take(path.segments.len() - 1)
+        .all(|seg| matches!(seg.ident.to_string().as_str(), "crate" | "self" | "super"))
+}
+
+fn type_mentions_self(ty: &Type, self_ident: &Ident) -> bool {
+    match ty {
+        Type::Path(tp) => {
+            if tp.qself.is_none() && path_might_be_self(&tp.path, self_ident) {
+                return true;
+            }
+            if let Some(q) = &tp.qself {
+                if type_mentions_self(&q.ty, self_ident) {
+                    return true;
+                }
+            }
+            tp.path.segments.iter().any(|seg| match &seg.arguments {
+                PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                    GenericArgument::Type(inner) => type_mentions_self(inner, self_ident),
+                    _ => false,
+                }),
+                _ => false,
+            })
+        }
+        Type::Reference(tr) => type_mentions_self(&tr.elem, self_ident),
+        Type::Tuple(tt) => tt.elems.iter().any(|t| type_mentions_self(t, self_ident)),
+        Type::Array(ta) => type_mentions_self(&ta.elem, self_ident),
+        Type::Slice(ts) => type_mentions_self(&ts.elem, self_ident),
+        Type::Group(tg) => type_mentions_self(&tg.elem, self_ident),
+        Type::Paren(tp) => type_mentions_self(&tp.elem, self_ident),
+        _ => false,
+    }
+}
+
+pub(crate) fn type_needs_trait_bound(ty: &Type, self_ident: &Ident) -> bool {
+    !type_mentions_self(ty, self_ident)
+}
+
 pub(crate) fn ensure_no_cbor_attrs(attrs: &[Attribute], ctx: &str) -> syn::Result<()> {
     for a in attrs {
         if a.path().is_ident("cbor") {
@@ -206,11 +275,7 @@ pub(crate) fn parse_cbor_field_attrs(attrs: &[Attribute]) -> syn::Result<CborFie
                 return Ok(());
             }
             if meta.path.is_ident("default") {
-                if out.default {
-                    return Err(meta.error("duplicate `cbor(default)`"));
-                }
-                out.default = true;
-                return Ok(());
+                return Err(meta.error("`cbor(default)` is not part of the exact schema derive"));
             }
             if meta.path.is_ident("rename") {
                 if out.rename.is_some() {
@@ -220,15 +285,15 @@ pub(crate) fn parse_cbor_field_attrs(attrs: &[Attribute]) -> syn::Result<CborFie
                 out.rename = Some(lit);
                 return Ok(());
             }
-            Err(meta
-                .error("unsupported `cbor(...)` field attribute (allowed: rename, skip, default)"))
+            Err(meta.error("unsupported `cbor(...)` field attribute (allowed: rename, skip)"))
         })?;
     }
 
-    if out.skip && (out.rename.is_some() || out.default) {
+    if out.skip && out.rename.is_some() {
+        let span = out.rename.as_ref().map_or(Span::call_site(), LitStr::span);
         return Err(syn::Error::new(
-            Span::call_site(),
-            "`cbor(skip)` cannot be combined with `rename` or `default`",
+            span,
+            "`cbor(skip)` cannot be combined with `rename`",
         ));
     }
 
@@ -252,7 +317,7 @@ pub(crate) fn parse_cbor_variant_attrs(attrs: &[Attribute]) -> syn::Result<CborV
             }
             if meta.path.is_ident("skip") || meta.path.is_ident("default") {
                 return Err(
-                    meta.error("`cbor(skip)` / `cbor(default)` are not valid on enum variants")
+                    meta.error("`cbor(skip)` and `cbor(default)` are not valid on enum variants")
                 );
             }
             Err(meta.error("unsupported `cbor(...)` variant attribute (allowed: rename)"))
@@ -263,7 +328,6 @@ pub(crate) fn parse_cbor_variant_attrs(attrs: &[Attribute]) -> syn::Result<CborV
 
 pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnumAttr> {
     let mut seen_tagged = false;
-    let mut seen_untagged = false;
     let mut tag: Option<LitStr> = None;
     let mut content: Option<LitStr> = None;
     let mut rename_all: Option<RenameRule> = None;
@@ -274,11 +338,7 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("untagged") {
-                if seen_untagged {
-                    return Err(meta.error("duplicate `cbor(untagged)`"));
-                }
-                seen_untagged = true;
-                return Ok(());
+                return Err(meta.error("`cbor(untagged)` is not part of the exact schema derive"));
             }
             if meta.path.is_ident("tagged") {
                 if seen_tagged {
@@ -310,16 +370,9 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
                 return Ok(());
             }
             Err(meta.error(
-                "unsupported `cbor(...)` enum attribute (allowed: tagged, untagged, tag, content, rename_all)",
+                "unsupported `cbor(...)` enum attribute (allowed: tagged, tag, content, rename_all)",
             ))
         })?;
-    }
-
-    if seen_tagged && seen_untagged {
-        return Err(syn::Error::new(
-            Span::call_site(),
-            "cbor enum cannot be both tagged and untagged",
-        ));
     }
 
     if seen_tagged && (tag.is_some() || content.is_some()) {
@@ -329,24 +382,10 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
         ));
     }
 
-    if seen_untagged && (tag.is_some() || content.is_some()) {
-        return Err(syn::Error::new(
-            Span::call_site(),
-            "`cbor(untagged)` cannot be combined with `tag` or `content`",
-        ));
-    }
-
     if content.is_some() && tag.is_none() {
         return Err(syn::Error::new(
             Span::call_site(),
             "`cbor(content=...)` requires `cbor(tag=...)`",
-        ));
-    }
-
-    if seen_untagged && rename_all.is_some() {
-        return Err(syn::Error::new(
-            Span::call_site(),
-            "`cbor(rename_all=...)` is meaningless for `#[cbor(untagged)]` enums",
         ));
     }
 
@@ -359,9 +398,7 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
         }
     }
 
-    let tagging = if seen_untagged {
-        EnumTagging::Untagged
-    } else if let Some(tag) = tag {
+    let tagging = if let Some(tag) = tag {
         if let Some(content) = content {
             EnumTagging::Adjacent { tag, content }
         } else {
@@ -377,12 +414,129 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
     })
 }
 
-pub(crate) fn field_key(field: &Field) -> syn::Result<LitStr> {
-    let attr = parse_cbor_field_attrs(&field.attrs)?;
-    let ident = field.ident.as_ref().unwrap();
-    Ok(attr
-        .rename
-        .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span())))
+pub(crate) fn named_field_ident(field: &Field) -> syn::Result<&syn::Ident> {
+    field
+        .ident
+        .as_ref()
+        .ok_or_else(|| syn::Error::new(field.span(), "expected a named field"))
+}
+
+pub(crate) fn named_fields(fields: &FieldsNamed) -> syn::Result<Vec<NamedFieldSpec<'_>>> {
+    let mut seen = Vec::<String>::new();
+    let mut out = Vec::new();
+    for field in &fields.named {
+        let attr = parse_cbor_field_attrs(&field.attrs)?;
+        let ident = named_field_ident(field)?;
+        let wire_key = if attr.skip {
+            None
+        } else {
+            Some(
+                attr.rename
+                    .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span())),
+            )
+        };
+
+        if let Some(key) = &wire_key {
+            let value = key.value();
+            if seen.iter().any(|existing| existing == &value) {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!("duplicate CBOR field key `{value}`"),
+                ));
+            }
+            seen.push(value);
+        }
+
+        out.push(NamedFieldSpec {
+            field,
+            ident,
+            ty: &field.ty,
+            wire_key,
+        });
+    }
+    out.sort_by(|a, b| match (&a.wire_key, &b.wire_key) {
+        (Some(a), Some(b)) => cmp_field_keys(a, b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    });
+
+    Ok(out)
+}
+
+pub(crate) fn cmp_field_keys(a: &LitStr, b: &LitStr) -> Ordering {
+    let a = cbor_text_key_bytes(a);
+    let b = cbor_text_key_bytes(b);
+    match a.len().cmp(&b.len()) {
+        Ordering::Equal => a.cmp(&b),
+        other => other,
+    }
+}
+
+pub(crate) fn cbor_text_key_bytes(key: &LitStr) -> Vec<u8> {
+    let text = key.value();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len + 9);
+
+    if len < 24 {
+        out.push(0x60 | (len as u8));
+    } else if let Ok(len) = u8::try_from(len) {
+        out.extend_from_slice(&[0x78, len]);
+    } else if let Ok(len) = u16::try_from(len) {
+        out.push(0x79);
+        out.extend_from_slice(&len.to_be_bytes());
+    } else if let Ok(len) = u32::try_from(len) {
+        out.push(0x7a);
+        out.extend_from_slice(&len.to_be_bytes());
+    } else {
+        let len = len as u64;
+        out.push(0x7b);
+        out.extend_from_slice(&len.to_be_bytes());
+    }
+
+    out.extend_from_slice(bytes);
+    out
+}
+
+pub(crate) fn tuple_fields<'a>(
+    fields: &'a FieldsUnnamed,
+    ctx: &str,
+) -> syn::Result<Vec<TupleFieldSpec<'a>>> {
+    let mut out = Vec::new();
+    for (index, field) in fields.unnamed.iter().enumerate() {
+        ensure_no_cbor_attrs(&field.attrs, ctx)?;
+        out.push(TupleFieldSpec {
+            ty: &field.ty,
+            index,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn enum_variants(
+    data: &DataEnum,
+    rename_all: Option<RenameRule>,
+) -> syn::Result<Vec<VariantSpec<'_>>> {
+    let mut seen = Vec::<String>::new();
+    let mut out = Vec::new();
+    for variant in &data.variants {
+        let name = variant_name(variant, rename_all)?;
+        let value = name.value();
+        if seen.iter().any(|existing| existing == &value) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!("duplicate CBOR variant name `{value}`"),
+            ));
+        }
+        seen.push(value);
+        out.push(VariantSpec {
+            ident: &variant.ident,
+            fields: &variant.fields,
+            name,
+        });
+    }
+    Ok(out)
 }
 
 pub(crate) fn variant_name(
@@ -403,30 +557,20 @@ pub(crate) fn variant_name(
     Ok(LitStr::new(&name, variant.ident.span()))
 }
 
-pub(crate) fn variant_has_rename(variant: &Variant) -> syn::Result<bool> {
-    Ok(parse_cbor_variant_attrs(&variant.attrs)?.rename.is_some())
-}
-
 pub(crate) fn validate_internal_tagging(data: &DataEnum, tag: &LitStr) -> syn::Result<()> {
     for variant in &data.variants {
         match &variant.fields {
             Fields::Unnamed(_) => {
-                return Err(syn::Error::new(
-                    variant.span(),
-                    "`#[cbor(tag = ...)]` only supports unit and struct variants; use `#[cbor(tag = ..., content = ...)]` for tuple variants",
-                ));
+                return Err(internal_tagged_tuple_variant_error(variant.span()));
             }
             Fields::Named(fields) => {
-                for field in &fields.named {
-                    let attr = parse_cbor_field_attrs(&field.attrs)?;
-                    if attr.skip {
+                for field in named_fields(fields)? {
+                    let Some(key) = field.wire_key else {
                         continue;
-                    }
-
-                    let key = field_key(field)?;
+                    };
                     if key.value() == tag.value() {
                         return Err(syn::Error::new(
-                            field.span(),
+                            field.field.span(),
                             format!(
                                 "field key `{}` conflicts with internal enum tag `{}`",
                                 key.value(),
@@ -440,4 +584,11 @@ pub(crate) fn validate_internal_tagging(data: &DataEnum, tag: &LitStr) -> syn::R
         }
     }
     Ok(())
+}
+
+pub(crate) fn internal_tagged_tuple_variant_error(span: Span) -> syn::Error {
+    syn::Error::new(
+        span,
+        "`#[cbor(tag = ...)]` only supports unit and struct variants; use `#[cbor(tag = ..., content = ...)]` for tuple variants",
+    )
 }

@@ -1,7 +1,6 @@
-#![cfg(feature = "alloc")]
+#![cfg(all(feature = "derive", feature = "collections"))]
 
-use std::collections::BTreeSet;
-
+use sacp_cbor::bytes::BytesRef;
 use sacp_cbor::{
     cbor_bytes, decode, encode_to_vec, CanonicalCbor, CanonicalCborRef, CborDecode, CborEncode,
     DecodeLimits, ErrorCode,
@@ -27,6 +26,74 @@ fn derive_hygiene_works_with_local_result_alias() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn derive_decode_rejects_unknown_struct_fields() {
+    let bytes = cbor_bytes!({ ok: true, extra: 1 }).unwrap();
+    let err = decode::<AliasMsg>(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::UnknownField);
+}
+
+#[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
+struct RequiredOptionMsg {
+    optional: Option<u64>,
+}
+
+#[test]
+fn derive_decode_requires_explicit_option_fields() {
+    let explicit = cbor_bytes!({ optional: { some: 7 } }).unwrap();
+    let decoded: RequiredOptionMsg = decode(
+        explicit.as_bytes(),
+        DecodeLimits::for_bytes(explicit.as_bytes().len()),
+    )
+    .unwrap();
+    assert_eq!(decoded, RequiredOptionMsg { optional: Some(7) });
+
+    let missing = cbor_bytes!({}).unwrap();
+    let err = decode::<RequiredOptionMsg>(
+        missing.as_bytes(),
+        DecodeLimits::for_bytes(missing.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::MapLenMismatch);
+}
+
+#[test]
+fn option_unit_is_injective() {
+    let some = Some(());
+    let none: Option<()> = None;
+
+    let some_bytes = encode_to_vec(&some).unwrap();
+    let none_bytes = encode_to_vec(&none).unwrap();
+    assert_ne!(some_bytes, none_bytes);
+
+    let decoded_some: Option<()> =
+        decode(&some_bytes, DecodeLimits::for_bytes(some_bytes.len())).unwrap();
+    let decoded_none: Option<()> =
+        decode(&none_bytes, DecodeLimits::for_bytes(none_bytes.len())).unwrap();
+    assert_eq!(decoded_some, some);
+    assert_eq!(decoded_none, none);
+
+    let nested = Some(Some(()));
+    let nested_none = Some(None::<()>);
+    let nested_bytes = encode_to_vec(&nested).unwrap();
+    let nested_none_bytes = encode_to_vec(&nested_none).unwrap();
+    assert_ne!(nested_bytes, nested_none_bytes);
+
+    let decoded_nested: Option<Option<()>> =
+        decode(&nested_bytes, DecodeLimits::for_bytes(nested_bytes.len())).unwrap();
+    let decoded_nested_none: Option<Option<()>> = decode(
+        &nested_none_bytes,
+        DecodeLimits::for_bytes(nested_none_bytes.len()),
+    )
+    .unwrap();
+    assert_eq!(decoded_nested, nested);
+    assert_eq!(decoded_nested_none, nested_none);
+}
+
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
 struct FixedBytesMsg {
     id: [u8; 16],
@@ -49,37 +116,6 @@ fn fixed_byte_array_decode_requires_exact_length() {
     let bytes = [0x41u8, 0xAA];
     let err = decode::<[u8; 2]>(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
     assert_eq!(err.code, ErrorCode::ExpectedBytes);
-}
-
-#[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-struct SetMsg {
-    members: BTreeSet<u64>,
-}
-
-#[test]
-fn derive_roundtrip_for_btreeset() {
-    let mut members = BTreeSet::new();
-    members.insert(1);
-    members.insert(2);
-    members.insert(3);
-    let msg = SetMsg { members };
-
-    let bytes = encode_to_vec(&msg).unwrap();
-    let decoded: SetMsg = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
-    assert_eq!(decoded, msg);
-}
-
-#[test]
-fn btreeset_decode_rejects_non_canonical_set_order() {
-    let unsorted = [0x82u8, 0x02, 0x01];
-    let err =
-        decode::<BTreeSet<u64>>(&unsorted, DecodeLimits::for_bytes(unsorted.len())).unwrap_err();
-    assert_eq!(err.code, ErrorCode::NonCanonicalSetOrder);
-
-    let duplicate = [0x82u8, 0x01, 0x01];
-    let err =
-        decode::<BTreeSet<u64>>(&duplicate, DecodeLimits::for_bytes(duplicate.len())).unwrap_err();
-    assert_eq!(err.code, ErrorCode::NonCanonicalSetOrder);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CborEncode, CborDecode)]
@@ -109,4 +145,107 @@ fn decode_canonical_ref_borrows_current_item_bytes() {
     let decoded: CanonicalCborRef<'_> =
         decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     assert_eq!(decoded.as_bytes(), &bytes);
+}
+
+#[derive(Debug, PartialEq, Eq, CborDecode)]
+struct BorrowedMsg<'a> {
+    name: &'a str,
+    payload: BytesRef<'a>,
+}
+
+#[test]
+fn derive_decode_borrowed_fields() {
+    let bytes = cbor_bytes!({ name: "ana", payload: b"xy" }).unwrap();
+    let decoded: BorrowedMsg<'_> = decode(
+        bytes.as_bytes(),
+        DecodeLimits::for_bytes(bytes.as_bytes().len()),
+    )
+    .unwrap();
+    assert_eq!(decoded.name, "ana");
+    assert_eq!(decoded.payload.as_slice(), b"xy");
+}
+
+#[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
+struct GenericMsg<T> {
+    value: T,
+}
+
+#[test]
+fn derive_roundtrip_for_generic_struct() {
+    let msg = GenericMsg { value: 7u64 };
+    let bytes = encode_to_vec(&msg).unwrap();
+    let decoded: GenericMsg<u64> = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    assert_eq!(decoded, msg);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CborEncode, CborDecode)]
+struct RecursiveNode {
+    value: u64,
+    children: Vec<RecursiveNode>,
+}
+
+#[test]
+fn derive_roundtrip_for_recursive_type() {
+    let node = RecursiveNode {
+        value: 1,
+        children: vec![RecursiveNode {
+            value: 2,
+            children: Vec::new(),
+        }],
+    };
+    let bytes = encode_to_vec(&node).unwrap();
+    let decoded: RecursiveNode = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    assert_eq!(decoded, node);
+}
+
+#[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
+struct SkipMsg {
+    id: u64,
+    #[cbor(skip)]
+    transient: bool,
+    count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
+struct SkipKeyReuseMsg {
+    #[cbor(skip)]
+    wire: bool,
+    #[cbor(rename = "wire")]
+    value: u64,
+}
+
+#[test]
+fn derive_skip_fields_and_requires_present_values() {
+    let msg = SkipMsg {
+        id: 3,
+        transient: true,
+        count: 9,
+    };
+    let bytes = encode_to_vec(&msg).unwrap();
+    let expected = cbor_bytes!({ id: 3, count: 9 }).unwrap();
+    assert_eq!(bytes, expected.as_bytes());
+
+    let missing = cbor_bytes!({ id: 3 }).unwrap();
+    let err = decode::<SkipMsg>(
+        missing.as_bytes(),
+        DecodeLimits::for_bytes(missing.as_bytes().len()),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::MapLenMismatch);
+
+    let reuse = SkipKeyReuseMsg {
+        wire: true,
+        value: 7,
+    };
+    let bytes = encode_to_vec(&reuse).unwrap();
+    let expected = cbor_bytes!({ wire: 7 }).unwrap();
+    assert_eq!(bytes, expected.as_bytes());
+    let decoded: SkipKeyReuseMsg = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    assert_eq!(
+        decoded,
+        SkipKeyReuseMsg {
+            wire: false,
+            value: 7
+        }
+    );
 }

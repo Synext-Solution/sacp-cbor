@@ -12,10 +12,10 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 
 - **Validate** that an input is a *single, canonical* CBOR item under a strict profile (`validate_canonical`).
 - Wrap validated bytes as `CanonicalCborRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
-- Optionally **decode** into Rust types via serde `from_slice` (`serde` + `alloc`).
-- **Encode canonical CBOR** directly (`Encoder`, `MapEncoder`, `ArrayEncoder`) (`alloc`).
-- Build canonical bytes with the **fallible** `cbor_bytes!` macro (`alloc`).
-- **Patch/edit** canonical bytes without decoding the whole structure (`Editor`) (`alloc`).
+- Optionally **decode** into Rust types via `sacp_cbor::serde::from_slice` (`serde`).
+- **Encode canonical CBOR** directly (`Encoder`, `encode::MapEncoder`, `encode::ArrayEncoder`) (`alloc`).
+- Build canonical bytes with the **fallible** `cbor_bytes!` macro (`derive`).
+- **Patch/edit** canonical bytes without decoding the whole structure (`edit::Editor`) (`edit`).
 - Optional:
   - **serde** conversion utilities (`serde`).
   - **SHA-256** helpers for canonical bytes / canonical-encoded values (`sha2`).
@@ -43,17 +43,22 @@ This crate enforces a strict “canonical profile”:
 
 If you need tags beyond bignums, indefinite lengths, non-text map keys, half/float32 encodings, etc., this crate is the wrong tool.
 
+The maintained wire/profile contract lives in [`SPEC.md`](SPEC.md).
+
 ---
 
 ## Feature flags
 
-This crate is `no_std` by default unless `std` is enabled.
+This crate supports `no_std` when default features are disabled. Default features enable `std` and `derive`; `std` enables `alloc`.
 
 | Feature | Enables | Notes |
 |---|---|---|
-| `std` | `std::error::Error` for `CborError` | Otherwise `no_std` |
-| `alloc` | Owned types + encoding + editor + macros | Required for `CanonicalCbor`, `Encoder`, `Editor`, `cbor_bytes!` |
-| `serde` | serde integration (`to_vec`, `from_slice`, etc.) | Requires `alloc` in practice; enables owned decoding via `from_slice` |
+| `std` | `std::error::Error` for `CborError` + `alloc` APIs | Otherwise `no_std` |
+| `alloc` | Owned types + encoding | Required for `CanonicalCbor` and `Encoder` |
+| `derive` | `#[derive(CborEncode, CborDecode)]` + `cbor_bytes!` | Requires `alloc`; enabled by default |
+| `collections` | Native collection impls + `collections::MapEntries` | Requires `alloc` |
+| `edit` | Structural patching under `sacp_cbor::edit` | Requires `alloc` |
+| `serde` | serde integration under `sacp_cbor::serde` | Requires `alloc` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
 | `simdutf8` | Faster UTF-8 validation | Optional SIMD validation, same semantics |
 | `unsafe` | Unchecked UTF-8 for canonical-trusted reads | Uses `unsafe` only for canonical-validated inputs |
@@ -63,19 +68,19 @@ This crate is `no_std` by default unless `std` is enabled.
 **Default Rust (std + alloc):**
 ```toml
 [dependencies]
-sacp-cbor = "0.5"
+sacp-cbor = "0.13"
 ```
 
 **`no_std` + `alloc`:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.5", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.13", default-features = false, features = ["alloc"] }
 ```
 
-**`no_std` + `alloc` + serde + sha2:**
+**`std` + serde + sha2:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.5", default-features = false, features = ["alloc", "serde", "sha2"] }
+sacp-cbor = { version = "0.13", default-features = false, features = ["std", "serde", "sha2"] }
 ```
 
 > In Rust code the crate name is typically `sacp_cbor` (hyphen becomes underscore).
@@ -110,7 +115,7 @@ The safe integer range is:
 - `MIN_SAFE_INTEGER = -(2^53 - 1)`
 - `MAX_SAFE_INTEGER = +(2^53 - 1)`
 
-Constants are exported:
+Constants are exported from `sacp_cbor::profile`:
 
 - `MAX_SAFE_INTEGER: u64`
 - `MAX_SAFE_INTEGER_I64: i64`
@@ -156,7 +161,7 @@ fn main() -> Result<(), sacp_cbor::CborError> {
   let canon = validate_canonical(input, limits)?;
 
   // From here on you can do zero-copy queries:
-  println!("validated {} bytes", canon.len());
+  println!("validated {} bytes", canon.as_bytes().len());
   Ok(())
 }
 ```
@@ -171,15 +176,15 @@ fn main() -> Result<(), sacp_cbor::CborError> {
 ### 2) Zero-copy query into a validated document
 
 ```rust
-use sacp_cbor::{path, validate_canonical, DecodeLimits};
+use sacp_cbor::{query::PathElem, validate_canonical, DecodeLimits};
 
 fn main() -> Result<(), sacp_cbor::CborError> {
   let bytes: &[u8] = /* canonical bytes */;
 
   let canon = validate_canonical(bytes, DecodeLimits::for_bytes(bytes.len()))?;
 
-  // Navigate: root -> ["user"] -> ["id"]
-  if let Some(id_ref) = canon.at(path!("user", "id"))? {
+  let path = [PathElem::Key("user"), PathElem::Key("id")];
+  if let Some(id_ref) = canon.at(&path)? {
     let id = id_ref.integer()?.as_i64(); // Option<i64>, None if big integer
     println!("user.id: {id:?}");
   }
@@ -228,23 +233,14 @@ Use `DecodeLimits::for_bytes(max_message_bytes)` for a reasonable baseline:
 - Prevents “CBOR bombs” (huge containers, deeply nested data).
 - Controls worst-case time and memory for validation and decoding.
 
-### `CborLimits`
-
-If you need two distinct policies (e.g., “message” vs “state”):
-
-```rust
-use sacp_cbor::CborLimits;
-
-let limits = CborLimits::new(1_000_000, 16_384)?;
-let msg = limits.message_limits();
-let state = limits.state_limits();
-```
+Use separate `DecodeLimits` and `EncodeLimits` values for distinct budgets. The core exposes only
+the primitive limit types; protocol-specific pairings belong at the protocol layer.
 
 ---
 
 ## Zero-copy query API
 
-All query APIs operate on **validated canonical bytes** (via `CanonicalCborRef` / `CanonicalCbor`) and return lightweight views (`CborValueRef`) into the underlying buffer.
+All query APIs operate on **validated canonical bytes** (via `CanonicalCborRef` / `CanonicalCbor`) and return lightweight views from `sacp_cbor::query` into the underlying buffer.
 
 ### `CanonicalCborRef<'a>`
 
@@ -255,9 +251,6 @@ How you obtain it:
 Key methods:
 
 - `as_bytes() -> &'a [u8]` (`O(1)`)
-- `len() -> usize` (`O(1)`)
-- `is_empty() -> bool` (`O(1)`)
-- `bytes_eq(other) -> bool` (`O(n)` compare)
 - `root() -> CborValueRef<'a>` (`O(1)`)
 - `at(path: &[PathElem]) -> Result<Option<CborValueRef>, CborError>`
 
@@ -275,25 +268,29 @@ Optional:
 How you obtain it:
 
 - `CanonicalCbor::from_slice(bytes, limits)` validates + copies
-- or from an `Encoder` (`into_canonical()`)
-- or from an `Editor::apply()`
+- or from an `Encoder` (`finish()`)
+- or from an `edit::Editor::apply()`
 
 Key methods:
 
 - `as_bytes() -> &[u8]` (`O(1)`)
 - `into_bytes() -> Vec<u8>` (`O(1)` move)
-- `bytes_eq(&other) -> bool` (`O(n)`)
 - `root()/at(...)` same as `CanonicalCborRef`
 - `sha256()` (`sha2`) — `O(n)`
 - `edit(...)` (`alloc`) — see “Editing”
 
-### `PathElem` and `path!`
+### `PathElem`
 
 ```rust
-use sacp_cbor::{PathElem, path};
+use sacp_cbor::query::PathElem;
 
-let p1: &[PathElem] = path!("a", "b", 0, "c"); // keys and indices
-let p2: &[PathElem] = &[PathElem::Key("a"), PathElem::Index(0)];
+let p1 = [
+  PathElem::Key("a"),
+  PathElem::Key("b"),
+  PathElem::Index(0),
+  PathElem::Key("c"),
+];
+let p2 = [PathElem::Key("a"), PathElem::Index(0)];
 ```
 
 - `PathElem::Key(&str)`
@@ -301,7 +298,7 @@ let p2: &[PathElem] = &[PathElem::Key("a"), PathElem::Index(0)];
 
 **Complexity**
 
-- Path construction is compile-time for literals; runtime cost is trivial.
+- Path construction is ordinary slice/array construction; traversal cost dominates.
 - Query traversal cost depends on containers traversed.
 
 ### `CborValueRef<'a>`
@@ -312,8 +309,7 @@ Key methods (behavior + complexity):
 
 - `as_bytes() -> &'a [u8]` — `O(1)`
 - `offset() -> usize` — `O(1)` (byte offset in the original buffer)
-- `len() -> usize` — `O(1)`
-- `is_empty() -> bool` — `O(1)`
+- `byte_len() -> usize` — `O(1)`
 
 Type/category inspection:
 
@@ -336,7 +332,7 @@ Container access:
 
 Scalar decoding (zero-copy where possible):
 
-- `integer() -> Result<CborIntegerRef<'a>, CborError>`
+- `integer() -> Result<IntegerRef<'a>, CborError>`
 
   - Returns `Safe(i64)` or `Big(BigIntRef)`
   - Time: `O(1)` + reads magnitude bytes for bigints
@@ -383,14 +379,14 @@ Multi-key lookup:
 These functions:
 
 - validate key sizes
-- internally sort an index array by canonical key encoding
+- require keys to be strictly increasing by canonical key encoding
 - scan the map once (merge-like scan)
 
 **Complexity**
 
-- Time: `O(k log k * L + bytes scanned in map)`
+- Time: `O(k * L + bytes scanned in map)`
   where `k = N`, `L` = average key length used in comparisons.
-- Space: `O(k)` (small fixed arrays)
+- Space: `O(k)` for the fixed output array; `get_many_sorted_into` is allocation-free
 
 Dynamic multi-key lookup (`alloc`):
 
@@ -398,10 +394,13 @@ Dynamic multi-key lookup (`alloc`):
 - `require_many(keys: &[&str]) -> Result<Vec<CborValueRef>>, CborError>`
 - `get_many_into(keys, out)` (writes into caller-provided slice)
 
+These accept keys in any order, allocate an index vector, sort by canonical key order, and preserve
+the input key order in the result.
+
 **Complexity**
 
 - Time: `O(k log k * L + bytes scanned in map)`
-- Space: `O(k)` for sorting indices (unless you provide your own pre-sorted list and use `extras_sorted` patterns)
+- Space: `O(k)` for sorting indices
 
 Iteration:
 
@@ -441,10 +440,12 @@ Obtain via `CborValueRef::array()?`.
 
 ---
 
-### `CborInteger` / `BigInt` / `F64Bits`
+### `Integer` / `BigInt` / `F64Bits`
 
-- `CborInteger::safe(i64) -> Result<CborInteger, CborError>`
-- `CborInteger::big(negative, magnitude: Vec<u8>) -> Result<CborInteger, CborError>`
+These wrappers live under `sacp_cbor::value` and `sacp_cbor::scalar`.
+
+- `Integer::safe(i64) -> Result<Integer, CborError>`
+- `Integer::big(negative, magnitude: Vec<u8>) -> Result<Integer, CborError>`
 - `BigInt::new(negative, magnitude: Vec<u8>) -> Result<BigInt, CborError>`
 
   - magnitude must be canonical and outside safe range
@@ -464,12 +465,13 @@ If you want to produce canonical CBOR bytes directly, use `Encoder`.
 Create:
 
 - `Encoder::new()`
-- `Encoder::with_capacity(usize)`
+- `Encoder::try_with_capacity(usize) -> Result<Encoder, CborError>`
+- `Encoder::with_limits(EncodeLimits) -> Result<Encoder, CborError>`
+- `Encoder::try_with_capacity_and_limits(usize, EncodeLimits) -> Result<Encoder, CborError>`
 
 Extract:
 
-- `into_vec() -> Vec<u8>` (not wrapped/validated)
-- `into_canonical() -> CanonicalCbor` (assumes you used encoder correctly)
+- `finish() -> Result<CanonicalCbor, CborError>` (proves exactly one complete root value)
 - `as_bytes() -> &[u8]` (current buffer)
 
 Write scalars:
@@ -482,15 +484,18 @@ Write scalars:
 
 Write composites:
 
-- `array(len, |&mut ArrayEncoder| ...)`
-- `map(len, |&mut MapEncoder| ...)`
+- `array(len, |arr| ...)`
+- `map(len, |map| ...)`
 
 Raw splice:
 
 - `raw_cbor(CanonicalCborRef)` (copies bytes as-is into output)
 - `raw_value_ref(CborValueRef)` (copies bytes as-is into output)
 
-**Key rule:** When emitting maps via `Encoder::map`, you must insert entries in **canonical key order** using `MapEncoder::entry`. The encoder enforces this and will error if you violate it.
+Limited encoders enforce output bytes, depth, item count, array/map length, and bytes/text length
+before accepting writes. Raw splices are scanned against those limits before copying.
+
+**Key rule:** When emitting maps via `Encoder::map`, you must insert entries in **canonical key order** using `map.entry`. The encoder enforces this and will error if you violate it.
 
 **Complexity**
 
@@ -502,7 +507,7 @@ Raw splice:
 
   - Additional time: `O(total key bytes)` across all entries
 
-### `MapEncoder::entry`
+### `encode::MapEncoder::entry`
 
 Signature:
 
@@ -532,7 +537,7 @@ Errors you may see:
 
 - Per entry: `O(key_len + value_bytes)` + ordering compare `O(key_len)`
 
-### `ArrayEncoder`
+### `encode::ArrayEncoder`
 
 You must write exactly `len` items; otherwise:
 
@@ -544,7 +549,7 @@ You must write exactly `len` items; otherwise:
 
 ---
 
-## Macros (`alloc`)
+## Macros (`derive`)
 
 ### `cbor_bytes!` — build canonical bytes directly (fallible)
 
@@ -580,7 +585,7 @@ let out = cbor_bytes!([canon, 1, 2, 3])?; // array whose first element is the ex
 
 - Time: `O(output_bytes)`
 - Space: output buffer
-- Map order enforcement: same as `Encoder`/`MapEncoder`
+- Map order enforcement: same as `Encoder`/`encode::MapEncoder`
 
 ---
 
@@ -591,102 +596,83 @@ The editor applies a set of mutations to an existing canonical document and emit
 ### High-level semantics
 
 - The input must be canonical (you start from `CanonicalCborRef` or `CanonicalCbor`).
-- Operations are specified by a **non-empty path** (`&[PathElem]`).
-
-  - You cannot “replace the root value” via an empty path.
-- Map edits can insert/delete keys; arrays support structural edits via splices.
+- Map edits use a path whose terminal element is `PathElem::Key`.
+- Array replacements/deletes use a path whose terminal element is `PathElem::Index`.
+- Array insertions and range edits use `Editor::splice` against an array path; `&[]` targets the root array.
+- Root replacement is not an editor operation.
+- `PatchValue::Encoded` inserts owned canonical bytes; `PatchValue::Raw` reuses a value reference from the source document.
 - Array indices in edit paths are interpreted against the **original** array (before edits).
 
 ### Getting an editor
 
 ```rust
-use sacp_cbor::{validate_canonical, DecodeLimits, path};
+use sacp_cbor::edit::{DeleteMode, PatchValue, SetMode};
+use sacp_cbor::query::PathElem;
+use sacp_cbor::{encode_to_canonical, validate_canonical, DecodeLimits};
 
 let bytes: &[u8] = /* canonical */;
 let canon = validate_canonical(bytes, DecodeLimits::for_bytes(bytes.len()))?;
 
 let edited = canon.edit(|ed| {
-ed.set(path!("user", "name"), "alice")?;
-ed.delete_if_present(path!("legacy"))?;
-Ok(())
+    ed.set(
+        &[PathElem::Key("user"), PathElem::Key("name")],
+        SetMode::Upsert,
+        PatchValue::Encoded(encode_to_canonical(&"alice")?),
+    )?;
+    ed.delete(&[PathElem::Key("temporary")], DeleteMode::IfPresent)?;
+    Ok(())
 })?;
 ```
 
 Or with owned bytes:
 
 ```rust
-use sacp_cbor::{CanonicalCbor, DecodeLimits, path};
+use sacp_cbor::edit::{PatchValue, SetMode};
+use sacp_cbor::query::PathElem;
+use sacp_cbor::{encode_to_canonical, CanonicalCbor, DecodeLimits};
 
 let owned = CanonicalCbor::from_slice(/*...*/, DecodeLimits::for_bytes(/*...*/))?;
 let updated = owned.edit(|ed| {
-ed.replace(path!("counter"), 42i64)?;
-Ok(())
+    ed.set(
+        &[PathElem::Key("counter")],
+        SetMode::ReplaceOnly,
+        PatchValue::Encoded(encode_to_canonical(&42i64)?),
+    )?;
+    Ok(())
 })?;
 ```
 
-### `EditOptions`
-
-```rust
-use sacp_cbor::EditOptions;
-
-ed.options_mut().create_missing_maps = true;
-```
-
-- `create_missing_maps: bool`
-
-  - If `true`, missing **map** keys along the path may be created as new (empty or partially filled) maps.
-  - This only creates **maps**, not arrays, and only when the editor can prove the needed structure.
-
 ### `Editor` operations
 
-All return `Result<(), CborError>`.
+All mutating operations return `Result<(), CborError>`.
 
-Set operations:
-
-- `set(path, value)` → Upsert semantics (arrays: replace element)
-- `insert(path, value)` → InsertOnly (maps: error if key exists; arrays: insert before index)
-- `replace(path, value)` → ReplaceOnly (maps: error if missing; arrays: replace element)
-- `set_raw(path, CborValueRef)` → splice a raw value reference from the source document
-- `set_encoded(path, |enc| { ... })` → compute the new value by encoding exactly one CBOR item
-
-Delete operations:
-
-- `delete(path)` → must exist (arrays: index must be in bounds)
-- `delete_if_present(path)` → no error if missing (arrays: ignore out-of-bounds)
-
-Array splices:
-
-- `splice(array_path, pos, delete)` → returns a builder to insert values at `pos`
-- `push(array_path, value)` / `push_encoded(array_path, |enc| ...)` → append to end
+- `set(path, SetMode, PatchValue)` inserts or replaces a map key, or replaces an existing array item.
+- `delete(path, DeleteMode)` deletes a map key or array item.
+- `splice(array_path, Splice)` inserts and/or deletes a contiguous array range.
 
 Finalize:
 
 - `apply(self) -> Result<CanonicalCbor, CborError>`
 
-### Supported value types for edits (`EditEncode`)
+### Supported value types for edits
 
-The editor accepts any `T: EditEncode` for `set/insert/replace`. `EditEncode` is sealed; only the
-types listed below are supported.
+The editor accepts `PatchValue`:
 
-Implemented out of the box:
+- `PatchValue::Encoded(CanonicalCbor)` for newly encoded values.
+- `PatchValue::Raw(CborValueRef)` for reusing an existing canonical sub-value from the source.
 
-- `bool`, `()`
-- `&str`, `String`
-- `&[u8]`, `Vec<u8>`
-- `f32`, `f64`, `F64Bits`
-- `i64`, `u64`, `i128`, `u128` (bignum encoding when outside safe range)
-- `CanonicalCborRef`, `CanonicalCbor`, `&CanonicalCbor`
+Use `encode_to_canonical(&value)` to turn any `T: CborEncode` into `PatchValue::Encoded`.
 
 **Complexity**
 
-- Converting `T` into an edit value usually means encoding a single CBOR item:
+- Building `PatchValue::Encoded` means encoding a single CBOR item:
 
   - Time: `O(encoded_bytes_of_value)`
-  - Space: may allocate a `Vec<u8>` for the encoded item unless you pass a `CanonicalCborRef`/`&CanonicalCbor`.
+  - Space: may allocate a `Vec<u8>` for the encoded item; use raw insertion when you already have a canonical value reference.
 
 ### Editor limitations (must-read)
 
-- **No empty path**: attempting to edit the root directly yields `InvalidQuery`.
+- **No root replacement**: map and array edits target containers inside the root; use encoding APIs to build a new root value.
 - **Array indices are relative to the original array** (before edits).
 - **Splice constraints**:
 
@@ -694,16 +680,13 @@ Implemented out of the box:
   - Splices must not overlap; overlapping splices or edits inside deleted ranges yield `PatchConflict`.
 - **Patch conflicts**:
 
-  - Two operations that overlap (e.g., set `["a"]` and also set `["a","b"]`) yield `PatchConflict`.
+  - Two operations that overlap (e.g., replacing map key `a` and also editing inside `a`) yield `PatchConflict`.
 - **Missing key semantics in maps**:
 
-  - `replace` on a missing key → `MissingKey`
-  - `delete` on a missing key → `MissingKey`
-  - `delete_if_present` on missing key → OK
-  - nested edits on missing keys:
-
-    - if `create_missing_maps = true`, the editor may create missing maps
-    - otherwise → `MissingKey`
+  - `set(..., SetMode::ReplaceOnly, ...)` on a missing key returns `MissingKey`
+  - `delete(..., DeleteMode::Require)` on a missing key returns `MissingKey`
+  - `delete(..., DeleteMode::IfPresent)` on a missing key succeeds
+  - nested edits on missing keys → `MissingKey`
 
 ### Editor performance / complexity
 
@@ -731,12 +714,12 @@ Applying an editor:
 
 ### Convert Rust types ↔ canonical CBOR bytes
 
-- `to_vec<T: Serialize>(&T) -> Result<Vec<u8>, CborError>`
-- `from_slice<T: DeserializeOwned>(bytes, limits) -> Result<T, CborError>`
+- `serde::to_vec<T: Serialize>(&T) -> Result<Vec<u8>, CborError>`
+- `serde::from_slice<T: DeserializeOwned>(bytes, limits) -> Result<T, CborError>`
 
 ```rust
 use serde::{Serialize, Deserialize};
-use sacp_cbor::{to_vec, from_slice, DecodeLimits};
+use sacp_cbor::{serde::{from_slice, to_vec}, DecodeLimits};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Msg {
@@ -751,13 +734,18 @@ let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 assert_eq!(decoded, msg);
 ```
 
-### Borrowed deserialization helpers
+For map types whose iteration order is not already canonical, opt into sorted map encoding:
 
-- `from_slice_borrowed<T: Deserialize>(bytes, limits) -> Result<T, CborError>`
+```rust
+use sacp_cbor::serde::SerdeOptions;
+
+let bytes = SerdeOptions::sorted_maps().to_vec(&msg)?;
+```
 
 ### Serde limitations (important)
 
 - Map keys must serialize as **text** (`&str`/`String`/`char` etc). Non-string keys fail with `MapKeyMustBeText`.
+- Serde `Option<T>` uses the same injective `{ "none": null }` / `{ "some": value }` shape as native `Option<T>`.
 - Integer support via serde is limited to what serde exposes:
 
   - Very large bignums (more than 128 bits) cannot be losslessly represented through serde numeric primitives.
@@ -800,9 +788,9 @@ pub struct CborError {
 - Canonical encoding violations:
 
   - `NonCanonicalEncoding`, `IndefiniteLengthForbidden`, `ReservedAdditionalInfo`, `TrailingBytes`
-- Map/set rules:
+- Map rules:
 
-  - `MapKeyMustBeText`, `DuplicateMapKey`, `NonCanonicalMapOrder`, `NonCanonicalSetOrder`
+  - `MapKeyMustBeText`, `DuplicateMapKey`, `NonCanonicalMapOrder`
 - Integers / tags:
 
   - `IntegerOutsideSafeRange`, `ForbiddenOrMalformedTag`, `BignumNotCanonical`, `BignumMustBeOutsideSafeRange`
@@ -831,50 +819,42 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 ### Validation & limits
 
-- `validate(bytes, limits) -> Result<(), CborError>`
-
-  - Validates canonical + single item.
-  - Time: `O(n)`, Space: `O(d)`
-
 - `validate_canonical(bytes, limits) -> Result<CanonicalCborRef, CborError>`
 
-  - Same as `validate`, but returns a typed wrapper.
+  - Validates canonical + single item and returns a typed wrapper.
   - Time: `O(n)`, Space: `O(d)`
 
 - `DecodeLimits::for_bytes(max_message_bytes) -> DecodeLimits`
 
   - Convenience baseline limits.
 
-- `CborLimits::new(max_message_bytes, max_state_bytes) -> Result<CborLimits, CborError>`
+- `EncodeLimits::for_bytes(max_output_bytes) -> EncodeLimits`
 
-  - Enforces `max_state_bytes <= max_message_bytes`.
-
-- `CborLimits::{message_limits,state_limits}() -> DecodeLimits`
-
-  - Derives `DecodeLimits` for each budget.
+  - Convenience baseline limits for `Encoder::with_limits`.
 
 ### Typed decode/encode
 
 - `decode(bytes, limits) -> Result<T, CborError>`
-- `decode_canonical(canon_ref) -> Result<T, CborError>`
-- `decode_canonical_owned(&canon) -> Result<T, CborError>` (`alloc`)
+- `decode_canonical(canon_ref, limits) -> Result<T, CborError>`
 - `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)
 - `encode_to_canonical(&value) -> Result<CanonicalCbor, CborError>` (`alloc`)
-- `encode_into(&mut Encoder, &value) -> Result<(), CborError>` (`alloc`)
+- `CborEncode::encode_array_item` lets custom encoders use `ArrayEncoder` directly for array elements; the default path remains guarded.
 
 Common trait coverage for derive-driven models includes:
 
+- byte strings: `bytes::Bytes` / `bytes::BytesRef`
+- explicit optional values: `Option<T>` using `{ "none": null }` or `{ "some": value }`
+- arrays: `Vec<T>` (`collections`)
+- maps: `MapEntries<K, V>` for encode/decode; `BTreeMap` and `HashMap` are encode-only conveniences
 - fixed byte arrays: `[u8; N]` (CBOR byte strings with exact-length decode checks)
-- ordered sets: `BTreeSet<T>` (`alloc`; canonical deterministic order, strict order validation on decode)
 - canonical wrappers: `CanonicalCborRef<'a>` and `CanonicalCbor` (`alloc`)
 
 ### Bytes wrappers
 
 - `CanonicalCborRef<'a>` (borrowed)
 
-  - `as_bytes/len/is_empty/root` — `O(1)`
-  - `bytes_eq` — `O(n)`
-  - `at(path)` — `O(bytes scanned)`
+  - `as_bytes/root` — `O(1)`
+- `at(path)` — `O(bytes scanned)`
   - `sha256` (`sha2`) — `O(n)`
   - `to_owned` (`alloc`) — `O(n)` alloc+copy
   - `editor/edit` (`alloc`) — see editing
@@ -887,22 +867,20 @@ Common trait coverage for derive-driven models includes:
 
 ### Query types
 
-- `PathElem`: `Key(&str)` / `Index(usize)`
+- `query::PathElem`: `Key(&str)` / `Index(usize)`
 
-- `path!()` macro: builds `&[PathElem]` slice
-
-- `CborValueRef<'a>`
+- `query::CborValueRef<'a>`
 
   - scalar reads: mostly `O(1)` (text is `O(len)`)
   - container queries: `O(bytes scanned)`
 
-- `MapRef<'a>`
+- `query::MapRef<'a>`
 
   - `get/require`: `O(bytes scanned until match/early-exit)`
-  - multi-key lookups: `O(k log k + bytes scanned)`
+  - sorted multi-key lookups: `O(k + bytes scanned)`; unsorted `alloc` lookups sort first
   - iter/extras: `O(bytes in map)` (+ optional key sorting costs)
 
-- `ArrayRef<'a>`
+- `query::ArrayRef<'a>`
 
   - `get`: `O(bytes scanned up to index)`
   - `iter`: `O(bytes in array)`
@@ -914,28 +892,29 @@ Common trait coverage for derive-driven models includes:
   - streaming canonical CBOR output
   - maps require canonical key order; enforced
 
-- `ArrayEncoder`, `MapEncoder`
+- `encode::ArrayEncoder`, `encode::MapEncoder`
 
   - enforce arity + map canonical ordering
 
-### Editing (`alloc`)
+### Editing (`edit`)
 
-- `Editor`
+- `edit::Editor`
 
-  - set/insert/replace/delete semantics with conflict detection
-  - array indices refer to the original array; cannot edit root via empty path
+  - `set`, `delete`, `splice`, and `apply` with conflict detection
+  - array indices refer to the original array
   - Time: `O(n + Σ(u log u))` worst-case
 
-### Macros (`alloc`)
+### Macros (`derive`)
 
 - `cbor_bytes!` → `Result<CanonicalCbor, CborError>`
 
-  - no sorting; order must already be canonical
+  - literal map entries are sorted into canonical order at macro expansion
 
 ### Serde (`serde` + `alloc`)
 
-- `to_vec`, `from_slice`, `from_slice_borrowed`
-- `from_canonical_bytes_ref`, `from_canonical_bytes` (for already-validated canonical bytes)
+- `serde::to_vec`, `serde::from_slice`
+- `serde::from_canonical_bytes_ref`, `serde::from_canonical_bytes` (for already-validated canonical bytes)
+- `serde::SerdeOptions` for sorted-map encoding
 - numeric bignums are limited to `i128/u128` roundtrips through serde
 
 ---
@@ -953,17 +932,20 @@ Common trait coverage for derive-driven models includes:
   `CanonicalCborRef::edit` / `CanonicalCbor::edit`
 
 - **You need serde:**
-  `to_vec/from_slice` (or `from_slice_borrowed` when you want borrows)
+  `serde::to_vec` / `serde::from_slice`
 - **You already validated canonical bytes and want struct decode:**
-  `from_canonical_bytes_ref` / `from_canonical_bytes`
+  `serde::from_canonical_bytes_ref` / `serde::from_canonical_bytes`
 
 ---
 
 ## Notes for maintainers / auditors
 
-- `unsafe` is forbidden (`#![forbid(unsafe_code)]`).
+- `unsafe` is forbidden unless the `unsafe` feature is enabled for canonical-trusted UTF-8 reads.
 - The validator is intentionally strict and rejects many CBOR features by design.
 - All offset-bearing errors aim to point at the byte position where the violation is detected (serde conversions generally return offset 0).
+- Bounded Kani proof harnesses for integer minimality, checked primitive decoding, profile
+  classifiers, canonical key comparators, and encoder slot rollback are compiled under `cfg(kani)`.
+  Run `scripts/proof.sh` on a Kani-supported host after installing and setting up `cargo-kani`.
 
 ---
 

@@ -1,3 +1,5 @@
+//! Owned value wrapper types for native SACP-CBOR/1 integer domains.
+
 use alloc::vec::Vec;
 
 use crate::profile::{validate_bignum_bytes, validate_int_safe_i64};
@@ -46,15 +48,15 @@ impl BigInt {
 
 /// An integer value permitted by SACP-CBOR/1.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CborInteger(IntegerRepr);
+pub struct Integer(IntegerRepr);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntegerRepr {
+enum IntegerRepr {
     Safe(i64),
     Big(BigInt),
 }
 
-impl CborInteger {
+impl Integer {
     /// Construct a safe-range integer.
     ///
     /// # Errors
@@ -116,7 +118,7 @@ impl CborInteger {
     }
 }
 
-impl From<BigInt> for CborInteger {
+impl From<BigInt> for Integer {
     fn from(value: BigInt) -> Self {
         Self(IntegerRepr::Big(value))
     }

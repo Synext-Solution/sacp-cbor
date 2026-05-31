@@ -1,5 +1,6 @@
 /target
 /coverage
+/goal.md
 **/*.rs.bk
 /benchmarks/target
 /benchmarks/reports/latest

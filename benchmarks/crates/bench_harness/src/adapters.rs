@@ -39,23 +39,24 @@ impl Adapter for SacpCbor {
 
     fn decode_ignored(&self, bytes: &[u8]) -> Result<(), String> {
         let _: IgnoredAny =
-            sacp_cbor::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+            sacp_cbor::serde::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
                 .map_err(|e| format!("{e}"))?;
         Ok(())
     }
 
     fn decode_bench_value(&self, bytes: &[u8]) -> Result<BenchValue, String> {
-        sacp_cbor::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+        sacp_cbor::serde::from_slice(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
             .map_err(|e| format!("{e}"))
     }
 
     fn encode_bench_value(&self, value: &BenchValue) -> Result<Vec<u8>, String> {
-        sacp_cbor::to_vec(value).map_err(|e| format!("{e}"))
+        sacp_cbor::serde::to_vec(value).map_err(|e| format!("{e}"))
     }
 
     fn validate_only(&self, bytes: &[u8]) -> Option<Result<(), String>> {
         Some(
-            sacp_cbor::validate(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+            sacp_cbor::validate_canonical(bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len()))
+                .map(|_| ())
                 .map_err(|e| format!("{e}")),
         )
     }
@@ -66,7 +67,7 @@ impl Adapter for SacpCbor {
             None => return Some(Err("missing canonical bytes".to_string())),
         };
         Some(
-            sacp_cbor::from_canonical_bytes_ref::<IgnoredAny>(canon)
+            sacp_cbor::serde::from_canonical_bytes_ref::<IgnoredAny>(canon)
                 .map(|_| ())
                 .map_err(|e| format!("{e}")),
         )
@@ -183,7 +184,7 @@ impl Adapter for Cbor4ii {
 pub fn encode_sacp_stream(value: &BenchValue) -> Result<Vec<u8>, String> {
     let mut enc = sacp_cbor::Encoder::new();
     encode_bench_value(&mut enc, value).map_err(|e| format!("{e}"))?;
-    Ok(enc.into_vec())
+    Ok(enc.finish().map_err(|err| err.to_string())?.into_bytes())
 }
 
 fn encode_bench_value(
@@ -207,7 +208,7 @@ fn encode_bench_value(
 }
 
 fn encode_bench_array(
-    a: &mut sacp_cbor::ArrayEncoder<'_>,
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_>,
     items: &[BenchValue],
 ) -> Result<(), sacp_cbor::CborError> {
     for item in items {
@@ -217,7 +218,7 @@ fn encode_bench_array(
 }
 
 fn encode_bench_value_in_array(
-    a: &mut sacp_cbor::ArrayEncoder<'_>,
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_>,
     v: &BenchValue,
 ) -> Result<(), sacp_cbor::CborError> {
     match v {

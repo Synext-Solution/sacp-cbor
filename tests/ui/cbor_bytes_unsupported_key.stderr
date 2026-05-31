@@ -1,0 +1,5 @@
+error: map keys must be identifiers or string literals
+ --> tests/ui/cbor_bytes_unsupported_key.rs:4:27
+  |
+4 |     let _ = cbor_bytes!({ 1: true });
+  |                           ^

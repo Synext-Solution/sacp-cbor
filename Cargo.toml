@@ -1,6 +1,6 @@
 [package]
 name = "sacp-cbor"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
@@ -15,20 +15,29 @@ repository = "https://github.com/Synext-Solution/sacp-cbor"
 members = ["sacp-cbor-derive"]
 
 [features]
-# Full-featured default for typical server deployments.
-default = ["std", "alloc", "sha2"]
+# Default API for application use: std integration plus derive macros.
+default = ["std", "derive"]
 
-# Enable std integration (implements std::error::Error and enables test/bench friendliness).
-std = []
+# Enable std integration (implements std::error::Error and enables allocation-backed APIs).
+std = ["alloc"]
 
 # Enable allocation-backed APIs (owned AST, canonical encoder, owned canonical bytes).
 alloc = []
+
+# Enable native collection implementations for Vec, BTreeMap, HashMap, and MapEntries.
+collections = ["alloc"]
+
+# Enable derive macros and the cbor_bytes! macro.
+derive = ["alloc", "dep:sacp-cbor-derive"]
+
+# Enable canonical CBOR editing and patch application.
+edit = ["alloc"]
 
 # Enable SHA-256 hashing helpers for canonical CBOR bytes.
 sha2 = ["dep:sha2"]
 
 # Enable serde-based conversions to/from canonical CBOR.
-serde = ["dep:serde", "alloc", "std"]
+serde = ["alloc", "dep:serde"]
 
 # Enable SIMD-accelerated UTF-8 validation where supported.
 simdutf8 = ["dep:simdutf8"]
@@ -38,8 +47,8 @@ unsafe = []
 
 [dependencies]
 sha2 = { version = "0.10", default-features = false, optional = true }
-serde = { version = "1", default-features = false, features = ["alloc", "derive", "std"], optional = true }
-sacp-cbor-derive = { path = "sacp-cbor-derive", version = "0.12.0" }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+sacp-cbor-derive = { path = "sacp-cbor-derive", version = "0.13.0", optional = true }
 simdutf8 = { version = "0.1", default-features = false, optional = true }
 
 [dev-dependencies]
@@ -50,3 +59,6 @@ trybuild = "1"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

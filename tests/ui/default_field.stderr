@@ -1,0 +1,5 @@
+error: `cbor(default)` is not part of the exact schema derive
+ --> tests/ui/default_field.rs:5:12
+  |
+5 |     #[cbor(default)]
+  |            ^^^^^^^

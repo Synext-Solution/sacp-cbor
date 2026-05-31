@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.0
+
+- **Breaking:** derive decoding is exact by default: unknown fields and missing fields are rejected, explicit optional fields use injective `Option<T>`, `#[cbor(default)]` is rejected, and untagged enums are no longer part of the derive grammar.
+- **Breaking:** removed the thin `validate` and `encode_into` public helpers; use `validate_canonical`, `encode_to_vec`, `encode_to_canonical`, or `Encoder` directly.
+- **Breaking:** renamed the owned canonical witness accessor from `CanonicalCbor::as_ref()` to `as_canonical_ref()` to avoid conflicting semantics with `AsRef<[u8]>`.
+- **Breaking:** collapsed editing to `set`, `delete`, `splice`, and `apply`, with explicit `PatchValue`, `SetMode`, and `DeleteMode`.
+- **Breaking:** native and serde optional values use the same explicit injective `Option<T>` representation.
+- **Breaking:** narrowed root exports; bytes, scalar, value, profile, query, and streaming container types are reached through their modules.
+- **Breaking:** removed robust-core decoders for standard map/set collections; use `MapEntries` for fallible vector-backed map decoding. `BTreeMap` and `HashMap` remain encode conveniences.
+- **Breaking:** reorganized feature topology: defaults are now `std` plus `derive`, `sha2` is opt-in, and `collections`, `edit`, `serde`, and `derive` explicitly require `alloc`.
+- Added explicit `derive` and `EncodeLimits` APIs, with encoder enforcement for output bytes, depth, item counts, container lengths, and bytes/text lengths.
+- Added `SPEC.md` for the maintained SACP-CBOR/1 wire/profile contract.
+- Made sorted multi-key query APIs validate strictly sorted input and scan without allocation or sorting.
+- Added `CborEncode::encode_array_item` so native encoders can use direct `ArrayEncoder` paths for array elements while retaining the guarded fallback.
+- Simplified encoder/serde internals by removing the unused sink abstraction, serde root plumbing, and duplicated integer write paths.
+- Refactored derive internals around a normalized schema model and removed duplicated attribute/type-bound paths.
+
 ## 0.12.0
 
 - **Breaking:** externally tagged derive newtype variants now encode and decode as direct payloads (`{ "variant": value }`) instead of single-element arrays.

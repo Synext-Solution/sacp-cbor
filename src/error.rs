@@ -1,3 +1,5 @@
+//! Error types for SACP-CBOR/1 validation, decoding, encoding, and editing.
+
 use core::fmt;
 
 /// A structured error code identifying the reason a CBOR item was rejected.
@@ -50,9 +52,6 @@ pub enum ErrorCode {
     DuplicateMapKey,
     /// Map keys are not in canonical order.
     NonCanonicalMapOrder,
-    /// Set elements are not in strict canonical set order.
-    NonCanonicalSetOrder,
-
     /// A forbidden tag was used, or the tag structure is malformed.
     ForbiddenOrMalformedTag,
     /// Bignum magnitude is not canonical (empty or leading zero).
@@ -92,10 +91,12 @@ pub enum ErrorCode {
     ExpectedNull,
     /// Expected a float64 at the current location.
     ExpectedFloat,
-    /// Expected a CBOR value matching an untagged enum variant.
+    /// Expected a supported CBOR enum representation.
     ExpectedEnum,
     /// Unknown enum variant key.
     UnknownEnumVariant,
+    /// Unknown struct or enum payload field key.
+    UnknownField,
 
     /// Patch operations overlap or conflict.
     PatchConflict,
@@ -148,7 +149,7 @@ impl fmt::Display for CborError {
             ErrorCode::MapLenLimitExceeded => "map length exceeds decode limits",
             ErrorCode::BytesLenLimitExceeded => "byte string length exceeds decode limits",
             ErrorCode::TextLenLimitExceeded => "text string length exceeds decode limits",
-            ErrorCode::MessageLenLimitExceeded => "input length exceeds decode limits",
+            ErrorCode::MessageLenLimitExceeded => "message length exceeds limits",
 
             ErrorCode::ReservedAdditionalInfo => "reserved additional info value",
             ErrorCode::IndefiniteLengthForbidden => "indefinite length forbidden",
@@ -157,8 +158,6 @@ impl fmt::Display for CborError {
             ErrorCode::MapKeyMustBeText => "map keys must be text strings",
             ErrorCode::DuplicateMapKey => "duplicate map key",
             ErrorCode::NonCanonicalMapOrder => "non-canonical map key order",
-            ErrorCode::NonCanonicalSetOrder => "non-canonical set element order",
-
             ErrorCode::ForbiddenOrMalformedTag => "forbidden or malformed CBOR tag",
             ErrorCode::BignumNotCanonical => {
                 "bignum magnitude must be canonical (non-empty, no leading zero)"
@@ -184,6 +183,7 @@ impl fmt::Display for CborError {
             ErrorCode::ExpectedFloat => "expected CBOR float64",
             ErrorCode::ExpectedEnum => "expected CBOR enum value",
             ErrorCode::UnknownEnumVariant => "unknown CBOR enum variant",
+            ErrorCode::UnknownField => "unknown CBOR field",
             ErrorCode::PatchConflict => "patch operations conflict",
             ErrorCode::IndexOutOfBounds => "array index out of bounds",
             ErrorCode::InvalidQuery => "invalid query arguments",
