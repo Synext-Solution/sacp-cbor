@@ -1,0 +1,5 @@
+error: duplicate `cbor(crate=...)`
+ --> tests/ui/duplicate_crate_path.rs:4:29
+  |
+4 | #[cbor(crate = "sacp_cbor", crate = "sacp_cbor")]
+  |                             ^^^^^

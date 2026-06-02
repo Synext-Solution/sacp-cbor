@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.0
+
+- **Breaking:** derive container attributes are now validated on structs as well as enums; unsupported struct-level `#[cbor(...)]` attributes fail at compile time.
+- Added `#[cbor(crate = "...")]` on `CborEncode` and `CborDecode` derives so framework facades can provide the runtime API path used by generated impls.
+- Tightened derive bounds for borrowed fields so lifetime-only field types do not receive unnecessary trait bounds.
+
 ## 0.13.0
 
 - **Breaking:** derive decoding is exact by default: unknown fields and missing fields are rejected, explicit optional fields use injective `Option<T>`, `#[cbor(default)]` is rejected, and untagged enums are no longer part of the derive grammar.

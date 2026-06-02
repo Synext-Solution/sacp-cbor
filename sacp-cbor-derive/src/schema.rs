@@ -2,7 +2,7 @@ use core::cmp::Ordering;
 use proc_macro2::Span;
 use syn::{
     spanned::Spanned, Attribute, DataEnum, Field, Fields, FieldsNamed, FieldsUnnamed,
-    GenericArgument, Ident, LitStr, Path, PathArguments, Type, Variant,
+    GenericArgument, Generics, Ident, LitStr, Path, PathArguments, Type, Variant,
 };
 
 #[derive(Default, Clone)]
@@ -16,8 +16,15 @@ pub(crate) struct CborVariantAttr {
     pub(crate) rename: Option<LitStr>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CborEnumAttr {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CborContainerKind {
+    Struct,
+    Enum,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CborContainerAttr {
+    pub(crate) crate_path: Path,
     pub(crate) tagging: EnumTagging,
     pub(crate) rename_all: Option<RenameRule>,
 }
@@ -244,8 +251,55 @@ fn type_mentions_self(ty: &Type, self_ident: &Ident) -> bool {
     }
 }
 
-pub(crate) fn type_needs_trait_bound(ty: &Type, self_ident: &Ident) -> bool {
-    !type_mentions_self(ty, self_ident)
+fn path_might_be_type_param(path: &Path, type_params: &[Ident]) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && type_params
+            .iter()
+            .any(|ident| path.segments[0].ident == *ident)
+}
+
+fn type_mentions_type_param(ty: &Type, type_params: &[Ident]) -> bool {
+    match ty {
+        Type::Path(tp) => {
+            if path_might_be_type_param(&tp.path, type_params) {
+                return true;
+            }
+            if let Some(q) = &tp.qself {
+                if type_mentions_type_param(&q.ty, type_params) {
+                    return true;
+                }
+            }
+            tp.path.segments.iter().any(|seg| match &seg.arguments {
+                PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                    GenericArgument::Type(inner) => type_mentions_type_param(inner, type_params),
+                    _ => false,
+                }),
+                _ => false,
+            })
+        }
+        Type::Reference(tr) => type_mentions_type_param(&tr.elem, type_params),
+        Type::Tuple(tt) => tt
+            .elems
+            .iter()
+            .any(|t| type_mentions_type_param(t, type_params)),
+        Type::Array(ta) => type_mentions_type_param(&ta.elem, type_params),
+        Type::Slice(ts) => type_mentions_type_param(&ts.elem, type_params),
+        Type::Group(tg) => type_mentions_type_param(&tg.elem, type_params),
+        Type::Paren(tp) => type_mentions_type_param(&tp.elem, type_params),
+        _ => false,
+    }
+}
+
+pub(crate) fn generic_type_params(generics: &Generics) -> Vec<Ident> {
+    generics
+        .type_params()
+        .map(|param| param.ident.clone())
+        .collect()
+}
+
+pub(crate) fn type_needs_trait_bound(ty: &Type, self_ident: &Ident, type_params: &[Ident]) -> bool {
+    !type_mentions_self(ty, self_ident) && type_mentions_type_param(ty, type_params)
 }
 
 pub(crate) fn ensure_no_cbor_attrs(attrs: &[Attribute], ctx: &str) -> syn::Result<()> {
@@ -326,7 +380,28 @@ pub(crate) fn parse_cbor_variant_attrs(attrs: &[Attribute]) -> syn::Result<CborV
     Ok(out)
 }
 
-pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnumAttr> {
+fn parse_cbor_crate_path(lit: &LitStr) -> syn::Result<Path> {
+    let path = lit.parse::<Path>().map_err(|err| {
+        syn::Error::new(lit.span(), format!("invalid `cbor(crate=...)` path: {err}"))
+    })?;
+
+    for segment in &path.segments {
+        if !matches!(segment.arguments, PathArguments::None) {
+            return Err(syn::Error::new(
+                segment.arguments.span(),
+                "`cbor(crate=...)` must be a module path without generic arguments",
+            ));
+        }
+    }
+
+    Ok(path)
+}
+
+pub(crate) fn parse_cbor_container_attrs(
+    attrs: &[Attribute],
+    kind: CborContainerKind,
+) -> syn::Result<CborContainerAttr> {
+    let mut crate_path: Option<Path> = None;
     let mut seen_tagged = false;
     let mut tag: Option<LitStr> = None;
     let mut content: Option<LitStr> = None;
@@ -337,6 +412,17 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                if crate_path.is_some() {
+                    return Err(meta.error("duplicate `cbor(crate=...)`"));
+                }
+                let lit: LitStr = meta.value()?.parse()?;
+                crate_path = Some(parse_cbor_crate_path(&lit)?);
+                return Ok(());
+            }
+            if kind == CborContainerKind::Struct {
+                return Err(meta.error("unsupported `cbor(...)` struct attribute (allowed: crate)"));
+            }
             if meta.path.is_ident("untagged") {
                 return Err(meta.error("`cbor(untagged)` is not part of the exact schema derive"));
             }
@@ -370,7 +456,7 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
                 return Ok(());
             }
             Err(meta.error(
-                "unsupported `cbor(...)` enum attribute (allowed: tagged, tag, content, rename_all)",
+                "unsupported `cbor(...)` enum attribute (allowed: crate, tagged, tag, content, rename_all)",
             ))
         })?;
     }
@@ -408,7 +494,8 @@ pub(crate) fn parse_cbor_enum_attrs(attrs: &[Attribute]) -> syn::Result<CborEnum
         EnumTagging::External
     };
 
-    Ok(CborEnumAttr {
+    Ok(CborContainerAttr {
+        crate_path: crate_path.unwrap_or_else(|| syn::parse_quote!(::sacp_cbor)),
         tagging,
         rename_all,
     })

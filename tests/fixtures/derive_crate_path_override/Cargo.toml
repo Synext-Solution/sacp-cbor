@@ -1,0 +1,10 @@
+[package]
+name = "derive-crate-path-override-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+private-cbor = { package = "sacp-cbor", path = "../../..", default-features = false, features = ["derive", "collections"] }
+
+[workspace]

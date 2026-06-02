@@ -551,6 +551,32 @@ You must write exactly `len` items; otherwise:
 
 ## Macros (`derive`)
 
+### `#[cbor(crate = "...")]`
+
+`CborEncode` and `CborDecode` derive accept a container-level runtime path:
+
+```rust
+#[derive(CborEncode, CborDecode)]
+#[cbor(crate = "my_crate::codec::cbor")]
+struct Msg {
+    id: u64,
+}
+```
+
+The path must name a module that exposes the derive runtime API:
+
+```rust
+pub mod cbor {
+    pub use sacp_cbor::{
+        CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder, ErrorCode,
+    };
+
+    pub mod query {
+        pub use sacp_cbor::query::{CborKind, CborValueRef};
+    }
+}
+```
+
 ### `cbor_bytes!` — build canonical bytes directly (fallible)
 
 - Produces `Result<CanonicalCbor, CborError>`
@@ -909,6 +935,8 @@ Common trait coverage for derive-driven models includes:
 - `cbor_bytes!` → `Result<CanonicalCbor, CborError>`
 
   - literal map entries are sorted into canonical order at macro expansion
+
+- `#[cbor(crate = "...")]` on `CborEncode` / `CborDecode` derive containers selects the generated runtime API path
 
 ### Serde (`serde` + `alloc`)
 

@@ -1,17 +1,18 @@
 use quote::{format_ident, quote, ToTokens};
 use syn::{
     spanned::Spanned, DataEnum, DataStruct, Fields, GenericParam, Generics, Ident, Lifetime,
-    LifetimeParam, LitStr, Type,
+    LifetimeParam, LitStr, Path, Type,
 };
 
 use crate::schema::{
-    enum_variants, internal_tagged_tuple_variant_error, named_fields, tuple_fields,
-    type_needs_trait_bound, validate_internal_tagging, CborEnumAttr, EnumTagging, NamedFieldSpec,
-    TupleFieldSpec, VariantSpec,
+    enum_variants, generic_type_params, internal_tagged_tuple_variant_error, named_fields,
+    tuple_fields, type_needs_trait_bound, validate_internal_tagging, CborContainerAttr,
+    EnumTagging, NamedFieldSpec, TupleFieldSpec, VariantSpec,
 };
 use crate::util::{add_where_bound, ensure_where_clause};
 
 fn decode_impl(
+    crate_path: &Path,
     name: &Ident,
     impl_generics: impl ToTokens,
     ty_generics: impl ToTokens,
@@ -20,8 +21,8 @@ fn decode_impl(
     body: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
-        impl #impl_generics ::sacp_cbor::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode<const CHECKED: bool>(decoder: &mut ::sacp_cbor::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, ::sacp_cbor::CborError> {
+        impl #impl_generics #crate_path::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
+            fn decode<const CHECKED: bool>(decoder: &mut #crate_path::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, #crate_path::CborError> {
                 #body
             }
         }
@@ -29,7 +30,9 @@ fn decode_impl(
 }
 
 fn tuple_decode_parts(
+    crate_path: &Path,
     name: &Ident,
+    type_params: &[Ident],
     fields: &[TupleFieldSpec<'_>],
     wc: &mut syn::WhereClause,
     decode_lt: &Lifetime,
@@ -42,15 +45,15 @@ fn tuple_decode_parts(
         let var = format_ident!("v{idx}");
         vars.push(var.clone());
 
-        if type_needs_trait_bound(field.ty, name) {
-            add_where_bound(wc, field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+        if type_needs_trait_bound(field.ty, name, type_params) {
+            add_where_bound(wc, field.ty, quote!(#crate_path::CborDecode<#decode_lt>));
         }
         decodes.push(quote! {
             let #var = match array.next_value()? {
                 ::core::option::Option::Some(value) => value,
                 ::core::option::Option::None => {
-                    return Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::ArrayLenMismatch,
+                    return Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::ArrayLenMismatch,
                         arr_off,
                     ));
                 }
@@ -62,7 +65,9 @@ fn tuple_decode_parts(
 }
 
 fn add_decode_bounds_for_named_fields(
+    crate_path: &Path,
     name: &Ident,
+    type_params: &[Ident],
     fields: &[NamedFieldSpec<'_>],
     wc: &mut syn::WhereClause,
     decode_lt: &Lifetime,
@@ -72,13 +77,14 @@ fn add_decode_bounds_for_named_fields(
             add_where_bound(wc, field.ty, quote!(::core::default::Default));
             continue;
         }
-        if type_needs_trait_bound(field.ty, name) {
-            add_where_bound(wc, field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+        if type_needs_trait_bound(field.ty, name, type_params) {
+            add_where_bound(wc, field.ty, quote!(#crate_path::CborDecode<#decode_lt>));
         }
     }
 }
 
 fn array_decode_block(
+    crate_path: &Path,
     expected: usize,
     decodes: &[proc_macro2::TokenStream],
     result: proc_macro2::TokenStream,
@@ -88,8 +94,8 @@ fn array_decode_block(
         let mut array = decoder.array()?;
         let arr_len = array.remaining();
         if arr_len != #expected {
-            return Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::ArrayLenMismatch,
+            return Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::ArrayLenMismatch,
                 arr_off,
             ));
         }
@@ -124,17 +130,19 @@ fn decode_lifetime(generics: &Generics) -> (Generics, Lifetime) {
     (out, lt)
 }
 
-struct DecodeImplParts {
+struct DecodeImplParts<'a> {
+    crate_path: &'a Path,
     generics: Generics,
     decode_lt: Lifetime,
     where_clause: Option<syn::WhereClause>,
 }
 
-impl DecodeImplParts {
-    fn new(generics: &Generics) -> Self {
+impl<'a> DecodeImplParts<'a> {
+    fn new(crate_path: &'a Path, generics: &Generics) -> Self {
         let (impl_generics, decode_lt) = decode_lifetime(generics);
         let where_clause = impl_generics.split_for_impl().2.cloned();
         Self {
+            crate_path,
             generics: impl_generics,
             decode_lt,
             where_clause,
@@ -154,6 +162,7 @@ impl DecodeImplParts {
         let (impl_generics, _, _) = self.generics.split_for_impl();
         let (_, ty_generics, _) = source_generics.split_for_impl();
         decode_impl(
+            self.crate_path,
             name,
             impl_generics,
             ty_generics,
@@ -165,6 +174,7 @@ impl DecodeImplParts {
 }
 
 fn decode_named_fields(
+    crate_path: &Path,
     fields: &[NamedFieldSpec<'_>],
     target: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
@@ -190,16 +200,16 @@ fn decode_named_fields(
                 let __key = match map.next_key_ref()? {
                     ::core::option::Option::Some(key) => key,
                     ::core::option::Option::None => {
-                        return Err(::sacp_cbor::CborError::new(
-                            ::sacp_cbor::ErrorCode::MapLenMismatch,
+                        return Err(#crate_path::CborError::new(
+                            #crate_path::ErrorCode::MapLenMismatch,
                             map_off,
                         ));
                     }
                 };
                 if __key.text != #key {
                     map.skip_value()?;
-                    return Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::UnknownField,
+                    return Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::UnknownField,
                         __key.offset,
                     ));
                 }
@@ -213,16 +223,16 @@ fn decode_named_fields(
         let map_off = decoder.position();
         let mut map = decoder.map()?;
         if map.remaining() < #expected_len {
-            return Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::MapLenMismatch,
+            return Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::MapLenMismatch,
                 map_off,
             ));
         }
         #(#decodes)*
         if let ::core::option::Option::Some(__key) = map.next_key_ref()? {
             map.skip_value()?;
-            return Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::UnknownField,
+            return Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::UnknownField,
                 __key.offset,
             ));
         }
@@ -252,40 +262,72 @@ struct InternalVariantDecode {
     unit: bool,
 }
 
-fn decode_raw_value(ty: &Type, raw: &Ident) -> proc_macro2::TokenStream {
+fn decode_raw_value(
+    crate_path: &Path,
+    decode_lt: &Lifetime,
+    ty: &Type,
+    raw: &Ident,
+) -> proc_macro2::TokenStream {
     quote! {
-        ::sacp_cbor::decode::<#ty>(
-            #raw.as_bytes(),
-            ::sacp_cbor::DecodeLimits::for_bytes(#raw.as_bytes().len()),
-        )
-        .map_err(|err| ::sacp_cbor::CborError::new(err.code, #raw.offset() + err.offset))
+        {
+            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
+            let __result: ::core::result::Result<#ty, #crate_path::CborError> = (|| {
+                let mut __decoder = #crate_path::Decoder::<true>::new_checked(
+                    __bytes,
+                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
+                )?;
+                let __value = #crate_path::CborDecode::decode(&mut __decoder)?;
+                if __decoder.position() != __bytes.len() {
+                    return Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::TrailingBytes,
+                        __decoder.position(),
+                    ));
+                }
+                Ok(__value)
+            })();
+            __result.map_err(|err| #crate_path::CborError::new(err.code, #raw.offset() + err.offset))
+        }
     }
 }
 
-fn decode_body_from_raw(raw: &Ident, body: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+fn decode_body_from_raw(
+    crate_path: &Path,
+    decode_lt: &Lifetime,
+    raw: &Ident,
+    body: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     quote! {
         {
-            let __result: ::core::result::Result<Self, ::sacp_cbor::CborError> = (|| {
-                let mut decoder = ::sacp_cbor::Decoder::<true>::new_checked(
-                    #raw.as_bytes(),
-                    ::sacp_cbor::DecodeLimits::for_bytes(#raw.as_bytes().len()),
+            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
+            let __result: ::core::result::Result<Self, #crate_path::CborError> = (|| {
+                let mut decoder = #crate_path::Decoder::<true>::new_checked(
+                    __bytes,
+                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
                 )?;
-                #body
+                let __value = { #body }?;
+                if decoder.position() != __bytes.len() {
+                    return Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::TrailingBytes,
+                        decoder.position(),
+                    ));
+                }
+                Ok(__value)
             })();
             __result
         }
-        .map_err(|err| ::sacp_cbor::CborError::new(err.code, #raw.offset() + err.offset))
+        .map_err(|err| #crate_path::CborError::new(err.code, #raw.offset() + err.offset))
     }
 }
 
 fn required_adjacent_content(
+    crate_path: &Path,
     raw: &Ident,
     decode_expr: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         let #raw = __content.ok_or_else(|| {
-            ::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::MissingKey,
+            #crate_path::CborError::new(
+                #crate_path::ErrorCode::MissingKey,
                 map_off,
             )
         })?;
@@ -297,16 +339,26 @@ pub(crate) fn decode_struct(
     name: &Ident,
     generics: &Generics,
     data: &DataStruct,
+    attrs: &CborContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let mut impl_parts = DecodeImplParts::new(generics);
+    let crate_path = &attrs.crate_path;
+    let type_params = generic_type_params(generics);
+    let mut impl_parts = DecodeImplParts::new(crate_path, generics);
 
     match &data.fields {
         Fields::Named(fields) => {
             let decode_lt = impl_parts.decode_lt.clone();
             let wc = impl_parts.where_clause_mut();
             let field_specs = named_fields(fields)?;
-            add_decode_bounds_for_named_fields(name, &field_specs, wc, &decode_lt);
-            let body = decode_named_fields(&field_specs, quote!(Self))?;
+            add_decode_bounds_for_named_fields(
+                crate_path,
+                name,
+                &type_params,
+                &field_specs,
+                wc,
+                &decode_lt,
+            );
+            let body = decode_named_fields(crate_path, &field_specs, quote!(Self))?;
             Ok(impl_parts.finish(name, generics, body))
         }
 
@@ -314,9 +366,11 @@ pub(crate) fn decode_struct(
             let decode_lt = impl_parts.decode_lt.clone();
             let wc = impl_parts.where_clause_mut();
             let field_specs = tuple_fields(fields, "tuple struct fields")?;
-            let (vars, decodes) = tuple_decode_parts(name, &field_specs, wc, &decode_lt)?;
+            let (vars, decodes) =
+                tuple_decode_parts(crate_path, name, &type_params, &field_specs, wc, &decode_lt)?;
             let expected = vars.len();
-            let body = array_decode_block(expected, &decodes, quote!(Ok(Self(#(#vars),*))));
+            let body =
+                array_decode_block(crate_path, expected, &decodes, quote!(Ok(Self(#(#vars),*))));
             Ok(impl_parts.finish(name, generics, body))
         }
 
@@ -324,7 +378,7 @@ pub(crate) fn decode_struct(
             name,
             generics,
             quote! {
-                let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
+                let _unit: () = #crate_path::CborDecode::decode(decoder)?;
                 Ok(Self)
             },
         )),
@@ -335,24 +389,43 @@ pub(crate) fn decode_enum(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
-    attrs: &CborEnumAttr,
+    attrs: &CborContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let variants = enum_variants(data, attrs.rename_all)?;
+    let type_params = generic_type_params(generics);
     match &attrs.tagging {
-        EnumTagging::External => decode_enum_external(name, generics, &variants),
-        EnumTagging::Internal { tag } => decode_enum_internal(name, generics, data, &variants, tag),
-        EnumTagging::Adjacent { tag, content } => {
-            decode_enum_adjacent(name, generics, &variants, tag, content)
+        EnumTagging::External => {
+            decode_enum_external(&attrs.crate_path, name, generics, &type_params, &variants)
         }
+        EnumTagging::Internal { tag } => decode_enum_internal(
+            &attrs.crate_path,
+            name,
+            generics,
+            &type_params,
+            data,
+            &variants,
+            tag,
+        ),
+        EnumTagging::Adjacent { tag, content } => decode_enum_adjacent(
+            &attrs.crate_path,
+            name,
+            generics,
+            &type_params,
+            &variants,
+            tag,
+            content,
+        ),
     }
 }
 
 fn decode_enum_external(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     variants: &[VariantSpec<'_>],
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let mut impl_parts = DecodeImplParts::new(generics);
+    let mut impl_parts = DecodeImplParts::new(crate_path, generics);
     let decode_lt = impl_parts.decode_lt.clone();
     let wc = impl_parts.where_clause_mut();
 
@@ -366,7 +439,7 @@ fn decode_enum_external(
             Fields::Unit => {
                 map_arms.push(quote! {
                     #vname => map.decode_value(|decoder| {
-                        let _unit: () = ::sacp_cbor::CborDecode::decode(decoder)?;
+                        let _unit: () = #crate_path::CborDecode::decode(decoder)?;
                         Ok(Self::#ident)
                     })
                 });
@@ -376,18 +449,26 @@ fn decode_enum_external(
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
                 if field_specs.len() == 1 {
                     let field = &field_specs[0];
-                    if type_needs_trait_bound(field.ty, name) {
-                        add_where_bound(wc, field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+                    if type_needs_trait_bound(field.ty, name, type_params) {
+                        add_where_bound(wc, field.ty, quote!(#crate_path::CborDecode<#decode_lt>));
                     }
                     map_arms.push(quote! {
                         #vname => map.decode_value(|decoder| {
-                            Ok(Self::#ident(::sacp_cbor::CborDecode::decode(decoder)?))
+                            Ok(Self::#ident(#crate_path::CborDecode::decode(decoder)?))
                         })
                     });
                 } else {
-                    let (vars, decodes) = tuple_decode_parts(name, &field_specs, wc, &decode_lt)?;
+                    let (vars, decodes) = tuple_decode_parts(
+                        crate_path,
+                        name,
+                        type_params,
+                        &field_specs,
+                        wc,
+                        &decode_lt,
+                    )?;
                     let expected = vars.len();
                     let body = array_decode_block(
+                        crate_path,
                         expected,
                         &decodes,
                         quote!(Ok(Self::#ident(#(#vars),*))),
@@ -402,8 +483,15 @@ fn decode_enum_external(
 
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
-                add_decode_bounds_for_named_fields(name, &field_specs, wc, &decode_lt);
-                let body = decode_named_fields(&field_specs, quote!(Self::#ident))?;
+                add_decode_bounds_for_named_fields(
+                    crate_path,
+                    name,
+                    type_params,
+                    &field_specs,
+                    wc,
+                    &decode_lt,
+                );
+                let body = decode_named_fields(crate_path, &field_specs, quote!(Self::#ident))?;
                 map_arms.push(quote! { #vname => map.decode_value(|decoder| { #body }) });
             }
         }
@@ -413,33 +501,33 @@ fn decode_enum_external(
         let map_off = decoder.position();
         let mut map = decoder.map()?;
         if map.remaining() != 1 {
-            return Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::MapLenMismatch,
+            return Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::MapLenMismatch,
                 map_off,
             ));
         }
         let k = match map.next_key_ref()? {
             ::core::option::Option::Some(key) => key,
             ::core::option::Option::None => {
-                return Err(::sacp_cbor::CborError::new(
-                    ::sacp_cbor::ErrorCode::MapLenMismatch,
+                return Err(#crate_path::CborError::new(
+                    #crate_path::ErrorCode::MapLenMismatch,
                     map_off,
                 ));
             }
         };
         match k.text {
             #(#map_arms),*,
-            _ => Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+            _ => Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::UnknownEnumVariant,
                 k.offset,
             )),
         }
     };
 
     let body = quote! {
-        if !matches!(decoder.peek_kind()?, ::sacp_cbor::query::CborKind::Map) {
-            return Err(::sacp_cbor::CborError::new(
-                ::sacp_cbor::ErrorCode::ExpectedEnum,
+        if !matches!(decoder.peek_kind()?, #crate_path::query::CborKind::Map) {
+            return Err(#crate_path::CborError::new(
+                #crate_path::ErrorCode::ExpectedEnum,
                 decoder.position(),
             ));
         }
@@ -450,15 +538,17 @@ fn decode_enum_external(
 }
 
 fn decode_enum_internal(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     data: &DataEnum,
     variants: &[VariantSpec<'_>],
     tag: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     validate_internal_tagging(data, tag)?;
 
-    let mut impl_parts = DecodeImplParts::new(generics);
+    let mut impl_parts = DecodeImplParts::new(crate_path, generics);
     let decode_lt = impl_parts.decode_lt.clone();
     let wc = impl_parts.where_clause_mut();
 
@@ -476,7 +566,14 @@ fn decode_enum_internal(
             }),
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
-                add_decode_bounds_for_named_fields(name, &field_specs, wc, &decode_lt);
+                add_decode_bounds_for_named_fields(
+                    crate_path,
+                    name,
+                    type_params,
+                    &field_specs,
+                    wc,
+                    &decode_lt,
+                );
 
                 let mut variant_fields = Vec::new();
                 for field in &field_specs {
@@ -530,7 +627,7 @@ fn decode_enum_internal(
     let slot_inits = slots.iter().map(|slot| {
         let storage = &slot.storage;
         quote! {
-            let mut #storage: ::core::option::Option<::sacp_cbor::query::CborValueRef<#decode_lt>> =
+            let mut #storage: ::core::option::Option<#crate_path::query::CborValueRef<#decode_lt>> =
                 ::core::option::Option::None;
         }
     });
@@ -564,8 +661,8 @@ fn decode_enum_internal(
                 let storage = &slot.storage;
                 quote! {
                     if let ::core::option::Option::Some(__extra) = #storage {
-                        return Err(::sacp_cbor::CborError::new(
-                            ::sacp_cbor::ErrorCode::UnknownField,
+                        return Err(#crate_path::CborError::new(
+                            #crate_path::ErrorCode::UnknownField,
                             __extra.offset(),
                         ));
                     }
@@ -595,14 +692,14 @@ fn decode_enum_internal(
                     syn::Error::new(field.ident.span(), "missing internal field storage")
                 })?;
                 let raw = format_ident!("__raw_{}", ident);
-                let decode_expr = decode_raw_value(&field.ty, &raw);
+                let decode_expr = decode_raw_value(crate_path, &decode_lt, &field.ty, &raw);
 
                 finals.push(quote! {
                     #ident: match #storage {
                         ::core::option::Option::Some(#raw) => #decode_expr?,
                         ::core::option::Option::None => {
-                            return Err(::sacp_cbor::CborError::new(
-                                ::sacp_cbor::ErrorCode::MissingKey,
+                            return Err(#crate_path::CborError::new(
+                                #crate_path::ErrorCode::MissingKey,
                                 map_off,
                             ));
                         }
@@ -636,20 +733,20 @@ fn decode_enum_internal(
                         #(#slot_matches)*
                         _ => {
                             map.skip_value()?;
-                            return Err(::sacp_cbor::CborError::new(
-                                ::sacp_cbor::ErrorCode::UnknownField,
+                            return Err(#crate_path::CborError::new(
+                                #crate_path::ErrorCode::UnknownField,
                                 k.offset,
                             ));
                         }
                     }
                 }
                 let __tag = __tag.ok_or_else(|| {
-                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
+                    #crate_path::CborError::new(#crate_path::ErrorCode::MissingKey, map_off)
                 })?;
                 match __tag {
                     #(#variant_arms),*,
-                    _ => Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                    _ => Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::UnknownEnumVariant,
                         map_off,
                     )),
                 }
@@ -658,13 +755,15 @@ fn decode_enum_internal(
 }
 
 fn decode_enum_adjacent(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     variants: &[VariantSpec<'_>],
     tag: &LitStr,
     content: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let mut impl_parts = DecodeImplParts::new(generics);
+    let mut impl_parts = DecodeImplParts::new(crate_path, generics);
     let decode_lt = impl_parts.decode_lt.clone();
     let wc = impl_parts.where_clause_mut();
 
@@ -678,14 +777,26 @@ fn decode_enum_adjacent(
             Fields::Unit => {
                 let raw = format_ident!("__content_raw");
                 let content = required_adjacent_content(
+                    crate_path,
                     &raw,
                     quote! {
                         {
-                            let _unit: () = ::sacp_cbor::decode(
-                                #raw.as_bytes(),
-                                ::sacp_cbor::DecodeLimits::for_bytes(#raw.as_bytes().len()),
-                            )
-                            .map_err(|err| ::sacp_cbor::CborError::new(
+                            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
+                            let __result: ::core::result::Result<(), #crate_path::CborError> = (|| {
+                                let mut __decoder = #crate_path::Decoder::<true>::new_checked(
+                                    __bytes,
+                                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
+                                )?;
+                                let _unit: () = #crate_path::CborDecode::decode(&mut __decoder)?;
+                                if __decoder.position() != __bytes.len() {
+                                    return Err(#crate_path::CborError::new(
+                                        #crate_path::ErrorCode::TrailingBytes,
+                                        __decoder.position(),
+                                    ));
+                                }
+                                Ok(())
+                            })();
+                            __result.map_err(|err| #crate_path::CborError::new(
                                 err.code,
                                 #raw.offset() + err.offset,
                             ))?;
@@ -703,29 +814,40 @@ fn decode_enum_adjacent(
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
                 if field_specs.len() == 1 {
                     let field = &field_specs[0];
-                    if type_needs_trait_bound(field.ty, name) {
-                        add_where_bound(wc, field.ty, quote!(::sacp_cbor::CborDecode<#decode_lt>));
+                    if type_needs_trait_bound(field.ty, name, type_params) {
+                        add_where_bound(wc, field.ty, quote!(#crate_path::CborDecode<#decode_lt>));
                     }
                     let raw = format_ident!("__content_raw");
-                    let decode_expr = decode_raw_value(field.ty, &raw);
-                    let content =
-                        required_adjacent_content(&raw, quote! { Ok(Self::#ident(#decode_expr?)) });
+                    let decode_expr = decode_raw_value(crate_path, &decode_lt, field.ty, &raw);
+                    let content = required_adjacent_content(
+                        crate_path,
+                        &raw,
+                        quote! { Ok(Self::#ident(#decode_expr?)) },
+                    );
                     variant_arms.push(quote! {
                         #vname => {
                             #content
                         }
                     });
                 } else {
-                    let (vars, decodes) = tuple_decode_parts(name, &field_specs, wc, &decode_lt)?;
+                    let (vars, decodes) = tuple_decode_parts(
+                        crate_path,
+                        name,
+                        type_params,
+                        &field_specs,
+                        wc,
+                        &decode_lt,
+                    )?;
                     let expected = vars.len();
                     let body = array_decode_block(
+                        crate_path,
                         expected,
                         &decodes,
                         quote!(Ok(Self::#ident(#(#vars),*))),
                     );
                     let raw = format_ident!("__content_raw");
-                    let decode_expr = decode_body_from_raw(&raw, body);
-                    let content = required_adjacent_content(&raw, decode_expr);
+                    let decode_expr = decode_body_from_raw(crate_path, &decode_lt, &raw, body);
+                    let content = required_adjacent_content(crate_path, &raw, decode_expr);
                     variant_arms.push(quote! {
                         #vname => {
                             #content
@@ -735,11 +857,18 @@ fn decode_enum_adjacent(
             }
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
-                add_decode_bounds_for_named_fields(name, &field_specs, wc, &decode_lt);
-                let body = decode_named_fields(&field_specs, quote!(Self::#ident))?;
+                add_decode_bounds_for_named_fields(
+                    crate_path,
+                    name,
+                    type_params,
+                    &field_specs,
+                    wc,
+                    &decode_lt,
+                );
+                let body = decode_named_fields(crate_path, &field_specs, quote!(Self::#ident))?;
                 let raw = format_ident!("__content_raw");
-                let decode_expr = decode_body_from_raw(&raw, body);
-                let content = required_adjacent_content(&raw, decode_expr);
+                let decode_expr = decode_body_from_raw(crate_path, &decode_lt, &raw, body);
+                let content = required_adjacent_content(crate_path, &raw, decode_expr);
                 variant_arms.push(quote! {
                     #vname => {
                         #content
@@ -757,7 +886,7 @@ fn decode_enum_adjacent(
                 let mut map = decoder.map()?;
                 let mut __tag: ::core::option::Option<&#decode_lt str> =
                     ::core::option::Option::None;
-                let mut __content: ::core::option::Option<::sacp_cbor::query::CborValueRef<#decode_lt>> =
+                let mut __content: ::core::option::Option<#crate_path::query::CborValueRef<#decode_lt>> =
                     ::core::option::Option::None;
                 while let ::core::option::Option::Some(k) = map.next_key_ref()? {
                     match k.text {
@@ -769,20 +898,20 @@ fn decode_enum_adjacent(
                         }
                         _ => {
                             map.skip_value()?;
-                            return Err(::sacp_cbor::CborError::new(
-                                ::sacp_cbor::ErrorCode::UnknownField,
+                            return Err(#crate_path::CborError::new(
+                                #crate_path::ErrorCode::UnknownField,
                                 k.offset,
                             ));
                         }
                     }
                 }
                 let __tag = __tag.ok_or_else(|| {
-                    ::sacp_cbor::CborError::new(::sacp_cbor::ErrorCode::MissingKey, map_off)
+                    #crate_path::CborError::new(#crate_path::ErrorCode::MissingKey, map_off)
                 })?;
                 match __tag {
                     #(#variant_arms),*,
-                    _ => Err(::sacp_cbor::CborError::new(
-                        ::sacp_cbor::ErrorCode::UnknownEnumVariant,
+                    _ => Err(#crate_path::CborError::new(
+                        #crate_path::ErrorCode::UnknownEnumVariant,
                         map_off,
                     )),
                 }

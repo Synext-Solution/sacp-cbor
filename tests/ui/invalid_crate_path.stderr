@@ -1,0 +1,5 @@
+error: invalid `cbor(crate=...)` path: unexpected token
+ --> tests/ui/invalid_crate_path.rs:4:16
+  |
+4 | #[cbor(crate = "not a path")]
+  |                ^^^^^^^^^^^^

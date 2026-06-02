@@ -1,10 +1,10 @@
 use quote::{format_ident, quote, ToTokens};
-use syn::{spanned::Spanned, DataEnum, DataStruct, Fields, Generics, Ident, LitStr, Type};
+use syn::{spanned::Spanned, DataEnum, DataStruct, Fields, Generics, Ident, LitStr, Path, Type};
 
 use crate::schema::{
-    cbor_text_key_bytes, enum_variants, internal_tagged_tuple_variant_error, named_fields,
-    tuple_fields, type_needs_trait_bound, validate_internal_tagging, CborEnumAttr, EnumTagging,
-    NamedFieldSpec, TupleFieldSpec, VariantSpec,
+    cbor_text_key_bytes, enum_variants, generic_type_params, internal_tagged_tuple_variant_error,
+    named_fields, tuple_fields, type_needs_trait_bound, validate_internal_tagging,
+    CborContainerAttr, EnumTagging, NamedFieldSpec, TupleFieldSpec, VariantSpec,
 };
 use crate::util::add_where_bounds;
 
@@ -36,6 +36,7 @@ fn map_entry(key: &LitStr, entry: proc_macro2::TokenStream) -> SortedMapEntry {
 }
 
 fn encode_impl(
+    crate_path: &Path,
     name: &Ident,
     impl_generics: impl ToTokens,
     ty_generics: impl ToTokens,
@@ -43,8 +44,8 @@ fn encode_impl(
     body: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
-        impl #impl_generics ::sacp_cbor::CborEncode for #name #ty_generics #where_clause {
-            fn encode(&self, enc: &mut ::sacp_cbor::Encoder) -> ::core::result::Result<(), ::sacp_cbor::CborError> {
+        impl #impl_generics #crate_path::CborEncode for #name #ty_generics #where_clause {
+            fn encode(&self, enc: &mut #crate_path::Encoder) -> ::core::result::Result<(), #crate_path::CborError> {
                 #body
             }
         }
@@ -52,6 +53,7 @@ fn encode_impl(
 }
 
 fn encode_match_impl(
+    crate_path: &Path,
     name: &Ident,
     impl_generics: impl ToTokens,
     ty_generics: impl ToTokens,
@@ -59,6 +61,7 @@ fn encode_match_impl(
     arms: &[proc_macro2::TokenStream],
 ) -> proc_macro2::TokenStream {
     encode_impl(
+        crate_path,
         name,
         impl_generics,
         ty_generics,
@@ -68,6 +71,7 @@ fn encode_match_impl(
 }
 
 fn finish_encode_match_impl<'a>(
+    crate_path: &Path,
     name: &Ident,
     impl_generics: impl ToTokens,
     ty_generics: impl ToTokens,
@@ -76,19 +80,28 @@ fn finish_encode_match_impl<'a>(
     arms: &[proc_macro2::TokenStream],
 ) -> proc_macro2::TokenStream {
     let encode_where_clause =
-        add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
-    encode_match_impl(name, impl_generics, ty_generics, encode_where_clause, arms)
+        add_where_bounds(base_where_clause, bounds, quote!(#crate_path::CborEncode));
+    encode_match_impl(
+        crate_path,
+        name,
+        impl_generics,
+        ty_generics,
+        encode_where_clause,
+        arms,
+    )
 }
 
 struct EncodeImplParts<'a> {
+    crate_path: &'a Path,
     generics: &'a Generics,
     base_where_clause: Option<&'a syn::WhereClause>,
 }
 
 impl<'a> EncodeImplParts<'a> {
-    fn new(generics: &'a Generics) -> Self {
+    fn new(crate_path: &'a Path, generics: &'a Generics) -> Self {
         let (_, _, base_where_clause) = generics.split_for_impl();
         Self {
+            crate_path,
             generics,
             base_where_clause,
         }
@@ -102,6 +115,7 @@ impl<'a> EncodeImplParts<'a> {
     ) -> proc_macro2::TokenStream {
         let (impl_generics, ty_generics, _) = self.generics.split_for_impl();
         finish_encode_match_impl(
+            self.crate_path,
             name,
             impl_generics,
             ty_generics,
@@ -113,7 +127,9 @@ impl<'a> EncodeImplParts<'a> {
 }
 
 fn named_entries_with_pats<'a, F>(
+    crate_path: &Path,
     name: &Ident,
+    type_params: &[Ident],
     fields: &[NamedFieldSpec<'a>],
     bounds: &mut Vec<&'a Type>,
     value: F,
@@ -132,7 +148,7 @@ where
         };
         pats.push(quote! { #f_ident });
 
-        if type_needs_trait_bound(field.ty, name) {
+        if type_needs_trait_bound(field.ty, name, type_params) {
             bounds.push(field.ty);
         }
 
@@ -140,7 +156,7 @@ where
         entries.push(map_entry(
             key,
             quote! {
-                m.entry(#key, |enc| ::sacp_cbor::CborEncode::encode(#value_ts, enc))?;
+                m.entry(#key, |enc| #crate_path::CborEncode::encode(#value_ts, enc))?;
             },
         ));
     }
@@ -150,6 +166,7 @@ where
 
 fn tuple_variant_parts<'a>(
     name: &Ident,
+    type_params: &[Ident],
     fields: &[TupleFieldSpec<'a>],
     bounds: &mut Vec<&'a Type>,
 ) -> syn::Result<(Vec<Ident>, Vec<proc_macro2::TokenStream>)> {
@@ -161,7 +178,7 @@ fn tuple_variant_parts<'a>(
         let var = format_ident!("v{idx}");
         pats.push(var.clone());
 
-        if type_needs_trait_bound(field.ty, name) {
+        if type_needs_trait_bound(field.ty, name, type_params) {
             bounds.push(field.ty);
         }
         items.push(quote! { a.value(#var)?; });
@@ -174,7 +191,10 @@ pub(crate) fn encode_struct(
     name: &Ident,
     generics: &Generics,
     data: &DataStruct,
+    attrs: &CborContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    let crate_path = &attrs.crate_path;
+    let type_params = generic_type_params(generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let base_where_clause = where_clause;
 
@@ -184,7 +204,9 @@ pub(crate) fn encode_struct(
             let field_specs = named_fields(fields)?;
 
             let (_, entries) = named_entries_with_pats(
+                crate_path,
                 name,
+                &type_params,
                 &field_specs,
                 &mut bounds,
                 |ident| quote!(&self.#ident),
@@ -193,9 +215,10 @@ pub(crate) fn encode_struct(
 
             let len = entries.len();
             let encode_where_clause =
-                add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
+                add_where_bounds(base_where_clause, bounds, quote!(#crate_path::CborEncode));
 
             Ok(encode_impl(
+                crate_path,
                 name,
                 impl_generics,
                 ty_generics,
@@ -217,7 +240,7 @@ pub(crate) fn encode_struct(
                 let idx = field.index;
                 let index = syn::Index::from(idx);
 
-                if type_needs_trait_bound(field.ty, name) {
+                if type_needs_trait_bound(field.ty, name, &type_params) {
                     bounds.push(field.ty);
                 }
 
@@ -226,9 +249,10 @@ pub(crate) fn encode_struct(
 
             let len = items.len();
             let encode_where_clause =
-                add_where_bounds(base_where_clause, bounds, quote!(::sacp_cbor::CborEncode));
+                add_where_bounds(base_where_clause, bounds, quote!(#crate_path::CborEncode));
 
             Ok(encode_impl(
+                crate_path,
                 name,
                 impl_generics,
                 ty_generics,
@@ -243,6 +267,7 @@ pub(crate) fn encode_struct(
         }
 
         Fields::Unit => Ok(encode_impl(
+            crate_path,
             name,
             impl_generics,
             ty_generics,
@@ -256,24 +281,43 @@ pub(crate) fn encode_enum(
     name: &Ident,
     generics: &Generics,
     data: &DataEnum,
-    attrs: &CborEnumAttr,
+    attrs: &CborContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let variants = enum_variants(data, attrs.rename_all)?;
+    let type_params = generic_type_params(generics);
     match &attrs.tagging {
-        EnumTagging::External => encode_enum_external(name, generics, &variants),
-        EnumTagging::Internal { tag } => encode_enum_internal(name, generics, data, &variants, tag),
-        EnumTagging::Adjacent { tag, content } => {
-            encode_enum_adjacent(name, generics, &variants, tag, content)
+        EnumTagging::External => {
+            encode_enum_external(&attrs.crate_path, name, generics, &type_params, &variants)
         }
+        EnumTagging::Internal { tag } => encode_enum_internal(
+            &attrs.crate_path,
+            name,
+            generics,
+            &type_params,
+            data,
+            &variants,
+            tag,
+        ),
+        EnumTagging::Adjacent { tag, content } => encode_enum_adjacent(
+            &attrs.crate_path,
+            name,
+            generics,
+            &type_params,
+            &variants,
+            tag,
+            content,
+        ),
     }
 }
 
 fn encode_enum_external(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     variants: &[VariantSpec<'_>],
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let impl_parts = EncodeImplParts::new(generics);
+    let impl_parts = EncodeImplParts::new(crate_path, generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
@@ -286,7 +330,7 @@ fn encode_enum_external(
             Fields::Unit => {
                 arms.push(quote! {
                     Self::#ident => enc.map(1, |m| {
-                        m.entry(#vname, ::sacp_cbor::Encoder::null)?;
+                        m.entry(#vname, #crate_path::Encoder::null)?;
                         Ok(())
                     })
                 });
@@ -294,14 +338,15 @@ fn encode_enum_external(
 
             Fields::Unnamed(fields) => {
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
-                let (pats, items) = tuple_variant_parts(name, &field_specs, &mut bounds)?;
+                let (pats, items) =
+                    tuple_variant_parts(name, type_params, &field_specs, &mut bounds)?;
 
                 let len = items.len();
                 if len == 1 {
                     let value = &pats[0];
                     arms.push(quote! {
                         Self::#ident( #(#pats),* ) => enc.map(1, |m| {
-                            m.entry(#vname, |enc| ::sacp_cbor::CborEncode::encode(#value, enc))?;
+                            m.entry(#vname, |enc| #crate_path::CborEncode::encode(#value, enc))?;
                             Ok(())
                         })
                     });
@@ -323,7 +368,9 @@ fn encode_enum_external(
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
                 let (pats, entries) = named_entries_with_pats(
+                    crate_path,
                     name,
+                    type_params,
                     &field_specs,
                     &mut bounds,
                     |ident| quote!(#ident),
@@ -350,15 +397,17 @@ fn encode_enum_external(
 }
 
 fn encode_enum_internal(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     data: &DataEnum,
     variants: &[VariantSpec<'_>],
     tag: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
     validate_internal_tagging(data, tag)?;
 
-    let impl_parts = EncodeImplParts::new(generics);
+    let impl_parts = EncodeImplParts::new(crate_path, generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
@@ -371,7 +420,7 @@ fn encode_enum_internal(
             Fields::Unit => {
                 arms.push(quote! {
                     Self::#ident => enc.map(1, |m| {
-                        m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                        m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
                         Ok(())
                     })
                 });
@@ -379,7 +428,9 @@ fn encode_enum_internal(
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
                 let (pats, mut entries) = named_entries_with_pats(
+                    crate_path,
                     name,
+                    type_params,
                     &field_specs,
                     &mut bounds,
                     |ident| quote!(#ident),
@@ -387,7 +438,7 @@ fn encode_enum_internal(
                 entries.push(map_entry(
                     tag,
                     quote! {
-                        m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                        m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
                     },
                 ));
                 let entries = sort_entries(entries);
@@ -410,13 +461,15 @@ fn encode_enum_internal(
 }
 
 fn encode_enum_adjacent(
+    crate_path: &Path,
     name: &Ident,
     generics: &Generics,
+    type_params: &[Ident],
     variants: &[VariantSpec<'_>],
     tag: &LitStr,
     content: &LitStr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let impl_parts = EncodeImplParts::new(generics);
+    let impl_parts = EncodeImplParts::new(crate_path, generics);
 
     let mut arms = Vec::new();
     let mut bounds = Vec::new();
@@ -431,13 +484,13 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
                         },
                     ),
                     map_entry(
                         content,
                         quote! {
-                            m.entry(#content, ::sacp_cbor::Encoder::null)?;
+                            m.entry(#content, #crate_path::Encoder::null)?;
                         },
                     ),
                 ]);
@@ -450,14 +503,15 @@ fn encode_enum_adjacent(
             }
             Fields::Unnamed(fields) => {
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
-                let (pats, items) = tuple_variant_parts(name, &field_specs, &mut bounds)?;
+                let (pats, items) =
+                    tuple_variant_parts(name, type_params, &field_specs, &mut bounds)?;
                 let len = items.len();
                 let content_entry = if len == 1 {
                     let value = &pats[0];
                     map_entry(
                         content,
                         quote! {
-                            m.entry(#content, |enc| ::sacp_cbor::CborEncode::encode(#value, enc))?;
+                            m.entry(#content, |enc| #crate_path::CborEncode::encode(#value, enc))?;
                         },
                     )
                 } else {
@@ -478,7 +532,7 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
                         },
                     ),
                     content_entry,
@@ -494,7 +548,9 @@ fn encode_enum_adjacent(
             Fields::Named(fields) => {
                 let field_specs = named_fields(fields)?;
                 let (pats, entries) = named_entries_with_pats(
+                    crate_path,
                     name,
+                    type_params,
                     &field_specs,
                     &mut bounds,
                     |ident| quote!(#ident),
@@ -505,7 +561,7 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| ::sacp_cbor::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
                         },
                     ),
                     map_entry(

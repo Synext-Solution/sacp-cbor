@@ -17,7 +17,7 @@ use syn::{parse_macro_input, spanned::Spanned, Data, DataEnum, DeriveInput, Iden
 use crate::cbor_bytes::expand as expand_cbor_bytes;
 use crate::decode::{decode_enum, decode_struct};
 use crate::encode::{encode_enum, encode_struct};
-use crate::schema::parse_cbor_enum_attrs;
+use crate::schema::{parse_cbor_container_attrs, CborContainerKind};
 
 fn ensure_non_empty_enum(name: &Ident, data: &DataEnum, derive_name: &str) -> syn::Result<()> {
     if data.variants.is_empty() {
@@ -36,10 +36,13 @@ pub fn derive_cbor_encode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let out = (|| -> syn::Result<proc_macro2::TokenStream> {
         match &input.data {
-            Data::Struct(data) => encode_struct(&input.ident, &input.generics, data),
+            Data::Struct(data) => {
+                let attrs = parse_cbor_container_attrs(&input.attrs, CborContainerKind::Struct)?;
+                encode_struct(&input.ident, &input.generics, data, &attrs)
+            }
             Data::Enum(data) => {
                 ensure_non_empty_enum(&input.ident, data, "CborEncode")?;
-                let attrs = parse_cbor_enum_attrs(&input.attrs)?;
+                let attrs = parse_cbor_container_attrs(&input.attrs, CborContainerKind::Enum)?;
                 encode_enum(&input.ident, &input.generics, data, &attrs)
             }
             Data::Union(u) => Err(syn::Error::new(
@@ -61,10 +64,13 @@ pub fn derive_cbor_decode(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let out = (|| -> syn::Result<proc_macro2::TokenStream> {
         match &input.data {
-            Data::Struct(data) => decode_struct(&input.ident, &input.generics, data),
+            Data::Struct(data) => {
+                let attrs = parse_cbor_container_attrs(&input.attrs, CborContainerKind::Struct)?;
+                decode_struct(&input.ident, &input.generics, data, &attrs)
+            }
             Data::Enum(data) => {
                 ensure_non_empty_enum(&input.ident, data, "CborDecode")?;
-                let attrs = parse_cbor_enum_attrs(&input.attrs)?;
+                let attrs = parse_cbor_container_attrs(&input.attrs, CborContainerKind::Enum)?;
                 decode_enum(&input.ident, &input.generics, data, &attrs)
             }
             Data::Union(u) => Err(syn::Error::new(

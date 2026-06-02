@@ -1,0 +1,5 @@
+error: unsupported `cbor(...)` struct attribute (allowed: crate)
+ --> tests/ui/struct_container_enum_attr.rs:4:8
+  |
+4 | #[cbor(rename_all = "snake_case")]
+  |        ^^^^^^^^^^
