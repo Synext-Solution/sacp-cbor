@@ -122,8 +122,8 @@ jobs:
           }
 
           wait_for_published() {
-            crate="$1"
-            version="$2"
+            local crate="$1"
+            local version="$2"
             for attempt in $(seq 1 30); do
               if is_published "$crate" "$version" && cargo info "${crate}@${version}" >/dev/null 2>&1; then
                 return 0
@@ -183,9 +183,10 @@ jobs:
           fi
 
           publish_crate() {
-            crate="$1"
-            version="$2"
-            package="$3"
+            local crate="$1"
+            local version="$2"
+            local package="$3"
+            local published
 
             set +e
             is_published "$crate" "$version"
