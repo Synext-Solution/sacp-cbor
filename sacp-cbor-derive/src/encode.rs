@@ -165,6 +165,7 @@ where
 }
 
 fn tuple_variant_parts<'a>(
+    crate_path: &Path,
     name: &Ident,
     type_params: &[Ident],
     fields: &[TupleFieldSpec<'a>],
@@ -181,7 +182,7 @@ fn tuple_variant_parts<'a>(
         if type_needs_trait_bound(field.ty, name, type_params) {
             bounds.push(field.ty);
         }
-        items.push(quote! { a.value(#var)?; });
+        items.push(quote! { #crate_path::CborEncode::encode_array_item(#var, a)?; });
     }
 
     Ok((pats, items))
@@ -244,7 +245,9 @@ pub(crate) fn encode_struct(
                     bounds.push(field.ty);
                 }
 
-                items.push(quote! { a.value(&self.#index)?; });
+                items.push(quote! {
+                    #crate_path::CborEncode::encode_array_item(&self.#index, a)?;
+                });
             }
 
             let len = items.len();
@@ -339,7 +342,7 @@ fn encode_enum_external(
             Fields::Unnamed(fields) => {
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
                 let (pats, items) =
-                    tuple_variant_parts(name, type_params, &field_specs, &mut bounds)?;
+                    tuple_variant_parts(crate_path, name, type_params, &field_specs, &mut bounds)?;
 
                 let len = items.len();
                 if len == 1 {
@@ -504,7 +507,7 @@ fn encode_enum_adjacent(
             Fields::Unnamed(fields) => {
                 let field_specs = tuple_fields(fields, "tuple enum variant fields")?;
                 let (pats, items) =
-                    tuple_variant_parts(name, type_params, &field_specs, &mut bounds)?;
+                    tuple_variant_parts(crate_path, name, type_params, &field_specs, &mut bounds)?;
                 let len = items.len();
                 let content_entry = if len == 1 {
                     let value = &pats[0];

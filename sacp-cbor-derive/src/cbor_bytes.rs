@@ -4,24 +4,25 @@ use quote::{format_ident, quote};
 use syn::{
     braced, bracketed,
     parse::{Parse, ParseStream},
-    Expr, Ident, LitStr, Result, Token,
+    parse_quote, Expr, Ident, LitStr, Path, Result, Token,
 };
 
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
-    let value = syn::parse_macro_input!(input as Value);
-    if let Err(err) = validate_value(&value) {
+    let input = syn::parse_macro_input!(input as MacroInput);
+    if let Err(err) = validate_value(&input.value) {
         return err.to_compile_error().into();
     }
 
-    let mut emitter = Emitter::new();
+    let crate_path = &input.crate_path;
+    let mut emitter = Emitter::new(crate_path);
     let enc = format_ident!("__cbor_enc");
     let enc_ref = format_ident!("__cbor_enc_ref");
-    let body = emitter.emit_value(&value, &enc_ref, Target::Encoder);
+    let body = emitter.emit_value(&input.value, &enc_ref, Target::Encoder);
 
     let out = quote! {
         {
-            (|| -> ::core::result::Result<::sacp_cbor::CanonicalCbor, ::sacp_cbor::CborError> {
-                let mut #enc = ::sacp_cbor::Encoder::new();
+            (|| -> ::core::result::Result<#crate_path::CanonicalCbor, #crate_path::CborError> {
+                let mut #enc = #crate_path::Encoder::new();
                 {
                     let #enc_ref = &mut #enc;
                     #body?;
@@ -32,6 +33,30 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(out)
+}
+
+struct MacroInput {
+    crate_path: Path,
+    value: Value,
+}
+
+impl Parse for MacroInput {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let crate_path = if input.peek(Token![crate]) {
+            input.parse::<Token![crate]>()?;
+            input.parse::<Token![=]>()?;
+            let path = input.parse::<Path>()?;
+            input.parse::<Token![;]>()?;
+            path
+        } else {
+            parse_quote!(::sacp_cbor)
+        };
+        let value = input.parse::<Value>()?;
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after cbor_bytes! value"));
+        }
+        Ok(Self { crate_path, value })
+    }
 }
 
 fn validate_value(value: &Value) -> Result<()> {
@@ -137,8 +162,9 @@ impl Parse for MapEntry {
     }
 }
 
-struct Emitter {
+struct Emitter<'a> {
     counter: usize,
+    crate_path: &'a Path,
 }
 
 #[derive(Clone, Copy)]
@@ -147,9 +173,12 @@ enum Target {
     Array,
 }
 
-impl Emitter {
-    fn new() -> Self {
-        Self { counter: 0 }
+impl<'a> Emitter<'a> {
+    fn new(crate_path: &'a Path) -> Self {
+        Self {
+            counter: 0,
+            crate_path,
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> Ident {
@@ -159,11 +188,14 @@ impl Emitter {
     }
 
     fn emit_value(&mut self, value: &Value, enc: &Ident, target: Target) -> TokenStream2 {
+        let crate_path = &self.crate_path;
         match value {
             Value::Null => quote! { #enc.null() },
             Value::Expr(expr) => match target {
-                Target::Encoder => quote! { ::sacp_cbor::CborEncode::encode(&#expr, #enc) },
-                Target::Array => quote! { #enc.value(&#expr) },
+                Target::Encoder => quote! { #crate_path::CborEncode::encode(&#expr, #enc) },
+                Target::Array => {
+                    quote! { #crate_path::CborEncode::encode_array_item(&#expr, #enc) }
+                }
             },
             Value::Array(elems) => {
                 let len = elems.len();
@@ -183,7 +215,7 @@ impl Emitter {
             Value::Map(entries) => {
                 let len = entries.len();
                 let map = self.fresh("map");
-                let mut entries_sorted = entries.clone();
+                let mut entries_sorted: Vec<&MapEntry> = entries.iter().collect();
                 entries_sorted.sort_by(|a, b| {
                     a.key_bytes
                         .len()
@@ -191,7 +223,7 @@ impl Emitter {
                         .then_with(|| a.key_bytes.cmp(&b.key_bytes))
                 });
                 let mut entry_stmts = Vec::with_capacity(len);
-                for entry in &entries_sorted {
+                for entry in entries_sorted {
                     let key = &entry.key;
                     let enc_inner = self.fresh("enc");
                     let expr = self.emit_value(&entry.value, &enc_inner, Target::Encoder);

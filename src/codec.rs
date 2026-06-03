@@ -31,6 +31,6 @@ pub trait CborEncode {
     ///
     /// Returns an error if encoding fails.
     fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-        array.encode_value_fallback(self)
+        array.value_with(|enc| self.encode(enc))
     }
 }

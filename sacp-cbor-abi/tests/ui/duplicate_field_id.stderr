@@ -1,0 +1,5 @@
+error: duplicate ABI field ID `1`
+ --> tests/ui/duplicate_field_id.rs:8:5
+  |
+8 |     #[abi(id = 1)]
+  |     ^

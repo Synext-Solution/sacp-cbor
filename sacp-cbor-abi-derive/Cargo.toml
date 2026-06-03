@@ -1,9 +1,10 @@
 [package]
-name = "sacp-cbor-derive"
-version = "0.15.0"
+name = "sacp-cbor-abi-derive"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 license = "MIT"
-description = "Derive macros for sacp-cbor native encode/decode"
+description = "Derive macros for sacp-cbor stable ABI schemas"
 repository = "https://github.com/Synext-Solution/sacp-cbor"
 
 [lib]

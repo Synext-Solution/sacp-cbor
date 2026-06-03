@@ -1219,10 +1219,18 @@ impl ArrayEncoder<'_> {
         self.delegate(|enc| enc.raw_value_ref(v))
     }
 
-    pub(crate) fn encode_value_fallback<T: CborEncode + ?Sized>(
-        &mut self,
-        value: &T,
-    ) -> Result<(), CborError> {
+    /// Encode a value using a custom encoder callback as the next array element.
+    ///
+    /// The callback must emit exactly one complete CBOR value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the array length is exceeded, the callback fails, or the callback emits
+    /// zero or multiple values.
+    pub fn value_with<F>(&mut self, f: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
         let before = self.remaining;
         if before == 0 {
             return Err(CborError::new(
@@ -1232,7 +1240,7 @@ impl ArrayEncoder<'_> {
         }
         self.sync_to_stack()?;
         let checkpoint = self.enc.checkpoint();
-        if let Err(err) = value.encode(self.enc) {
+        if let Err(err) = f(self.enc) {
             self.enc.restore(checkpoint);
             self.remaining = before;
             return Err(err);

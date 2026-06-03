@@ -380,11 +380,7 @@ pub(crate) fn parse_cbor_variant_attrs(attrs: &[Attribute]) -> syn::Result<CborV
     Ok(out)
 }
 
-fn parse_cbor_crate_path(lit: &LitStr) -> syn::Result<Path> {
-    let path = lit.parse::<Path>().map_err(|err| {
-        syn::Error::new(lit.span(), format!("invalid `cbor(crate=...)` path: {err}"))
-    })?;
-
+fn validate_cbor_crate_path(path: Path) -> syn::Result<Path> {
     for segment in &path.segments {
         if !matches!(segment.arguments, PathArguments::None) {
             return Err(syn::Error::new(
@@ -416,8 +412,11 @@ pub(crate) fn parse_cbor_container_attrs(
                 if crate_path.is_some() {
                     return Err(meta.error("duplicate `cbor(crate=...)`"));
                 }
-                let lit: LitStr = meta.value()?.parse()?;
-                crate_path = Some(parse_cbor_crate_path(&lit)?);
+                let path = meta
+                    .value()?
+                    .parse::<Path>()
+                    .map_err(|err| meta.error(format!("invalid `cbor(crate=...)` path: {err}")))?;
+                crate_path = Some(validate_cbor_crate_path(path)?);
                 return Ok(());
             }
             if kind == CborContainerKind::Struct {

@@ -49,7 +49,7 @@ fn tuple_decode_parts(
             add_where_bound(wc, field.ty, quote!(#crate_path::CborDecode<#decode_lt>));
         }
         decodes.push(quote! {
-            let #var = match array.next_value()? {
+            let #var = match array.decode_next(#crate_path::CborDecode::decode)? {
                 ::core::option::Option::Some(value) => value,
                 ::core::option::Option::None => {
                     return Err(#crate_path::CborError::new(
@@ -213,7 +213,7 @@ fn decode_named_fields(
                         __key.offset,
                     ));
                 }
-                map.next_value()?
+                map.decode_value(#crate_path::CborDecode::decode)?
             };
         });
         finals.push(quote! { #ident: #var, });
@@ -636,7 +636,9 @@ fn decode_enum_internal(
         let storage = &slot.storage;
         quote! {
             #key => {
-                #storage = ::core::option::Option::Some(map.next_value()?);
+                    #storage = ::core::option::Option::Some(
+                        map.decode_value(#crate_path::CborDecode::decode)?
+                    );
             }
         }
     });
@@ -728,7 +730,9 @@ fn decode_enum_internal(
                 while let ::core::option::Option::Some(k) = map.next_key_ref()? {
                     match k.text {
                         #tag => {
-                            __tag = ::core::option::Option::Some(map.next_value()?);
+                            __tag = ::core::option::Option::Some(
+                                map.decode_value(#crate_path::CborDecode::decode)?
+                            );
                         }
                         #(#slot_matches)*
                         _ => {
@@ -891,10 +895,14 @@ fn decode_enum_adjacent(
                 while let ::core::option::Option::Some(k) = map.next_key_ref()? {
                     match k.text {
                         #tag => {
-                            __tag = ::core::option::Option::Some(map.next_value()?);
+                            __tag = ::core::option::Option::Some(
+                                map.decode_value(#crate_path::CborDecode::decode)?
+                            );
                         }
                         #content => {
-                            __content = ::core::option::Option::Some(map.next_value()?);
+                            __content = ::core::option::Option::Some(
+                                map.decode_value(#crate_path::CborDecode::decode)?
+                            );
                         }
                         _ => {
                             map.skip_value()?;

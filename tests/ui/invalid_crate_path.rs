@@ -1,7 +1,7 @@
 use sacp_cbor::CborEncode;
 
 #[derive(CborEncode)]
-#[cbor(crate = "not a path")]
+#[cbor(crate = sacp_cbor::<u8>)]
 struct Bad {
     value: u64,
 }

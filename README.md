@@ -68,19 +68,19 @@ This crate supports `no_std` when default features are disabled. Default feature
 **Default Rust (std + alloc):**
 ```toml
 [dependencies]
-sacp-cbor = "0.13"
+sacp-cbor = "0.15"
 ```
 
 **`no_std` + `alloc`:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.13", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.15", default-features = false, features = ["alloc"] }
 ```
 
 **`std` + serde + sha2:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.13", default-features = false, features = ["std", "serde", "sha2"] }
+sacp-cbor = { version = "0.15", default-features = false, features = ["std", "serde", "sha2"] }
 ```
 
 > In Rust code the crate name is typically `sacp_cbor` (hyphen becomes underscore).
@@ -551,13 +551,13 @@ You must write exactly `len` items; otherwise:
 
 ## Macros (`derive`)
 
-### `#[cbor(crate = "...")]`
+### `#[cbor(crate = path::to::runtime)]`
 
 `CborEncode` and `CborDecode` derive accept a container-level runtime path:
 
 ```rust
 #[derive(CborEncode, CborDecode)]
-#[cbor(crate = "my_crate::codec::cbor")]
+#[cbor(crate = my_crate::codec::cbor)]
 struct Msg {
     id: u64,
 }
@@ -568,7 +568,8 @@ The path must name a module that exposes the derive runtime API:
 ```rust
 pub mod cbor {
     pub use sacp_cbor::{
-        CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder, ErrorCode,
+        CanonicalCbor, CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder,
+        ErrorCode,
     };
 
     pub mod query {
@@ -596,6 +597,12 @@ let bytes = cbor_bytes!({
 })?;
 ```
 
+Facade crates can select the macro runtime path explicitly:
+
+```rust
+let bytes = cbor_bytes!(crate = my_crate::codec::cbor; { id: 7 })?;
+```
+
 Splicing existing canonical fragments (still copied into output, but no decoding/re-encoding):
 
 ```rust
@@ -612,6 +619,38 @@ let out = cbor_bytes!([canon, 1, 2, 3])?; // array whose first element is the ex
 - Time: `O(output_bytes)`
 - Space: output buffer
 - Map order enforcement: same as `Encoder`/`encode::MapEncoder`
+
+---
+
+## Stable public ABI (`sacp-cbor-abi`)
+
+`#[derive(CborEncode, CborDecode)]` is intentionally a Rust-shape codec. It is useful for internal
+types, but public protocols should use the separate `sacp-cbor-abi` crate.
+
+The ABI layer is opt-in and uses stable numeric IDs:
+
+```rust
+use sacp_cbor_abi::CborAbi;
+
+#[derive(CborAbi)]
+#[abi(type_id = "ledger.Transfer", version = 1)]
+struct Transfer {
+  #[abi(id = 1)]
+  from: u64,
+  #[abi(id = 2)]
+  to: u64,
+  #[abi(id = 3)]
+  amount: u64,
+  #[abi(id = 4, optional)]
+  memo: Option<String>,
+}
+```
+
+- Structs encode as field-set arrays: `[field_id, value, ...]`, sorted by field ID.
+- Enums encode as `[variant_id, payload]`; named variants use field-set payloads and unit variants use `null`.
+- Required `Option<T>` fields are rejected; optional fields are omitted when `None`.
+- Schema hashes are SHA-256 over a canonical schema normal form.
+- `sacp_cbor_abi::diff` classifies compatible and incompatible schema changes for CI.
 
 ---
 
@@ -936,7 +975,7 @@ Common trait coverage for derive-driven models includes:
 
   - literal map entries are sorted into canonical order at macro expansion
 
-- `#[cbor(crate = "...")]` on `CborEncode` / `CborDecode` derive containers selects the generated runtime API path
+- `#[cbor(crate = path::to::runtime)]` on `CborEncode` / `CborDecode` derive containers selects the generated runtime API path
 
 ### Serde (`serde` + `alloc`)
 

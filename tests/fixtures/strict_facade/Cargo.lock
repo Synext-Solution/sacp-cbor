@@ -3,13 +3,6 @@
 version = 4
 
 [[package]]
-name = "derive-crate-path-override-fixture"
-version = "0.0.0"
-dependencies = [
- "sacp-cbor",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -41,6 +34,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "strict-facade-fixture"
+version = "0.0.0"
+dependencies = [
+ "sacp-cbor",
 ]
 
 [[package]]

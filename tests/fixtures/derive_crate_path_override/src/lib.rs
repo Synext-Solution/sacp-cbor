@@ -13,22 +13,22 @@ pub mod codec {
 use codec::cbor::{CborDecode, CborEncode};
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor")]
+#[cbor(crate = crate::codec::cbor)]
 pub struct BorrowedGeneric<'a, T> {
     pub name: &'a str,
     pub value: T,
 }
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor")]
+#[cbor(crate = crate::codec::cbor)]
 pub struct TupleGeneric<T>(pub T, pub u64);
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor")]
+#[cbor(crate = crate::codec::cbor)]
 pub struct Unit;
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor")]
+#[cbor(crate = crate::codec::cbor)]
 pub enum External<T> {
     Newtype(T),
     Pair(u64, bool),
@@ -36,7 +36,7 @@ pub enum External<T> {
 }
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor", tag = "kind")]
+#[cbor(crate = crate::codec::cbor, tag = "kind")]
 #[cbor(rename_all = "snake_case")]
 pub enum Internal<'a, T> {
     Ready { name: &'a str, value: T },
@@ -44,7 +44,7 @@ pub enum Internal<'a, T> {
 }
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
-#[cbor(crate = "crate::codec::cbor", tag = "kind", content = "data")]
+#[cbor(crate = crate::codec::cbor, tag = "kind", content = "data")]
 pub enum Adjacent<'a> {
     Unit,
     One(&'a str),

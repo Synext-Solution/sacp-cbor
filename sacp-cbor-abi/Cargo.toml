@@ -1,0 +1,20 @@
+[package]
+name = "sacp-cbor-abi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Stable ABI schema and codegen layer for sacp-cbor"
+repository = "https://github.com/Synext-Solution/sacp-cbor"
+
+[features]
+default = ["derive"]
+derive = ["dep:sacp-cbor-abi-derive"]
+
+[dependencies]
+sacp-cbor = { path = "..", version = "0.15.0", default-features = false, features = ["alloc"] }
+sacp-cbor-abi-derive = { path = "../sacp-cbor-abi-derive", version = "0.1.0", optional = true }
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+trybuild = "1"

@@ -98,6 +98,16 @@ derive grammar. External unit variants use the same one-entry map shape as data 
 `null` payload. Adjacent variants always include both tag and content; unit content is `null`.
 Internal variants reject fields not belonging to the selected variant.
 
+## Stable ABI Schema Layer
+
+The optional `sacp-cbor-abi` crate defines public ABI codecs above this canonical profile.
+ABI structs encode as field-set arrays of `[field_id, value, ...]` sorted by nonzero numeric field
+ID. ABI enums encode as `[variant_id, payload]`, where unit payloads are `null` and named variant
+payloads are field-set arrays. Optional fields are `Option<T>` and are omitted when absent; required
+`Option<T>` is rejected by the derive macro. ABI schemas include a stable type ID, version, profile,
+numeric field and variant IDs, unknown-field policy, and a SHA-256 hash over canonical schema normal
+form bytes.
+
 ## Collection Policy
 
 `Vec<T>` represents a CBOR array. Byte strings use `Bytes`, `BytesRef`, byte slices, or fixed byte

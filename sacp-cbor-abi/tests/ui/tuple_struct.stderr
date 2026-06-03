@@ -1,0 +1,5 @@
+error: public ABI structs must use named fields; tuple structs require an explicit transparent ABI design
+ --> tests/ui/tuple_struct.rs:5:11
+  |
+5 | struct Bad(#[abi(id = 1)] u64);
+  |           ^^^^^^^^^^^^^^^^^^^^

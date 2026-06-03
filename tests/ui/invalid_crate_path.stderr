@@ -1,5 +1,5 @@
-error: invalid `cbor(crate=...)` path: unexpected token
- --> tests/ui/invalid_crate_path.rs:4:16
+error: `cbor(crate=...)` must be a module path without generic arguments
+ --> tests/ui/invalid_crate_path.rs:4:25
   |
-4 | #[cbor(crate = "not a path")]
-  |                ^^^^^^^^^^^^
+4 | #[cbor(crate = sacp_cbor::<u8>)]
+  |                         ^

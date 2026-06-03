@@ -1,9 +1,16 @@
 # Changelog
 
+## 0.15.0
+
+- **Breaking:** crate-path attributes use token paths: `#[cbor(crate = my_crate::codec::cbor)]`.
+- Made derives and `cbor_bytes!` facade-safe for wrapper traits by routing generated encode/decode calls through the configured runtime path.
+- Added `ArrayEncoder::value_with` for facade and codegen integrations that need closure-based array element encoding.
+- Added `sacp-cbor-abi` and `sacp-cbor-abi-derive` for stable public ABI schemas, numeric field/variant IDs, schema hashes, compatibility checks, and golden-vector tests.
+
 ## 0.14.0
 
 - **Breaking:** derive container attributes are now validated on structs as well as enums; unsupported struct-level `#[cbor(...)]` attributes fail at compile time.
-- Added `#[cbor(crate = "...")]` on `CborEncode` and `CborDecode` derives so framework facades can provide the runtime API path used by generated impls.
+- Added a derive crate-path override so framework facades can provide the runtime API path used by generated impls.
 - Tightened derive bounds for borrowed fields so lifetime-only field types do not receive unnecessary trait bounds.
 
 ## 0.13.0
