@@ -68,19 +68,19 @@ This crate supports `no_std` when default features are disabled. Default feature
 **Default Rust (std + alloc):**
 ```toml
 [dependencies]
-sacp-cbor = "0.15"
+sacp-cbor = "0.16"
 ```
 
 **`no_std` + `alloc`:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.15", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.16", default-features = false, features = ["alloc"] }
 ```
 
 **`std` + serde + sha2:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.15", default-features = false, features = ["std", "serde", "sha2"] }
+sacp-cbor = { version = "0.16", default-features = false, features = ["std", "serde", "sha2"] }
 ```
 
 > In Rust code the crate name is typically `sacp_cbor` (hyphen becomes underscore).
@@ -649,8 +649,14 @@ struct Transfer {
 - Structs encode as field-set arrays: `[field_id, value, ...]`, sorted by field ID.
 - Enums encode as `[variant_id, payload]`; named variants use field-set payloads and unit variants use `null`.
 - Required `Option<T>` fields are rejected; optional fields are omitted when `None`.
-- Schema hashes are SHA-256 over a canonical schema normal form.
-- `sacp_cbor_abi::diff` classifies compatible and incompatible schema changes for CI.
+- Field types use stable `TypeRef` values; Rust path spelling is not schema identity.
+- `wire_hash` covers wire-significant schema data; `full_hash` also covers version and diagnostic names.
+- `sacp_cbor_abi::diff` reports `new_reads_old`, `old_reads_new`, and `old_preserves_new`.
+- Unknown fields can be rejected, ignored, or preserved with `UnknownFields`.
+- Unknown enum variants can be preserved with an `#[abi(unknown)]` variant.
+- Transparent newtypes encode exactly like their inner type while keeping a named ABI identity.
+- Lifetime-only ABI types can borrow decoded text and canonical sub-values from the input.
+- Facade crates can route generated code with `#[abi(crate = path::to::abi, cbor = path::to::cbor)]`.
 
 ---
 

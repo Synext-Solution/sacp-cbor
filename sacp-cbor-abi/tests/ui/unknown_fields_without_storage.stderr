@@ -1,0 +1,9 @@
+error: `abi(unknown_fields = "preserve")` requires one `#[abi(unknown_fields)]` storage field
+ --> tests/ui/unknown_fields_without_storage.rs:5:12
+  |
+5 |   struct Bad {
+  |  ____________^
+6 | |     #[abi(id = 1)]
+7 | |     value: u64,
+8 | | }
+  | |_^

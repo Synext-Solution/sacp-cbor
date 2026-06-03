@@ -1,4 +1,4 @@
-error: required `Option<T>` fields are not allowed; add `abi(optional)` or use a non-Option type
+error: required `Option<T>` fields are not valid ABI fields
  --> tests/ui/required_option.rs:7:12
   |
 7 |     maybe: Option<u64>,

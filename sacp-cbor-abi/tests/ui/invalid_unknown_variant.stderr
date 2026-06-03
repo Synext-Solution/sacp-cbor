@@ -1,0 +1,5 @@
+error: `abi(unknown)` variant must be a one-field tuple variant
+ --> tests/ui/invalid_unknown_variant.rs:9:13
+  |
+9 |     Unknown { id: u32 },
+  |             ^^^^^^^^^^^

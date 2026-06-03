@@ -105,8 +105,11 @@ ABI structs encode as field-set arrays of `[field_id, value, ...]` sorted by non
 ID. ABI enums encode as `[variant_id, payload]`, where unit payloads are `null` and named variant
 payloads are field-set arrays. Optional fields are `Option<T>` and are omitted when absent; required
 `Option<T>` is rejected by the derive macro. ABI schemas include a stable type ID, version, profile,
-numeric field and variant IDs, unknown-field policy, and a SHA-256 hash over canonical schema normal
-form bytes.
+structured type references, numeric field and variant IDs, unknown-field policy, and unknown-variant
+policy. The schema layer defines separate SHA-256 hashes for wire-significant data and full
+diagnostic metadata. Unknown fields may be rejected, ignored, or preserved; unknown enum variants
+may be rejected or preserved. Lifetime-only derived ABI types may borrow decoded field values from
+the input.
 
 ## Collection Policy
 

@@ -1,0 +1,5 @@
+error: `abi(ty_version=...)` requires `abi(ty=...)`
+ --> tests/ui/ty_version_without_ty.rs:6:5
+  |
+6 |     #[abi(id = 1, ty_version = 1)]
+  |     ^

@@ -6,56 +6,95 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote};
+use syn::fold::{self, Fold};
 use syn::{
     parse_macro_input, spanned::Spanned, Attribute, Data, DataEnum, DataStruct, DeriveInput, Field,
-    Fields, GenericArgument, Ident, LitInt, LitStr, PathArguments, Type,
+    Fields, GenericArgument, GenericParam, Generics, Ident, Lifetime, LitInt, LitStr, Path,
+    PathArguments, Type,
 };
 
-#[derive(Clone, Copy)]
-enum UnknownPolicy {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownFieldMode {
     Reject,
     Ignore,
+    Preserve,
 }
 
-impl UnknownPolicy {
-    fn tokens(self) -> proc_macro2::TokenStream {
+impl UnknownFieldMode {
+    fn tokens(self, abi_path: &Path) -> proc_macro2::TokenStream {
         match self {
-            Self::Reject => quote!(::sacp_cbor_abi::UnknownFieldPolicy::Reject),
-            Self::Ignore => quote!(::sacp_cbor_abi::UnknownFieldPolicy::Ignore),
+            Self::Reject => quote!(#abi_path::UnknownFieldPolicy::Reject),
+            Self::Ignore => quote!(#abi_path::UnknownFieldPolicy::Ignore),
+            Self::Preserve => quote!(#abi_path::UnknownFieldPolicy::Preserve),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnknownVariantMode {
+    Reject,
+    Preserve,
+}
+
+impl UnknownVariantMode {
+    fn tokens(self, abi_path: &Path) -> proc_macro2::TokenStream {
+        match self {
+            Self::Reject => quote!(#abi_path::UnknownVariantPolicy::Reject),
+            Self::Preserve => quote!(#abi_path::UnknownVariantPolicy::Preserve),
         }
     }
 }
 
 struct ContainerAttr {
+    abi_path: Path,
+    cbor_path: Path,
     type_id: LitStr,
     version: u32,
-    unknown_fields: UnknownPolicy,
+    unknown_fields: UnknownFieldMode,
+    unknown_variants: Option<UnknownVariantMode>,
+    transparent: bool,
+    try_from: Option<Path>,
 }
 
 struct FieldAttr {
     id: Option<u32>,
     optional: bool,
+    ty: Option<LitStr>,
+    ty_version: Option<u32>,
+    unknown_fields: bool,
 }
 
 struct VariantAttr {
     id: Option<u32>,
+    unknown: bool,
 }
 
 struct FieldSpec<'a> {
     ident: &'a Ident,
     id: u32,
-    ty: &'a Type,
     wire_ty: &'a Type,
-    ty_name: String,
+    decode_ty: Type,
+    decode_wire_ty: Type,
     optional: bool,
+    ty_override: Option<LitStr>,
+    ty_version: Option<u32>,
+}
+
+struct FieldSetSpec<'a> {
+    fields: Vec<FieldSpec<'a>>,
+    unknown_field: Option<&'a Ident>,
 }
 
 struct VariantSpec<'a> {
     ident: &'a Ident,
     id: u32,
-    fields: Vec<FieldSpec<'a>>,
+    fields: FieldSetSpec<'a>,
     unit: bool,
+}
+
+struct UnknownVariantSpec<'a> {
+    ident: &'a Ident,
 }
 
 #[proc_macro_derive(CborAbi, attributes(abi))]
@@ -63,16 +102,11 @@ struct VariantSpec<'a> {
 pub fn derive_cbor_abi(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let out = (|| -> syn::Result<proc_macro2::TokenStream> {
-        if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
-            return Err(syn::Error::new(
-                input.generics.span(),
-                "CborAbi does not support generic public ABI types",
-            ));
-        }
+        validate_generics(&input.generics)?;
         let attrs = parse_container_attrs(&input.attrs)?;
         match &input.data {
-            Data::Struct(data) => derive_struct(&input.ident, data, &attrs),
-            Data::Enum(data) => derive_enum(&input.ident, data, &attrs),
+            Data::Struct(data) => derive_struct(&input.ident, &input.generics, data, &attrs),
+            Data::Enum(data) => derive_enum(&input.ident, &input.generics, data, &attrs),
             Data::Union(u) => Err(syn::Error::new(
                 u.union_token.span(),
                 "CborAbi does not support unions",
@@ -86,17 +120,79 @@ pub fn derive_cbor_abi(input: TokenStream) -> TokenStream {
     }
 }
 
+fn validate_generics(generics: &Generics) -> syn::Result<()> {
+    if generics.where_clause.is_some()
+        || generics
+            .params
+            .iter()
+            .any(|param| !matches!(param, GenericParam::Lifetime(_)))
+    {
+        return Err(syn::Error::new(
+            generics.span(),
+            "CborAbi supports lifetimes but not type parameters, const parameters, or where clauses",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_ty_generics(generics: &Generics) -> proc_macro2::TokenStream {
+    let count = generics.lifetimes().count();
+    if count == 0 {
+        quote! {}
+    } else {
+        let lifetimes = (0..count).map(|_| quote!('__sacp_abi));
+        quote!(<#(#lifetimes),*>)
+    }
+}
+
+fn decode_type(ty: &Type) -> Type {
+    struct DecodeLifetime;
+
+    impl Fold for DecodeLifetime {
+        fn fold_lifetime(&mut self, _: Lifetime) -> Lifetime {
+            syn::parse_quote!('__sacp_abi)
+        }
+
+        fn fold_type_reference(&mut self, mut node: syn::TypeReference) -> syn::TypeReference {
+            if node.lifetime.is_none() {
+                node.lifetime = Some(syn::parse_quote!('__sacp_abi));
+            }
+            fold::fold_type_reference(self, node)
+        }
+    }
+
+    DecodeLifetime.fold_type(ty.clone())
+}
+
 fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttr> {
+    let mut abi_path = None;
+    let mut cbor_path = None;
     let mut type_id = None;
     let mut version = None;
-    let mut unknown_fields = UnknownPolicy::Reject;
+    let mut unknown_fields = UnknownFieldMode::Reject;
+    let mut unknown_variants = None;
     let mut transparent = false;
+    let mut try_from = None;
 
     for attr in attrs {
         if !attr.path().is_ident("abi") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                if abi_path.is_some() {
+                    return Err(meta.error("duplicate `abi(crate=...)`"));
+                }
+                abi_path = Some(meta.value()?.parse::<Path>()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("cbor") {
+                if cbor_path.is_some() {
+                    return Err(meta.error("duplicate `abi(cbor=...)`"));
+                }
+                cbor_path = Some(meta.value()?.parse::<Path>()?);
+                return Ok(());
+            }
             if meta.path.is_ident("type_id") {
                 if type_id.is_some() {
                     return Err(meta.error("duplicate `abi(type_id=...)`"));
@@ -114,29 +210,58 @@ fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttr> {
             if meta.path.is_ident("unknown_fields") {
                 let lit = meta.value()?.parse::<LitStr>()?;
                 unknown_fields = match lit.value().as_str() {
-                    "reject" => UnknownPolicy::Reject,
-                    "ignore" => UnknownPolicy::Ignore,
+                    "reject" => UnknownFieldMode::Reject,
+                    "ignore" => UnknownFieldMode::Ignore,
+                    "preserve" => UnknownFieldMode::Preserve,
                     _ => {
                         return Err(syn::Error::new(
                             lit.span(),
-                            "unknown_fields must be `reject` or `ignore`",
+                            "unknown_fields must be `reject`, `ignore`, or `preserve`",
                         ))
                     }
                 };
                 return Ok(());
             }
+            if meta.path.is_ident("unknown_variants") {
+                if unknown_variants.is_some() {
+                    return Err(meta.error("duplicate `abi(unknown_variants=...)`"));
+                }
+                let lit = meta.value()?.parse::<LitStr>()?;
+                unknown_variants = Some(match lit.value().as_str() {
+                    "reject" => UnknownVariantMode::Reject,
+                    "preserve" => UnknownVariantMode::Preserve,
+                    _ => {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            "unknown_variants must be `reject` or `preserve`",
+                        ))
+                    }
+                });
+                return Ok(());
+            }
             if meta.path.is_ident("transparent") {
+                if transparent {
+                    return Err(meta.error("duplicate `abi(transparent)`"));
+                }
                 transparent = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("try_from") {
+                if try_from.is_some() {
+                    return Err(meta.error("duplicate `abi(try_from=...)`"));
+                }
+                let lit = meta.value()?.parse::<LitStr>()?;
+                try_from = Some(lit.parse::<Path>()?);
                 return Ok(());
             }
             Err(meta.error("unsupported `abi(...)` container attribute"))
         })?;
     }
 
-    if transparent {
+    if try_from.is_some() && !transparent {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "`abi(transparent)` is reserved and is not implemented yet",
+            "`abi(try_from=...)` requires `abi(transparent)`",
         ));
     }
 
@@ -151,15 +276,25 @@ fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttr> {
     })?;
 
     Ok(ContainerAttr {
+        abi_path: abi_path.unwrap_or_else(|| syn::parse_quote!(::sacp_cbor_abi)),
+        cbor_path: cbor_path
+            .unwrap_or_else(|| syn::parse_quote!(::sacp_cbor_abi::__private::sacp_cbor)),
         type_id,
         version,
         unknown_fields,
+        unknown_variants,
+        transparent,
+        try_from,
     })
 }
 
 fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttr> {
     let mut id = None;
     let mut optional = false;
+    let mut ty = None;
+    let mut ty_version = None;
+    let mut unknown_fields = false;
+
     for attr in &field.attrs {
         if !attr.path().is_ident("abi") {
             continue;
@@ -179,14 +314,51 @@ fn parse_field_attrs(field: &Field) -> syn::Result<FieldAttr> {
                 optional = true;
                 return Ok(());
             }
+            if meta.path.is_ident("ty") {
+                if ty.is_some() {
+                    return Err(meta.error("duplicate `abi(ty=...)`"));
+                }
+                ty = Some(meta.value()?.parse::<LitStr>()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("ty_version") {
+                if ty_version.is_some() {
+                    return Err(meta.error("duplicate `abi(ty_version=...)`"));
+                }
+                ty_version = Some(parse_u32_lit(&meta.value()?.parse::<LitInt>()?)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("unknown_fields") {
+                if unknown_fields {
+                    return Err(meta.error("duplicate `abi(unknown_fields)`"));
+                }
+                unknown_fields = true;
+                return Ok(());
+            }
             Err(meta.error("unsupported `abi(...)` field attribute"))
         })?;
     }
-    Ok(FieldAttr { id, optional })
+
+    if ty_version.is_some() && ty.is_none() {
+        return Err(syn::Error::new(
+            field.span(),
+            "`abi(ty_version=...)` requires `abi(ty=...)`",
+        ));
+    }
+
+    Ok(FieldAttr {
+        id,
+        optional,
+        ty,
+        ty_version,
+        unknown_fields,
+    })
 }
 
 fn parse_variant_attrs(variant: &syn::Variant) -> syn::Result<VariantAttr> {
     let mut id = None;
+    let mut unknown = false;
+
     for attr in &variant.attrs {
         if !attr.path().is_ident("abi") {
             continue;
@@ -199,10 +371,18 @@ fn parse_variant_attrs(variant: &syn::Variant) -> syn::Result<VariantAttr> {
                 id = Some(parse_u32_lit(&meta.value()?.parse::<LitInt>()?)?);
                 return Ok(());
             }
+            if meta.path.is_ident("unknown") {
+                if unknown {
+                    return Err(meta.error("duplicate `abi(unknown)`"));
+                }
+                unknown = true;
+                return Ok(());
+            }
             Err(meta.error("unsupported `abi(...)` variant attribute"))
         })?;
     }
-    Ok(VariantAttr { id })
+
+    Ok(VariantAttr { id, unknown })
 }
 
 fn parse_u32_lit(lit: &LitInt) -> syn::Result<u32> {
@@ -236,15 +416,36 @@ fn option_inner(ty: &Type) -> Option<&Type> {
     }
 }
 
-fn named_field_specs(fields: &syn::FieldsNamed) -> syn::Result<Vec<FieldSpec<'_>>> {
+fn named_field_specs(fields: &syn::FieldsNamed) -> syn::Result<FieldSetSpec<'_>> {
     let mut out = Vec::new();
+    let mut unknown_field = None;
     let mut seen = Vec::<u32>::new();
+
     for field in &fields.named {
         let ident = field
             .ident
             .as_ref()
             .ok_or_else(|| syn::Error::new(field.span(), "expected named field"))?;
         let attr = parse_field_attrs(field)?;
+
+        if attr.unknown_fields {
+            if attr.id.is_some() || attr.optional || attr.ty.is_some() || attr.ty_version.is_some()
+            {
+                return Err(syn::Error::new(
+                    field.span(),
+                    "`abi(unknown_fields)` cannot be combined with field ID, optionality, or type override",
+                ));
+            }
+            if unknown_field.is_some() {
+                return Err(syn::Error::new(
+                    field.span(),
+                    "duplicate `abi(unknown_fields)` storage field",
+                ));
+            }
+            unknown_field = Some(ident);
+            continue;
+        }
+
         let id = attr
             .id
             .ok_or_else(|| syn::Error::new(field.span(), "missing `abi(id = N)`"))?;
@@ -266,70 +467,234 @@ fn named_field_specs(fields: &syn::FieldsNamed) -> syn::Result<Vec<FieldSpec<'_>
         if !attr.optional && inner.is_some() {
             return Err(syn::Error::new(
                 field.ty.span(),
-                "required `Option<T>` fields are not allowed; add `abi(optional)` or use a non-Option type",
+                "required `Option<T>` fields are not valid ABI fields",
             ));
         }
         let wire_ty = inner.unwrap_or(&field.ty);
         out.push(FieldSpec {
             ident,
             id,
-            ty: &field.ty,
             wire_ty,
-            ty_name: wire_ty.to_token_stream().to_string(),
+            decode_ty: decode_type(&field.ty),
+            decode_wire_ty: decode_type(wire_ty),
             optional: attr.optional,
+            ty_override: attr.ty,
+            ty_version: attr.ty_version,
         });
     }
+
     out.sort_by_key(|field| field.id);
-    Ok(out)
+    Ok(FieldSetSpec {
+        fields: out,
+        unknown_field,
+    })
+}
+
+fn validate_unknown_field_storage(
+    field_set: &FieldSetSpec<'_>,
+    mode: UnknownFieldMode,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    match (mode, field_set.unknown_field) {
+        (UnknownFieldMode::Preserve, None) => Err(syn::Error::new(
+            span,
+            "`abi(unknown_fields = \"preserve\")` requires one `#[abi(unknown_fields)]` storage field",
+        )),
+        (UnknownFieldMode::Reject | UnknownFieldMode::Ignore, Some(ident)) => Err(syn::Error::new(
+            ident.span(),
+            "`abi(unknown_fields)` requires `abi(unknown_fields = \"preserve\")`",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn derive_struct(
     name: &Ident,
+    generics: &Generics,
     data: &DataStruct,
     attrs: &ContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    if attrs.transparent {
+        return derive_transparent_struct(name, generics, data, attrs);
+    }
+
     let Fields::Named(fields) = &data.fields else {
         return Err(syn::Error::new(
             data.fields.span(),
-            "public ABI structs must use named fields; tuple structs require an explicit transparent ABI design",
+            "field-set ABI structs must use named fields",
         ));
     };
-    let fields = named_field_specs(fields)?;
-    let encode = encode_struct_body(&fields, quote!(self));
-    let decode = decode_field_set_body(&fields, attrs.unknown_fields, quote!(Self));
-    let schema = schema_struct_tokens(attrs, &fields);
+    let field_set = named_field_specs(fields)?;
+    validate_unknown_field_storage(&field_set, attrs.unknown_fields, data.fields.span())?;
+
+    let abi_path = &attrs.abi_path;
+    let cbor_path = &attrs.cbor_path;
+    let encode = encode_field_set_body(
+        &field_set,
+        attrs.unknown_fields,
+        EncodeContext::Struct,
+        abi_path,
+    );
+    let decode = decode_field_set_body(
+        &field_set,
+        attrs.unknown_fields,
+        quote!(Self),
+        abi_path,
+        cbor_path,
+    );
+    let schema = schema_struct_tokens(attrs, &field_set);
+    let type_ref = type_ref_impl_tokens(name, generics, attrs);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let decode_ty_generics = decode_ty_generics(generics);
 
     Ok(quote! {
-        impl ::sacp_cbor_abi::AbiEncode for #name {
+        impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
             fn abi_encode(
                 &self,
-                enc: &mut ::sacp_cbor_abi::__private::sacp_cbor::Encoder,
-            ) -> ::core::result::Result<(), ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
+                enc: &mut #cbor_path::Encoder,
+            ) -> ::core::result::Result<(), #cbor_path::CborError> {
                 #encode
             }
         }
 
-        impl<'__abi> ::sacp_cbor_abi::AbiDecode<'__abi> for #name {
+        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
             fn abi_decode<const CHECKED: bool>(
-                decoder: &mut ::sacp_cbor_abi::__private::sacp_cbor::Decoder<'__abi, CHECKED>,
-            ) -> ::core::result::Result<Self, ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
                 #decode
             }
         }
 
-        impl ::sacp_cbor_abi::AbiType for #name {
-            fn schema() -> ::sacp_cbor_abi::Schema {
+        impl #impl_generics #abi_path::AbiType for #name #ty_generics #where_clause {
+            fn schema() -> #abi_path::Schema {
                 #schema
             }
         }
+
+        #type_ref
     })
+}
+
+fn derive_transparent_struct(
+    name: &Ident,
+    generics: &Generics,
+    data: &DataStruct,
+    attrs: &ContainerAttr,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let inner = transparent_inner(data)?;
+    let abi_path = &attrs.abi_path;
+    let cbor_path = &attrs.cbor_path;
+    let inner_ty = inner.ty;
+    let decode_inner_ty = &inner.decode_ty;
+    let schema = schema_transparent_tokens(attrs, inner_ty);
+    let type_ref = type_ref_impl_tokens(name, generics, attrs);
+    let access = inner.access;
+    let construct = inner.construct;
+    let try_from = attrs.try_from.as_ref();
+    let decode_construct = if let Some(try_from) = try_from {
+        quote! {
+            #try_from(__abi_inner).map_err(|_| {
+                #cbor_path::CborError::new(#cbor_path::ErrorCode::InvalidAbiValue, __abi_off)
+            })
+        }
+    } else {
+        quote! { ::core::result::Result::Ok(#construct) }
+    };
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let decode_ty_generics = decode_ty_generics(generics);
+
+    Ok(quote! {
+        impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
+            fn abi_encode(
+                &self,
+                enc: &mut #cbor_path::Encoder,
+            ) -> ::core::result::Result<(), #cbor_path::CborError> {
+                #abi_path::AbiEncode::abi_encode(#access, enc)
+            }
+        }
+
+        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
+            fn abi_decode<const CHECKED: bool>(
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
+                let __abi_off = decoder.position();
+                let __abi_inner: #decode_inner_ty = #abi_path::AbiDecode::abi_decode(decoder)?;
+                #decode_construct
+            }
+        }
+
+        impl #impl_generics #abi_path::AbiType for #name #ty_generics #where_clause {
+            fn schema() -> #abi_path::Schema {
+                #schema
+            }
+        }
+
+        #type_ref
+    })
+}
+
+struct TransparentInner<'a> {
+    ty: &'a Type,
+    decode_ty: Type,
+    access: proc_macro2::TokenStream,
+    construct: proc_macro2::TokenStream,
+}
+
+fn transparent_inner(data: &DataStruct) -> syn::Result<TransparentInner<'_>> {
+    match &data.fields {
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            let field = fields.unnamed.first().expect("len checked");
+            ensure_no_abi_field_attrs(field)?;
+            let index = syn::Index::from(0);
+            Ok(TransparentInner {
+                ty: &field.ty,
+                decode_ty: decode_type(&field.ty),
+                access: quote!(&self.#index),
+                construct: quote!(Self(__abi_inner)),
+            })
+        }
+        Fields::Named(fields) if fields.named.len() == 1 => {
+            let field = fields.named.first().expect("len checked");
+            ensure_no_abi_field_attrs(field)?;
+            let ident = field.ident.as_ref().expect("named field");
+            Ok(TransparentInner {
+                ty: &field.ty,
+                decode_ty: decode_type(&field.ty),
+                access: quote!(&self.#ident),
+                construct: quote!(Self { #ident: __abi_inner }),
+            })
+        }
+        _ => Err(syn::Error::new(
+            data.fields.span(),
+            "`abi(transparent)` requires exactly one field",
+        )),
+    }
+}
+
+fn ensure_no_abi_field_attrs(field: &Field) -> syn::Result<()> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("abi") {
+            return Err(syn::Error::new(
+                attr.span(),
+                "`abi(...)` field attributes are not valid inside transparent structs",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn derive_enum(
     name: &Ident,
+    generics: &Generics,
     data: &DataEnum,
     attrs: &ContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
+    if attrs.transparent {
+        return Err(syn::Error::new(
+            name.span(),
+            "`abi(transparent)` is only valid on structs",
+        ));
+    }
     if data.variants.is_empty() {
         return Err(syn::Error::new(
             name.span(),
@@ -337,42 +702,75 @@ fn derive_enum(
         ));
     }
 
-    let variants = enum_variant_specs(data)?;
-    let encode = encode_enum_body(&variants);
-    let decode = decode_enum_body(&variants, attrs.unknown_fields);
-    let schema = schema_enum_tokens(attrs, &variants);
+    let (variants, unknown_variant) = enum_variant_specs(data, attrs.unknown_fields)?;
+    let unknown_mode = resolve_unknown_variant_mode(attrs, unknown_variant.as_ref())?;
+    let abi_path = &attrs.abi_path;
+    let cbor_path = &attrs.cbor_path;
+    let encode = encode_enum_body(&variants, unknown_variant.as_ref(), attrs, unknown_mode);
+    let decode = decode_enum_body(&variants, unknown_variant.as_ref(), attrs, unknown_mode);
+    let schema = schema_enum_tokens(attrs, &variants, unknown_mode);
+    let type_ref = type_ref_impl_tokens(name, generics, attrs);
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let decode_ty_generics = decode_ty_generics(generics);
 
     Ok(quote! {
-        impl ::sacp_cbor_abi::AbiEncode for #name {
+        impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
             fn abi_encode(
                 &self,
-                enc: &mut ::sacp_cbor_abi::__private::sacp_cbor::Encoder,
-            ) -> ::core::result::Result<(), ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
+                enc: &mut #cbor_path::Encoder,
+            ) -> ::core::result::Result<(), #cbor_path::CborError> {
                 #encode
             }
         }
 
-        impl<'__abi> ::sacp_cbor_abi::AbiDecode<'__abi> for #name {
+        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
             fn abi_decode<const CHECKED: bool>(
-                decoder: &mut ::sacp_cbor_abi::__private::sacp_cbor::Decoder<'__abi, CHECKED>,
-            ) -> ::core::result::Result<Self, ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
                 #decode
             }
         }
 
-        impl ::sacp_cbor_abi::AbiType for #name {
-            fn schema() -> ::sacp_cbor_abi::Schema {
+        impl #impl_generics #abi_path::AbiType for #name #ty_generics #where_clause {
+            fn schema() -> #abi_path::Schema {
                 #schema
             }
         }
+
+        #type_ref
     })
 }
 
-fn enum_variant_specs(data: &DataEnum) -> syn::Result<Vec<VariantSpec<'_>>> {
+fn enum_variant_specs<'a>(
+    data: &'a DataEnum,
+    unknown_fields: UnknownFieldMode,
+) -> syn::Result<(Vec<VariantSpec<'a>>, Option<UnknownVariantSpec<'a>>)> {
     let mut out = Vec::new();
+    let mut unknown_variant = None;
     let mut seen = Vec::<u32>::new();
+
     for variant in &data.variants {
         let attr = parse_variant_attrs(variant)?;
+        if attr.unknown {
+            if attr.id.is_some() {
+                return Err(syn::Error::new(
+                    variant.span(),
+                    "`abi(unknown)` variants do not have ABI IDs",
+                ));
+            }
+            validate_unknown_variant_shape(variant)?;
+            if unknown_variant.is_some() {
+                return Err(syn::Error::new(
+                    variant.span(),
+                    "duplicate `abi(unknown)` variant",
+                ));
+            }
+            unknown_variant = Some(UnknownVariantSpec {
+                ident: &variant.ident,
+            });
+            continue;
+        }
+
         let id = attr
             .id
             .ok_or_else(|| syn::Error::new(variant.span(), "missing `abi(id = N)` on variant"))?;
@@ -388,102 +786,218 @@ fn enum_variant_specs(data: &DataEnum) -> syn::Result<Vec<VariantSpec<'_>>> {
             Fields::Unit => out.push(VariantSpec {
                 ident: &variant.ident,
                 id,
-                fields: Vec::new(),
+                fields: FieldSetSpec {
+                    fields: Vec::new(),
+                    unknown_field: None,
+                },
                 unit: true,
             }),
-            Fields::Named(fields) => out.push(VariantSpec {
-                ident: &variant.ident,
-                id,
-                fields: named_field_specs(fields)?,
-                unit: false,
-            }),
+            Fields::Named(fields) => {
+                let field_set = named_field_specs(fields)?;
+                validate_unknown_field_storage(&field_set, unknown_fields, fields.span())?;
+                out.push(VariantSpec {
+                    ident: &variant.ident,
+                    id,
+                    fields: field_set,
+                    unit: false,
+                });
+            }
             Fields::Unnamed(fields) => {
                 return Err(syn::Error::new(
                     fields.span(),
-                    "public ABI enum variants must be unit or named-field variants",
+                    "ABI enum variants must be unit, named-field, or `abi(unknown)` variants",
                 ))
             }
         }
     }
+
     out.sort_by_key(|variant| variant.id);
-    Ok(out)
+    Ok((out, unknown_variant))
 }
 
-fn encode_struct_body(
-    fields: &[FieldSpec<'_>],
-    self_expr: proc_macro2::TokenStream,
+fn validate_unknown_variant_shape(variant: &syn::Variant) -> syn::Result<()> {
+    match &variant.fields {
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => Ok(()),
+        _ => Err(syn::Error::new(
+            variant.fields.span(),
+            "`abi(unknown)` variant must be a one-field tuple variant",
+        )),
+    }
+}
+
+fn resolve_unknown_variant_mode(
+    attrs: &ContainerAttr,
+    unknown_variant: Option<&UnknownVariantSpec<'_>>,
+) -> syn::Result<UnknownVariantMode> {
+    match (attrs.unknown_variants, unknown_variant) {
+        (Some(UnknownVariantMode::Reject), Some(variant)) => Err(syn::Error::new(
+            variant.ident.span(),
+            "`abi(unknown)` requires `abi(unknown_variants = \"preserve\")` or no explicit unknown-variant policy",
+        )),
+        (Some(UnknownVariantMode::Preserve), None) => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`abi(unknown_variants = \"preserve\")` requires one `#[abi(unknown)]` variant",
+        )),
+        (Some(mode), _) => Ok(mode),
+        (None, Some(_)) => Ok(UnknownVariantMode::Preserve),
+        (None, None) => Ok(UnknownVariantMode::Reject),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EncodeContext {
+    Struct,
+    Variant,
+}
+
+fn encode_field_set_body(
+    field_set: &FieldSetSpec<'_>,
+    unknown_mode: UnknownFieldMode,
+    context: EncodeContext,
+    abi_path: &Path,
 ) -> proc_macro2::TokenStream {
-    let len_terms = fields.iter().map(|field| {
+    let len_terms = field_set.fields.iter().map(|field| {
         let ident = field.ident;
+        let access = match context {
+            EncodeContext::Struct => quote!(&self.#ident),
+            EncodeContext::Variant => quote!(#ident),
+        };
         if field.optional {
-            quote! { + if #self_expr.#ident.is_some() { 2 } else { 0 } }
+            quote! { + if (#access).is_some() { 2 } else { 0 } }
         } else {
             quote! { + 2 }
         }
     });
-    let writes = fields.iter().map(|field| {
+
+    let unknown_len = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
+        let unknown = field_set.unknown_field.expect("validated unknown storage");
+        let access = match context {
+            EncodeContext::Struct => quote!(&self.#unknown),
+            EncodeContext::Variant => quote!(#unknown),
+        };
+        quote! { + ((#access).len() * 2) }
+    } else {
+        quote! {}
+    };
+
+    let unknown_setup = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
+        let unknown = field_set.unknown_field.expect("validated unknown storage");
+        let access = match context {
+            EncodeContext::Struct => quote!(&self.#unknown),
+            EncodeContext::Variant => quote!(#unknown),
+        };
+        quote! {
+            let __abi_unknown_fields = #access;
+            let mut __abi_unknown_cursor = 0usize;
+        }
+    } else {
+        quote! {}
+    };
+
+    let writes = field_set.fields.iter().map(|field| {
         let ident = field.ident;
         let id = field.id;
-        if field.optional {
+        let before_unknown = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
             quote! {
-                if let ::core::option::Option::Some(__abi_value) = &#self_expr.#ident {
-                    __abi_encode_id(__abi_array, #id)?;
-                    __abi_array.value_with(|enc| {
-                        ::sacp_cbor_abi::AbiEncode::abi_encode(__abi_value, enc)
-                    })?;
+                #abi_path::__private::encode_unknown_fields_before(
+                    __abi_array,
+                    __abi_unknown_fields,
+                    &mut __abi_unknown_cursor,
+                    #id,
+                )?;
+            }
+        } else {
+            quote! {}
+        };
+        let value_access = match context {
+            EncodeContext::Struct => quote!(&self.#ident),
+            EncodeContext::Variant => quote!(#ident),
+        };
+        let write_value = if field.optional {
+            quote! {
+                if let ::core::option::Option::Some(__abi_value) = #value_access {
+                #abi_path::__private::encode_field_id(__abi_array, #id)?;
+                __abi_array.value_with(|enc| {
+                    #abi_path::AbiEncode::abi_encode(__abi_value, enc)
+                })?;
                 }
             }
         } else {
             quote! {
-                __abi_encode_id(__abi_array, #id)?;
+                #abi_path::__private::encode_field_id(__abi_array, #id)?;
                 __abi_array.value_with(|enc| {
-                    ::sacp_cbor_abi::AbiEncode::abi_encode(&#self_expr.#ident, enc)
+                    #abi_path::AbiEncode::abi_encode(#value_access, enc)
                 })?;
             }
+        };
+        quote! {
+            #before_unknown
+            #write_value
         }
     });
-    quote! {
-        fn __abi_encode_id(
-            array: &mut ::sacp_cbor_abi::__private::sacp_cbor::encode::ArrayEncoder<'_>,
-            id: u32,
-        ) -> ::core::result::Result<(), ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
-            array.value_with(|enc| {
-                ::sacp_cbor_abi::__private::sacp_cbor::CborEncode::encode(&id, enc)
-            })
-        }
 
-        let __abi_len = 0usize #(#len_terms)*;
+    let remaining_unknown = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
+        quote! {
+            #abi_path::__private::encode_remaining_unknown_fields(
+                __abi_array,
+                __abi_unknown_fields,
+                &mut __abi_unknown_cursor,
+            )?;
+        }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        let __abi_len = 0usize #(#len_terms)* #unknown_len;
         enc.array(__abi_len, |__abi_array| {
+            #unknown_setup
             #(#writes)*
+            #remaining_unknown
             ::core::result::Result::Ok(())
         })
     }
 }
 
 fn decode_field_set_body(
-    fields: &[FieldSpec<'_>],
-    unknown: UnknownPolicy,
+    field_set: &FieldSetSpec<'_>,
+    unknown_mode: UnknownFieldMode,
     target: proc_macro2::TokenStream,
+    abi_path: &Path,
+    cbor_path: &Path,
 ) -> proc_macro2::TokenStream {
-    let storage_decls = fields.iter().map(|field| {
+    let storage_decls = field_set.fields.iter().map(|field| {
         let ident = storage_ident(field.ident);
-        let ty = field.ty;
+        let ty = &field.decode_ty;
         quote! { let mut #ident: ::core::option::Option<#ty> = ::core::option::Option::None; }
     });
-    let match_arms = fields.iter().map(|field| {
+    let unknown_decl = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
+        quote! {
+            let mut __abi_unknown_fields = #abi_path::__private::Vec::<#abi_path::UnknownField>::new();
+        }
+    } else {
+        quote! {}
+    };
+
+    let match_arms = field_set.fields.iter().map(|field| {
         let id = field.id;
         let storage = storage_ident(field.ident);
-        let decode_ty = field.wire_ty;
+        let decode_ty = &field.decode_wire_ty;
         if field.optional {
             quote! {
                 #id => {
                     if #storage.is_some() {
-                        return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                            ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::DuplicateMapKey,
+                        return Err(#cbor_path::CborError::new(
+                            #cbor_path::ErrorCode::DuplicateMapKey,
                             __abi_id_off,
                         ));
                     }
-                    let __abi_value: #decode_ty = __abi_next_value(&mut __abi_array, __abi_arr_off)?;
+                    let __abi_value: #decode_ty = __abi_array
+                        .decode_next(#abi_path::AbiDecode::abi_decode)?
+                        .ok_or_else(|| #cbor_path::CborError::new(
+                            #cbor_path::ErrorCode::ArrayLenMismatch,
+                            __abi_arr_off,
+                        ))?;
                     #storage = ::core::option::Option::Some(::core::option::Option::Some(__abi_value));
                 }
             }
@@ -491,105 +1005,112 @@ fn decode_field_set_body(
             quote! {
                 #id => {
                     if #storage.is_some() {
-                        return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                            ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::DuplicateMapKey,
+                        return Err(#cbor_path::CborError::new(
+                            #cbor_path::ErrorCode::DuplicateMapKey,
                             __abi_id_off,
                         ));
                     }
-                    #storage = ::core::option::Option::Some(
-                        __abi_next_value(&mut __abi_array, __abi_arr_off)?
-                    );
+                    let __abi_value: #decode_ty = __abi_array
+                        .decode_next(#abi_path::AbiDecode::abi_decode)?
+                        .ok_or_else(|| #cbor_path::CborError::new(
+                            #cbor_path::ErrorCode::ArrayLenMismatch,
+                            __abi_arr_off,
+                        ))?;
+                    #storage = ::core::option::Option::Some(__abi_value);
                 }
             }
         }
     });
-    let unknown_arm = match unknown {
-        UnknownPolicy::Reject => quote! {
+
+    let unknown_arm = match unknown_mode {
+        UnknownFieldMode::Reject => quote! {
             _ => {
-                return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                    ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::UnknownField,
+                return Err(#cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::UnknownField,
                     __abi_id_off,
                 ));
             }
         },
-        UnknownPolicy::Ignore => quote! {
+        UnknownFieldMode::Ignore => quote! {
             _ => {
                 let _: () = __abi_array.decode_next(|decoder| {
                     decoder.skip_value()?;
                     ::core::result::Result::Ok(())
-                })?.ok_or_else(|| {
-                    ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                        ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
+                })?.ok_or_else(|| #cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::ArrayLenMismatch,
+                    __abi_arr_off,
+                ))?;
+            }
+        },
+        UnknownFieldMode::Preserve => quote! {
+            _ => {
+                let __abi_value: #cbor_path::CanonicalCbor = __abi_array
+                    .decode_next(#cbor_path::CborDecode::decode)?
+                    .ok_or_else(|| #cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
                         __abi_arr_off,
-                    )
-                })?;
+                    ))?;
+                __abi_unknown_fields.push(#abi_path::UnknownField {
+                    id: __abi_id,
+                    value: __abi_value,
+                });
             }
         },
     };
-    let finals = fields.iter().map(|field| {
+
+    let finals = field_set.fields.iter().map(|field| {
         let ident = field.ident;
         let storage = storage_ident(field.ident);
         if field.optional {
             quote! { #ident: #storage.unwrap_or(::core::option::Option::None), }
         } else {
             quote! {
-                #ident: #storage.ok_or_else(|| {
-                    ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                        ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::MissingKey,
-                        __abi_arr_off,
-                    )
-                })?,
+                #ident: #storage.ok_or_else(|| #cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::MissingKey,
+                    __abi_arr_off,
+                ))?,
             }
         }
     });
+    let unknown_final = if let Some(unknown) = field_set.unknown_field {
+        quote! {
+            #unknown: #abi_path::UnknownFields::try_from_vec(__abi_unknown_fields)?,
+        }
+    } else {
+        quote! {}
+    };
 
     quote! {
-        fn __abi_next_value<'__abi, T, const CHECKED: bool>(
-            array: &mut ::sacp_cbor_abi::__private::sacp_cbor::decode::ArrayDecoder<'_, '__abi, CHECKED>,
-            arr_off: usize,
-        ) -> ::core::result::Result<T, ::sacp_cbor_abi::__private::sacp_cbor::CborError>
-        where
-            T: ::sacp_cbor_abi::AbiDecode<'__abi>,
-        {
-            array.decode_next(::sacp_cbor_abi::AbiDecode::abi_decode)?.ok_or_else(|| {
-                ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                    ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
-                    arr_off,
-                )
-            })
-        }
-
         let __abi_arr_off = decoder.position();
         let mut __abi_array = decoder.array()?;
         if __abi_array.remaining() % 2 != 0 {
-            return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
+            return Err(#cbor_path::CborError::new(
+                #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ));
         }
         #(#storage_decls)*
+        #unknown_decl
         let mut __abi_prev_id: ::core::option::Option<u32> = ::core::option::Option::None;
         while __abi_array.remaining() > 0 {
             let (__abi_id_off, __abi_id): (usize, u32) = __abi_array.decode_next(|decoder| {
                 let off = decoder.position();
-                let id = ::sacp_cbor_abi::__private::sacp_cbor::CborDecode::decode(decoder)?;
+                let id = #cbor_path::CborDecode::decode(decoder)?;
                 ::core::result::Result::Ok((off, id))
-            })?.ok_or_else(|| {
-                ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                    ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
-                    __abi_arr_off,
-                )
-            })?;
+            })?.ok_or_else(|| #cbor_path::CborError::new(
+                #cbor_path::ErrorCode::ArrayLenMismatch,
+                __abi_arr_off,
+            ))?;
             if let ::core::option::Option::Some(prev) = __abi_prev_id {
                 if __abi_id == prev {
-                    return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                        ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::DuplicateMapKey,
+                    return Err(#cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::DuplicateMapKey,
                         __abi_id_off,
                     ));
                 }
                 if __abi_id < prev {
-                    return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                        ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::NonCanonicalMapOrder,
+                    return Err(#cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::NonCanonicalMapOrder,
                         __abi_id_off,
                     ));
                 }
@@ -600,28 +1121,40 @@ fn decode_field_set_body(
                 #unknown_arm
             }
         }
-        ::core::result::Result::Ok(#target { #(#finals)* })
+        ::core::result::Result::Ok(#target { #(#finals)* #unknown_final })
     }
 }
 
-fn encode_enum_body(variants: &[VariantSpec<'_>]) -> proc_macro2::TokenStream {
+fn encode_enum_body(
+    variants: &[VariantSpec<'_>],
+    unknown_variant: Option<&UnknownVariantSpec<'_>>,
+    attrs: &ContainerAttr,
+    unknown_mode: UnknownVariantMode,
+) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
     let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
         let id = variant.id;
         if variant.unit {
             quote! {
                 Self::#ident => enc.array(2, |__abi_array| {
-                    __abi_encode_id(__abi_array, #id)?;
+                    #abi_path::__private::encode_field_id(__abi_array, #id)?;
                     __abi_array.null()?;
                     ::core::result::Result::Ok(())
                 })
             }
         } else {
-            let pats = variant.fields.iter().map(|field| field.ident);
-            let body = encode_variant_payload(&variant.fields);
+            let pats = variant.fields.fields.iter().map(|field| field.ident);
+            let unknown_pat = variant.fields.unknown_field;
+            let body = encode_field_set_body(
+                &variant.fields,
+                attrs.unknown_fields,
+                EncodeContext::Variant,
+                abi_path,
+            );
             quote! {
-                Self::#ident { #(#pats),* } => enc.array(2, |__abi_array| {
-                    __abi_encode_id(__abi_array, #id)?;
+                Self::#ident { #(#pats,)* #unknown_pat } => enc.array(2, |__abi_array| {
+                    #abi_path::__private::encode_field_id(__abi_array, #id)?;
                     __abi_array.value_with(|enc| {
                         #body
                     })?;
@@ -630,142 +1163,165 @@ fn encode_enum_body(variants: &[VariantSpec<'_>]) -> proc_macro2::TokenStream {
             }
         }
     });
-    quote! {
-        fn __abi_encode_id(
-            array: &mut ::sacp_cbor_abi::__private::sacp_cbor::encode::ArrayEncoder<'_>,
-            id: u32,
-        ) -> ::core::result::Result<(), ::sacp_cbor_abi::__private::sacp_cbor::CborError> {
-            array.value_with(|enc| {
-                ::sacp_cbor_abi::__private::sacp_cbor::CborEncode::encode(&id, enc)
-            })
-        }
-        match self {
-            #(#arms),*
-        }
-    }
-}
 
-fn encode_variant_payload(fields: &[FieldSpec<'_>]) -> proc_macro2::TokenStream {
-    let len_terms = fields.iter().map(|field| {
-        let ident = field.ident;
-        if field.optional {
-            quote! { + if #ident.is_some() { 2 } else { 0 } }
-        } else {
-            quote! { + 2 }
-        }
-    });
-    let writes = fields.iter().map(|field| {
-        let ident = field.ident;
-        let id = field.id;
-        if field.optional {
-            quote! {
-                if let ::core::option::Option::Some(__abi_value) = #ident {
-                    __abi_encode_id(__abi_array, #id)?;
-                    __abi_array.value_with(|enc| {
-                        ::sacp_cbor_abi::AbiEncode::abi_encode(__abi_value, enc)
-                    })?;
-                }
-            }
-        } else {
-            quote! {
-                __abi_encode_id(__abi_array, #id)?;
-                __abi_array.value_with(|enc| {
-                    ::sacp_cbor_abi::AbiEncode::abi_encode(#ident, enc)
-                })?;
+    let unknown_arm = if matches!(unknown_mode, UnknownVariantMode::Preserve) {
+        let unknown = unknown_variant.expect("validated unknown variant");
+        let ident = unknown.ident;
+        let reserved_ids = variants.iter().map(|variant| {
+            let id = variant.id;
+            quote!(#id)
+        });
+        quote! {
+            Self::#ident(__abi_unknown) => {
+                const __ABI_RESERVED_VARIANTS: &[u32] = &[#(#reserved_ids),*];
+                #abi_path::__private::validate_unknown_variant(
+                    __abi_unknown,
+                    __ABI_RESERVED_VARIANTS,
+                )?;
+                enc.array(2, |__abi_array| {
+                    #abi_path::__private::encode_field_id(__abi_array, __abi_unknown.id)?;
+                    __abi_array.raw_cbor(__abi_unknown.payload.as_canonical_ref())?;
+                    ::core::result::Result::Ok(())
+                })
             }
         }
-    });
+    } else {
+        quote! {}
+    };
+
     quote! {
-        let __abi_len = 0usize #(#len_terms)*;
-        enc.array(__abi_len, |__abi_array| {
-            #(#writes)*
-            ::core::result::Result::Ok(())
-        })
+        match self {
+            #(#arms,)*
+            #unknown_arm
+        }
     }
 }
 
 fn decode_enum_body(
     variants: &[VariantSpec<'_>],
-    unknown: UnknownPolicy,
+    unknown_variant: Option<&UnknownVariantSpec<'_>>,
+    attrs: &ContainerAttr,
+    unknown_mode: UnknownVariantMode,
 ) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
+    let cbor_path = &attrs.cbor_path;
     let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
         let id = variant.id;
         if variant.unit {
             quote! {
                 #id => {
-                    let _: () = __abi_array.decode_next(|decoder| {
-                        ::sacp_cbor_abi::__private::sacp_cbor::CborDecode::decode(decoder)
-                    })?.ok_or_else(|| {
-                        ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                            ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
+                    let _: () = __abi_array
+                        .decode_next(#abi_path::AbiDecode::abi_decode)?
+                        .ok_or_else(|| #cbor_path::CborError::new(
+                            #cbor_path::ErrorCode::ArrayLenMismatch,
                             __abi_arr_off,
-                        )
-                    })?;
+                        ))?;
                     ::core::result::Result::Ok(Self::#ident)
                 }
             }
         } else {
-            let body = decode_field_set_body(&variant.fields, unknown, quote!(Self::#ident));
+            let body = decode_field_set_body(
+                &variant.fields,
+                attrs.unknown_fields,
+                quote!(Self::#ident),
+                abi_path,
+                cbor_path,
+            );
             quote! {
                 #id => {
-                    let __abi_payload = __abi_array.decode_next(|decoder| {
+                    __abi_array.decode_next(|decoder| {
                         #body
-                    })?.ok_or_else(|| {
-                        ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                            ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
-                            __abi_arr_off,
-                        )
-                    })?;
-                    ::core::result::Result::Ok(__abi_payload)
+                    })?.ok_or_else(|| #cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
+                        __abi_arr_off,
+                    ))
                 }
             }
         }
     });
+
+    let unknown_arm = if matches!(unknown_mode, UnknownVariantMode::Preserve) {
+        let unknown = unknown_variant.expect("validated unknown variant");
+        let ident = unknown.ident;
+        quote! {
+            _ => {
+                let __abi_payload: #cbor_path::CanonicalCbor = __abi_array
+                    .decode_next(#cbor_path::CborDecode::decode)?
+                    .ok_or_else(|| #cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
+                        __abi_arr_off,
+                    ))?;
+                ::core::result::Result::Ok(Self::#ident(#abi_path::UnknownVariant {
+                    id: __abi_id,
+                    payload: __abi_payload,
+                }))
+            }
+        }
+    } else {
+        quote! {
+            _ => Err(#cbor_path::CborError::new(
+                #cbor_path::ErrorCode::UnknownEnumVariant,
+                __abi_id_off,
+            ))
+        }
+    };
+
     quote! {
         let __abi_arr_off = decoder.position();
         let mut __abi_array = decoder.array()?;
         if __abi_array.remaining() != 2 {
-            return Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
+            return Err(#cbor_path::CborError::new(
+                #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ));
         }
         let (__abi_id_off, __abi_id): (usize, u32) = __abi_array.decode_next(|decoder| {
             let off = decoder.position();
-            let id = ::sacp_cbor_abi::__private::sacp_cbor::CborDecode::decode(decoder)?;
+            let id = #cbor_path::CborDecode::decode(decoder)?;
             ::core::result::Result::Ok((off, id))
-        })?.ok_or_else(|| {
-            ::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::ArrayLenMismatch,
-                __abi_arr_off,
-            )
-        })?;
+        })?.ok_or_else(|| #cbor_path::CborError::new(
+            #cbor_path::ErrorCode::ArrayLenMismatch,
+            __abi_arr_off,
+        ))?;
         match __abi_id {
             #(#arms,)*
-            _ => Err(::sacp_cbor_abi::__private::sacp_cbor::CborError::new(
-                ::sacp_cbor_abi::__private::sacp_cbor::ErrorCode::UnknownEnumVariant,
-                __abi_id_off,
-            )),
+            #unknown_arm
         }
     }
 }
 
 fn schema_struct_tokens(
     attrs: &ContainerAttr,
-    fields: &[FieldSpec<'_>],
+    field_set: &FieldSetSpec<'_>,
 ) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
     let type_id = &attrs.type_id;
     let version = attrs.version;
-    let unknown = attrs.unknown_fields.tokens();
-    let fields = field_defs_tokens(fields);
+    let unknown = attrs.unknown_fields.tokens(abi_path);
+    let fields = field_defs_tokens(field_set, abi_path);
     quote! {
-        ::sacp_cbor_abi::Schema::new(
+        #abi_path::Schema::new(
             #type_id,
             #version,
-            ::sacp_cbor_abi::TypeDef::Struct {
+            #abi_path::TypeDef::Struct(#abi_path::FieldSetDef {
                 fields: #fields,
                 unknown_fields: #unknown,
+            }),
+        )
+    }
+}
+
+fn schema_transparent_tokens(attrs: &ContainerAttr, inner: &Type) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
+    let type_id = &attrs.type_id;
+    let version = attrs.version;
+    quote! {
+        #abi_path::Schema::new(
+            #type_id,
+            #version,
+            #abi_path::TypeDef::Transparent {
+                inner: <#inner as #abi_path::AbiTypeRef>::abi_type_ref(),
             },
         )
     }
@@ -774,50 +1330,96 @@ fn schema_struct_tokens(
 fn schema_enum_tokens(
     attrs: &ContainerAttr,
     variants: &[VariantSpec<'_>],
+    unknown_mode: UnknownVariantMode,
 ) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
     let type_id = &attrs.type_id;
     let version = attrs.version;
-    let unknown = attrs.unknown_fields.tokens();
+    let unknown_fields = attrs.unknown_fields.tokens(abi_path);
+    let unknown_variants = unknown_mode.tokens(abi_path);
     let variants = variants.iter().map(|variant| {
         let id = variant.id;
         let name = variant.ident.to_string();
-        let fields = field_defs_tokens(&variant.fields);
+        let fields = field_defs_tokens(&variant.fields, abi_path);
         quote! {
-            ::sacp_cbor_abi::VariantDef {
+            #abi_path::VariantDef {
                 id: #id,
-                name: ::sacp_cbor_abi::__private::String::from(#name),
+                name: #abi_path::__private::String::from(#name),
                 fields: #fields,
             }
         }
     });
     quote! {
-        ::sacp_cbor_abi::Schema::new(
+        #abi_path::Schema::new(
             #type_id,
             #version,
-            ::sacp_cbor_abi::TypeDef::Enum {
-                variants: ::sacp_cbor_abi::__private::vec![#(#variants),*],
-                unknown_fields: #unknown,
-            },
+            #abi_path::TypeDef::Enum(#abi_path::EnumDef {
+                variants: #abi_path::__private::vec![#(#variants),*],
+                unknown_fields: #unknown_fields,
+                unknown_variants: #unknown_variants,
+            }),
         )
     }
 }
 
-fn field_defs_tokens(fields: &[FieldSpec<'_>]) -> proc_macro2::TokenStream {
-    let defs = fields.iter().map(|field| {
+fn field_defs_tokens(field_set: &FieldSetSpec<'_>, abi_path: &Path) -> proc_macro2::TokenStream {
+    let defs = field_set.fields.iter().map(|field| {
         let id = field.id;
         let name = field.ident.to_string();
-        let ty = &field.ty_name;
-        let optional = field.optional;
+        let ty = field_type_ref_tokens(field, abi_path);
+        let presence = if field.optional {
+            quote!(#abi_path::FieldPresence::Optional)
+        } else {
+            quote!(#abi_path::FieldPresence::Required)
+        };
         quote! {
-            ::sacp_cbor_abi::FieldDef {
+            #abi_path::FieldDef {
                 id: #id,
-                name: ::sacp_cbor_abi::__private::String::from(#name),
-                ty: ::sacp_cbor_abi::__private::String::from(#ty),
-                optional: #optional,
+                name: #abi_path::__private::String::from(#name),
+                ty: #ty,
+                presence: #presence,
             }
         }
     });
-    quote! { ::sacp_cbor_abi::__private::vec![#(#defs),*] }
+    quote! { #abi_path::__private::vec![#(#defs),*] }
+}
+
+fn field_type_ref_tokens(field: &FieldSpec<'_>, abi_path: &Path) -> proc_macro2::TokenStream {
+    if let Some(type_id) = &field.ty_override {
+        let version = match field.ty_version {
+            Some(version) => quote!(::core::option::Option::Some(#version)),
+            None => quote!(::core::option::Option::None),
+        };
+        quote! {
+            #abi_path::TypeRef::Named {
+                type_id: #abi_path::__private::String::from(#type_id),
+                version: #version,
+            }
+        }
+    } else {
+        let wire_ty = field.wire_ty;
+        quote!(<#wire_ty as #abi_path::AbiTypeRef>::abi_type_ref())
+    }
+}
+
+fn type_ref_impl_tokens(
+    name: &Ident,
+    generics: &Generics,
+    attrs: &ContainerAttr,
+) -> proc_macro2::TokenStream {
+    let abi_path = &attrs.abi_path;
+    let type_id = &attrs.type_id;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    quote! {
+        impl #impl_generics #abi_path::AbiTypeRef for #name #ty_generics #where_clause {
+            fn abi_type_ref() -> #abi_path::TypeRef {
+                #abi_path::TypeRef::Named {
+                    type_id: #abi_path::__private::String::from(#type_id),
+                    version: ::core::option::Option::None,
+                }
+            }
+        }
+    }
 }
 
 fn storage_ident(ident: &Ident) -> Ident {

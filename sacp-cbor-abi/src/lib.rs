@@ -1,47 +1,106 @@
-//! Stable ABI schema and codegen support for `sacp-cbor`.
-//!
-//! This crate is intentionally separate from `CborEncode` / `CborDecode` derives. Normal derives
-//! describe Rust shape. `CborAbi` describes a public wire contract with numeric field and variant
-//! identities, schema hashes, and mechanical compatibility checks.
+//! Stable public ABI schemas and codecs for SACP-CBOR.
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::{
-    CanonicalCbor, CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder, ErrorCode,
+    CanonicalCbor, CanonicalCborRef, CborDecode, CborEncode, CborError, DecodeLimits, Decoder,
+    Encoder, ErrorCode,
 };
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "derive")]
 pub use sacp_cbor_abi_derive::CborAbi;
 
-/// Private support items used by generated code.
+/// Support items used by generated code.
 #[doc(hidden)]
 pub mod __private {
-    pub use alloc::{string::String, vec, vec::Vec};
+    pub use alloc::{boxed::Box, string::String, vec, vec::Vec};
     pub use sacp_cbor;
+
+    use super::{UnknownFields, UnknownVariant};
+
+    /// Encode one ABI field ID in a field-set array.
+    pub fn encode_field_id(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+        id: u32,
+    ) -> Result<(), sacp_cbor::CborError> {
+        array.value_with(|enc| sacp_cbor::CborEncode::encode(&id, enc))
+    }
+
+    /// Encode preserved unknown fields whose IDs are lower than `before_id`.
+    pub fn encode_unknown_fields_before(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+        unknown: &UnknownFields,
+        cursor: &mut usize,
+        before_id: u32,
+    ) -> Result<(), sacp_cbor::CborError> {
+        let fields = unknown.as_slice();
+        while *cursor < fields.len() && fields[*cursor].id < before_id {
+            encode_unknown_field(array, &fields[*cursor])?;
+            *cursor += 1;
+        }
+        if *cursor < fields.len() && fields[*cursor].id == before_id {
+            return Err(sacp_cbor::CborError::new(
+                sacp_cbor::ErrorCode::DuplicateMapKey,
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encode remaining preserved unknown fields.
+    pub fn encode_remaining_unknown_fields(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+        unknown: &UnknownFields,
+        cursor: &mut usize,
+    ) -> Result<(), sacp_cbor::CborError> {
+        let fields = unknown.as_slice();
+        while *cursor < fields.len() {
+            encode_unknown_field(array, &fields[*cursor])?;
+            *cursor += 1;
+        }
+        Ok(())
+    }
+
+    /// Validate that an unknown variant does not use a reserved variant ID.
+    pub fn validate_unknown_variant(
+        variant: &UnknownVariant,
+        reserved: &[u32],
+    ) -> Result<(), sacp_cbor::CborError> {
+        if variant.id == 0 || reserved.contains(&variant.id) {
+            return Err(sacp_cbor::CborError::new(
+                sacp_cbor::ErrorCode::InvalidAbiValue,
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode_unknown_field(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+        field: &super::UnknownField,
+    ) -> Result<(), sacp_cbor::CborError> {
+        encode_field_id(array, field.id)?;
+        array.raw_cbor(field.value.as_canonical_ref())
+    }
 }
 
 /// Encode a public ABI value.
 pub trait AbiEncode {
     /// Encode `self` into canonical SACP-CBOR bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
     fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError>;
 }
 
 /// Decode a public ABI value.
 pub trait AbiDecode<'de>: Sized {
     /// Decode `Self` from a streaming decoder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the input does not match the ABI schema.
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
     ) -> Result<Self, CborError>;
@@ -54,24 +113,64 @@ pub trait AbiType {
     fn schema() -> Schema;
 }
 
+/// Exposes the ABI type reference used when this type appears as a field.
+pub trait AbiTypeRef {
+    /// Return this type's stable ABI reference.
+    #[must_use]
+    fn abi_type_ref() -> TypeRef;
+}
+
 /// Current stable ABI schema profile.
-pub const ABI_PROFILE: &str = "SACP-CBOR-ABI/1";
+pub const ABI_PROFILE: &str = "SACP_CBOR_ABI/1";
 
 /// Unknown field handling policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownFieldPolicy {
     /// Reject unknown fields.
     Reject,
-    /// Ignore unknown fields.
+    /// Accept unknown fields without retaining them.
     Ignore,
+    /// Accept and retain unknown fields for byte-preserving re-encode.
+    Preserve,
 }
 
 impl UnknownFieldPolicy {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Reject => "reject",
             Self::Ignore => "ignore",
+            Self::Preserve => "preserve",
         }
+    }
+
+    const fn accepts(self) -> bool {
+        matches!(self, Self::Ignore | Self::Preserve)
+    }
+
+    const fn preserves(self) -> bool {
+        matches!(self, Self::Preserve)
+    }
+}
+
+/// Unknown enum variant handling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownVariantPolicy {
+    /// Reject unknown variants.
+    Reject,
+    /// Accept and retain unknown variants for byte-preserving re-encode.
+    Preserve,
+}
+
+impl UnknownVariantPolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Preserve => "preserve",
+        }
+    }
+
+    const fn preserves(self) -> bool {
+        matches!(self, Self::Preserve)
     }
 }
 
@@ -82,7 +181,7 @@ pub struct Schema {
     pub profile: String,
     /// Stable type identity.
     pub type_id: String,
-    /// Schema version.
+    /// Governance schema version.
     pub version: u32,
     /// Root type definition.
     pub root: TypeDef,
@@ -100,24 +199,21 @@ impl Schema {
         }
     }
 
-    /// Canonical SACP-CBOR encoding of the schema normal form.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if schema encoding fails.
-    pub fn canonical_bytes(&self) -> Result<CanonicalCbor, CborError> {
+    /// Canonical SACP-CBOR encoding of the selected schema normal form.
+    pub fn canonical_bytes(&self, kind: SchemaHashKind) -> Result<CanonicalCbor, CborError> {
         let mut enc = Encoder::new();
-        encode_schema(self, &mut enc)?;
+        encode_schema(self, kind, &mut enc)?;
         enc.finish()
     }
 
-    /// SHA-256 over the canonical schema normal form.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if schema encoding fails.
-    pub fn hash(&self) -> Result<SchemaHash, CborError> {
-        schema_hash(self)
+    /// SHA-256 over the wire-significant schema normal form.
+    pub fn wire_hash(&self) -> Result<SchemaHash, CborError> {
+        schema_hash(self, SchemaHashKind::Wire)
+    }
+
+    /// SHA-256 over the complete schema normal form.
+    pub fn full_hash(&self) -> Result<SchemaHash, CborError> {
+        schema_hash(self, SchemaHashKind::Full)
     }
 }
 
@@ -125,24 +221,39 @@ impl Schema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeDef {
     /// Struct field-set.
-    Struct {
-        /// Public fields.
-        fields: Vec<FieldDef>,
-        /// Unknown field policy.
-        unknown_fields: UnknownFieldPolicy,
-    },
+    Struct(FieldSetDef),
     /// Enum discriminant plus payload.
-    Enum {
-        /// Public variants.
-        variants: Vec<VariantDef>,
-        /// Unknown field policy for struct variant payloads.
-        unknown_fields: UnknownFieldPolicy,
+    Enum(EnumDef),
+    /// Named wrapper encoded exactly like its inner type.
+    Transparent {
+        /// Inner wire type.
+        inner: TypeRef,
     },
-    /// Primitive or externally-defined field type.
+    /// Primitive or external type definition.
     Primitive {
-        /// Stable display name.
-        name: String,
+        /// Primitive type reference.
+        ty: TypeRef,
     },
+}
+
+/// A reusable ABI field-set definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldSetDef {
+    /// Public fields.
+    pub fields: Vec<FieldDef>,
+    /// Unknown field policy.
+    pub unknown_fields: UnknownFieldPolicy,
+}
+
+/// A public enum definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDef {
+    /// Public variants.
+    pub variants: Vec<VariantDef>,
+    /// Unknown field policy for named variant payloads.
+    pub unknown_fields: UnknownFieldPolicy,
+    /// Unknown variant policy.
+    pub unknown_variants: UnknownVariantPolicy,
 }
 
 /// A public field definition.
@@ -150,12 +261,82 @@ pub enum TypeDef {
 pub struct FieldDef {
     /// Stable numeric field ID. Must be nonzero.
     pub id: u32,
-    /// Rust/source field name for diagnostics.
+    /// Source field name for diagnostics.
     pub name: String,
-    /// Field type name.
-    pub ty: String,
-    /// Whether this field is optional and omitted when absent.
-    pub optional: bool,
+    /// Field wire type.
+    pub ty: TypeRef,
+    /// Field presence semantics.
+    pub presence: FieldPresence,
+}
+
+/// ABI field presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldPresence {
+    /// Field must be present.
+    Required,
+    /// Field is omitted when absent.
+    Optional,
+}
+
+impl FieldPresence {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+        }
+    }
+
+    const fn is_optional(self) -> bool {
+        matches!(self, Self::Optional)
+    }
+}
+
+/// Stable ABI type reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeRef {
+    /// Unit/null.
+    Unit,
+    /// Boolean.
+    Bool,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed 8-bit integer.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// UTF-8 text.
+    Text,
+    /// CBOR byte string.
+    Bytes,
+    /// CBOR byte string with exact length.
+    FixedBytes {
+        /// Required byte length.
+        len: u32,
+    },
+    /// CBOR array of homogeneous items.
+    Vec {
+        /// Item type.
+        item: Box<TypeRef>,
+    },
+    /// Canonical CBOR sub-value.
+    CanonicalCbor,
+    /// Stable named ABI type.
+    Named {
+        /// Stable type identity.
+        type_id: String,
+        /// Optional referenced schema version.
+        version: Option<u32>,
+    },
 }
 
 /// A public enum variant definition.
@@ -163,10 +344,110 @@ pub struct FieldDef {
 pub struct VariantDef {
     /// Stable numeric variant ID. Must be nonzero.
     pub id: u32,
-    /// Rust/source variant name for diagnostics.
+    /// Source variant name for diagnostics.
     pub name: String,
     /// Struct payload fields. Empty means unit payload.
     pub fields: Vec<FieldDef>,
+}
+
+/// Preserved unknown field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownField {
+    /// Stable numeric field ID.
+    pub id: u32,
+    /// Canonical field value bytes.
+    pub value: CanonicalCbor,
+}
+
+impl UnknownField {
+    /// Construct a preserved unknown field.
+    pub fn new(id: u32, value: CanonicalCbor) -> Result<Self, CborError> {
+        if id == 0 {
+            return Err(CborError::new(ErrorCode::InvalidAbiValue, 0));
+        }
+        Ok(Self { id, value })
+    }
+}
+
+/// Preserved unknown fields in strict field-ID order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnknownFields(Vec<UnknownField>);
+
+impl UnknownFields {
+    /// Construct an empty unknown-field set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Construct an unknown-field set after validating ID order and uniqueness.
+    pub fn try_from_vec(fields: Vec<UnknownField>) -> Result<Self, CborError> {
+        let mut prev = None;
+        for field in &fields {
+            if field.id == 0 {
+                return Err(CborError::new(ErrorCode::InvalidAbiValue, 0));
+            }
+            if let Some(prev_id) = prev {
+                if field.id <= prev_id {
+                    return Err(CborError::new(ErrorCode::InvalidAbiValue, 0));
+                }
+            }
+            prev = Some(field.id);
+        }
+        Ok(Self(fields))
+    }
+
+    /// Return the preserved fields.
+    #[must_use]
+    pub fn as_slice(&self) -> &[UnknownField] {
+        &self.0
+    }
+
+    /// Return the number of preserved fields.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return `true` when no unknown fields are preserved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consume and return the preserved fields.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<UnknownField> {
+        self.0
+    }
+}
+
+/// Preserved unknown enum variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownVariant {
+    /// Stable numeric variant ID.
+    pub id: u32,
+    /// Canonical payload bytes.
+    pub payload: CanonicalCbor,
+}
+
+impl UnknownVariant {
+    /// Construct a preserved unknown variant.
+    pub fn new(id: u32, payload: CanonicalCbor) -> Result<Self, CborError> {
+        if id == 0 {
+            return Err(CborError::new(ErrorCode::InvalidAbiValue, 0));
+        }
+        Ok(Self { id, payload })
+    }
+}
+
+/// Schema hash normal form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaHashKind {
+    /// Wire-significant schema data.
+    Wire,
+    /// Complete schema data, including diagnostics.
+    Full,
 }
 
 /// SHA-256 digest of a schema normal form.
@@ -190,55 +471,94 @@ impl fmt::Display for SchemaHash {
     }
 }
 
-/// Compatibility policy for schema diffs.
+/// Top-level compatibility class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompatibilityPolicy {
-    /// Allow adding optional struct fields.
-    pub allow_optional_field_additions: bool,
-    /// Allow adding enum variants.
-    pub allow_variant_additions: bool,
+pub enum CompatibilityClass {
+    /// The direction is schema-compatible.
+    Compatible,
+    /// The direction is not schema-compatible.
+    Incompatible,
 }
 
-impl Default for CompatibilityPolicy {
-    fn default() -> Self {
-        Self {
-            allow_optional_field_additions: true,
-            allow_variant_additions: false,
+impl CompatibilityClass {
+    const fn and(self, other: Self) -> Self {
+        if matches!(self, Self::Compatible) && matches!(other, Self::Compatible) {
+            Self::Compatible
+        } else {
+            Self::Incompatible
         }
     }
 }
 
-/// Top-level compatibility class.
+/// Schema change severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompatibilityClass {
-    /// Existing decoders remain compatible under the policy.
-    Compatible,
-    /// Existing decoders are not compatible.
-    Incompatible,
+pub enum SchemaChangeClass {
+    /// Diagnostic metadata changed.
+    MetadataOnly,
+    /// Wire schema changed without breaking every direction.
+    WireCompatible,
+    /// Wire schema changed in a breaking direction.
+    WireIncompatible,
 }
 
-/// Compatibility report.
+/// Structured schema change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaChange {
+    /// Schema path.
+    pub path: String,
+    /// Change class.
+    pub class: SchemaChangeClass,
+    /// Human-readable description.
+    pub message: String,
+}
+
+/// Directional compatibility report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatibilityReport {
-    /// Overall class.
-    pub class: CompatibilityClass,
-    /// Human-readable change descriptions.
-    pub changes: Vec<String>,
+    /// Whether the new decoder can read old bytes.
+    pub new_reads_old: CompatibilityClass,
+    /// Whether the old decoder can read new bytes.
+    pub old_reads_new: CompatibilityClass,
+    /// Whether the old decoder can preserve and re-emit new bytes.
+    pub old_preserves_new: CompatibilityClass,
+    /// Whether both decoders can read each other's bytes.
+    pub bidirectional: CompatibilityClass,
+    /// Structured schema changes.
+    pub changes: Vec<SchemaChange>,
 }
 
 impl CompatibilityReport {
-    /// Whether the report is compatible.
+    /// Whether both read directions are compatible.
     #[must_use]
-    pub const fn is_compatible(&self) -> bool {
-        matches!(self.class, CompatibilityClass::Compatible)
+    pub const fn is_bidirectional(&self) -> bool {
+        matches!(self.bidirectional, CompatibilityClass::Compatible)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Directional {
+    new_reads_old: CompatibilityClass,
+    old_reads_new: CompatibilityClass,
+    old_preserves_new: CompatibilityClass,
+}
+
+impl Directional {
+    const fn compatible() -> Self {
+        Self {
+            new_reads_old: CompatibilityClass::Compatible,
+            old_reads_new: CompatibilityClass::Compatible,
+            old_preserves_new: CompatibilityClass::Compatible,
+        }
+    }
+
+    fn all_incompatible(&mut self) {
+        self.new_reads_old = CompatibilityClass::Incompatible;
+        self.old_reads_new = CompatibilityClass::Incompatible;
+        self.old_preserves_new = CompatibilityClass::Incompatible;
     }
 }
 
 /// Encode an ABI value to owned canonical CBOR.
-///
-/// # Errors
-///
-/// Returns an error if encoding fails.
 pub fn encode_to_canonical<T: AbiEncode>(value: &T) -> Result<CanonicalCbor, CborError> {
     let mut enc = Encoder::new();
     value.abi_encode(&mut enc)?;
@@ -246,19 +566,11 @@ pub fn encode_to_canonical<T: AbiEncode>(value: &T) -> Result<CanonicalCbor, Cbo
 }
 
 /// Encode an ABI value to a vector of canonical bytes.
-///
-/// # Errors
-///
-/// Returns an error if encoding fails.
 pub fn encode_to_vec<T: AbiEncode>(value: &T) -> Result<Vec<u8>, CborError> {
     Ok(encode_to_canonical(value)?.into_bytes())
 }
 
 /// Validate and decode an ABI value.
-///
-/// # Errors
-///
-/// Returns an error if validation or decoding fails.
 pub fn decode<'de, T: AbiDecode<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
@@ -271,13 +583,9 @@ pub fn decode<'de, T: AbiDecode<'de>>(
     Ok(value)
 }
 
-/// SHA-256 over the canonical schema normal form.
-///
-/// # Errors
-///
-/// Returns an error if schema encoding fails.
-pub fn schema_hash(schema: &Schema) -> Result<SchemaHash, CborError> {
-    let canon = schema.canonical_bytes()?;
+/// SHA-256 over the selected canonical schema normal form.
+pub fn schema_hash(schema: &Schema, kind: SchemaHashKind) -> Result<SchemaHash, CborError> {
+    let canon = schema.canonical_bytes(kind)?;
     let mut hasher = Sha256::new();
     hasher.update(canon.as_bytes());
     let digest = hasher.finalize();
@@ -286,111 +594,228 @@ pub fn schema_hash(schema: &Schema) -> Result<SchemaHash, CborError> {
     Ok(SchemaHash(out))
 }
 
-/// Diff two schemas using the default compatibility policy.
+/// Diff two schemas and report directional compatibility.
 #[must_use]
 pub fn diff(old: &Schema, new: &Schema) -> CompatibilityReport {
-    diff_with_policy(old, new, CompatibilityPolicy::default())
-}
-
-/// Diff two schemas using an explicit compatibility policy.
-#[must_use]
-pub fn diff_with_policy(
-    old: &Schema,
-    new: &Schema,
-    policy: CompatibilityPolicy,
-) -> CompatibilityReport {
     let mut changes = Vec::new();
-    let mut incompatible = false;
+    let mut dir = Directional::compatible();
 
     if old.profile != new.profile {
-        incompatible = true;
-        changes.push("ABI profile changed".to_string());
+        dir.all_incompatible();
+        push_change(
+            &mut changes,
+            "schema",
+            SchemaChangeClass::WireIncompatible,
+            "ABI profile changed",
+        );
     }
     if old.type_id != new.type_id {
-        incompatible = true;
-        changes.push("type ID changed".to_string());
+        dir.all_incompatible();
+        push_change(
+            &mut changes,
+            "schema",
+            SchemaChangeClass::WireIncompatible,
+            "type ID changed",
+        );
     }
-    if new.version < old.version {
-        incompatible = true;
-        changes.push("schema version decreased".to_string());
+    if old.version != new.version {
+        push_change(
+            &mut changes,
+            "schema.version",
+            SchemaChangeClass::MetadataOnly,
+            "version changed",
+        );
     }
 
-    compare_type_defs(
-        "root",
-        &old.root,
-        &new.root,
-        policy,
-        &mut changes,
-        &mut incompatible,
-    );
+    compare_type_defs("root", &old.root, &new.root, &mut changes, &mut dir);
 
     CompatibilityReport {
-        class: if incompatible {
-            CompatibilityClass::Incompatible
-        } else {
-            CompatibilityClass::Compatible
-        },
+        new_reads_old: dir.new_reads_old,
+        old_reads_new: dir.old_reads_new,
+        old_preserves_new: dir.old_preserves_new,
+        bidirectional: dir.new_reads_old.and(dir.old_reads_new),
         changes,
     }
+}
+
+/// Assert a type's wire schema hash.
+pub fn assert_wire_schema_hash<T: AbiType>(expected_hex: &str) {
+    let actual = T::schema().wire_hash().expect("schema wire hash");
+    assert_eq!(actual.to_string(), expected_hex);
+}
+
+/// Assert a type's full schema hash.
+pub fn assert_full_schema_hash<T: AbiType>(expected_hex: &str) {
+    let actual = T::schema().full_hash().expect("schema full hash");
+    assert_eq!(actual.to_string(), expected_hex);
+}
+
+/// Assert an ABI encoding golden vector.
+pub fn assert_abi_vector<T: AbiEncode>(name: &str, value: &T, expected_hex: &str) {
+    let bytes = encode_to_vec(value).unwrap_or_else(|err| panic!("{name}: encode failed: {err}"));
+    let actual = hex_bytes(&bytes);
+    assert_eq!(actual, expected_hex, "{name}");
+}
+
+/// Assert that ABI decoding rejects bytes with the expected error code.
+pub fn assert_abi_rejects<'de, T: AbiDecode<'de>>(bytes: &'de [u8], expected: ErrorCode) {
+    match decode::<T>(bytes, DecodeLimits::for_bytes(bytes.len())) {
+        Ok(_) => panic!("decode unexpectedly succeeded"),
+        Err(err) => assert_eq!(err.code, expected),
+    }
+}
+
+fn push_change(
+    changes: &mut Vec<SchemaChange>,
+    path: &str,
+    class: SchemaChangeClass,
+    message: &str,
+) {
+    changes.push(SchemaChange {
+        path: path.to_string(),
+        class,
+        message: message.to_string(),
+    });
 }
 
 fn compare_type_defs(
     path: &str,
     old: &TypeDef,
     new: &TypeDef,
-    policy: CompatibilityPolicy,
-    changes: &mut Vec<String>,
-    incompatible: &mut bool,
+    changes: &mut Vec<SchemaChange>,
+    dir: &mut Directional,
 ) {
     match (old, new) {
-        (
-            TypeDef::Struct {
-                fields: old_fields,
-                unknown_fields: old_unknown,
-            },
-            TypeDef::Struct {
-                fields: new_fields,
-                unknown_fields: new_unknown,
-            },
-        ) => {
-            if old_unknown != new_unknown {
-                *incompatible = true;
-                changes.push(format!("{path} unknown-field policy changed"));
-            }
-            compare_fields(path, old_fields, new_fields, policy, changes, incompatible);
+        (TypeDef::Struct(old), TypeDef::Struct(new)) => {
+            compare_field_sets(path, old, new, changes, dir);
         }
-        (
-            TypeDef::Enum {
-                variants: old_variants,
-                unknown_fields: old_unknown,
-            },
-            TypeDef::Enum {
-                variants: new_variants,
-                unknown_fields: new_unknown,
-            },
-        ) => {
-            if old_unknown != new_unknown {
-                *incompatible = true;
-                changes.push(format!("{path} unknown-field policy changed"));
-            }
-            compare_variants(
-                path,
-                old_variants,
-                new_variants,
-                policy,
-                changes,
-                incompatible,
-            );
+        (TypeDef::Enum(old), TypeDef::Enum(new)) => {
+            compare_enums(path, old, new, changes, dir);
         }
-        (TypeDef::Primitive { name: old_name }, TypeDef::Primitive { name: new_name }) => {
-            if old_name != new_name {
-                *incompatible = true;
-                changes.push(format!("{path} primitive type changed"));
-            }
+        (TypeDef::Transparent { inner: old }, TypeDef::Transparent { inner: new }) => {
+            compare_type_ref(path, old, new, changes, dir);
+        }
+        (TypeDef::Primitive { ty: old }, TypeDef::Primitive { ty: new }) => {
+            compare_type_ref(path, old, new, changes, dir);
         }
         _ => {
-            *incompatible = true;
-            changes.push(format!("{path} kind changed"));
+            dir.all_incompatible();
+            push_change(
+                changes,
+                path,
+                SchemaChangeClass::WireIncompatible,
+                "type kind changed",
+            );
+        }
+    }
+}
+
+fn compare_field_sets(
+    path: &str,
+    old: &FieldSetDef,
+    new: &FieldSetDef,
+    changes: &mut Vec<SchemaChange>,
+    dir: &mut Directional,
+) {
+    if old.unknown_fields != new.unknown_fields {
+        push_change(
+            changes,
+            &format!("{path}.unknown_fields"),
+            SchemaChangeClass::WireCompatible,
+            "unknown-field policy changed",
+        );
+    }
+    compare_fields(
+        path,
+        &old.fields,
+        &new.fields,
+        old.unknown_fields,
+        new.unknown_fields,
+        changes,
+        dir,
+    );
+}
+
+fn compare_enums(
+    path: &str,
+    old: &EnumDef,
+    new: &EnumDef,
+    changes: &mut Vec<SchemaChange>,
+    dir: &mut Directional,
+) {
+    if old.unknown_fields != new.unknown_fields {
+        push_change(
+            changes,
+            &format!("{path}.unknown_fields"),
+            SchemaChangeClass::WireCompatible,
+            "variant field-set unknown-field policy changed",
+        );
+    }
+    if old.unknown_variants != new.unknown_variants {
+        push_change(
+            changes,
+            &format!("{path}.unknown_variants"),
+            SchemaChangeClass::WireCompatible,
+            "unknown-variant policy changed",
+        );
+    }
+
+    for old_variant in &old.variants {
+        match new
+            .variants
+            .iter()
+            .find(|variant| variant.id == old_variant.id)
+        {
+            Some(new_variant) => {
+                let variant_path = format!("{path}.variant.{}", old_variant.id);
+                if old_variant.name != new_variant.name {
+                    push_change(
+                        changes,
+                        &format!("{variant_path}.name"),
+                        SchemaChangeClass::MetadataOnly,
+                        "variant name changed",
+                    );
+                }
+                compare_fields(
+                    &variant_path,
+                    &old_variant.fields,
+                    &new_variant.fields,
+                    old.unknown_fields,
+                    new.unknown_fields,
+                    changes,
+                    dir,
+                );
+            }
+            None => {
+                push_change(
+                    changes,
+                    &format!("{path}.variant.{}", old_variant.id),
+                    SchemaChangeClass::WireIncompatible,
+                    "variant removed",
+                );
+                if !new.unknown_variants.preserves() {
+                    dir.new_reads_old = CompatibilityClass::Incompatible;
+                }
+            }
+        }
+    }
+
+    for new_variant in &new.variants {
+        if old
+            .variants
+            .iter()
+            .all(|variant| variant.id != new_variant.id)
+        {
+            push_change(
+                changes,
+                &format!("{path}.variant.{}", new_variant.id),
+                SchemaChangeClass::WireCompatible,
+                "variant added",
+            );
+            if !old.unknown_variants.preserves() {
+                dir.old_reads_new = CompatibilityClass::Incompatible;
+                dir.old_preserves_new = CompatibilityClass::Incompatible;
+            }
         }
     }
 }
@@ -399,116 +824,170 @@ fn compare_fields(
     path: &str,
     old_fields: &[FieldDef],
     new_fields: &[FieldDef],
-    policy: CompatibilityPolicy,
-    changes: &mut Vec<String>,
-    incompatible: &mut bool,
+    old_unknown: UnknownFieldPolicy,
+    new_unknown: UnknownFieldPolicy,
+    changes: &mut Vec<SchemaChange>,
+    dir: &mut Directional,
 ) {
     for old in old_fields {
         match new_fields.iter().find(|field| field.id == old.id) {
             Some(new) => {
-                if old.ty != new.ty {
-                    *incompatible = true;
-                    changes.push(format!("{path} field {} type changed", old.id));
+                let field_path = format!("{path}.field.{}", old.id);
+                if old.name != new.name {
+                    push_change(
+                        changes,
+                        &format!("{field_path}.name"),
+                        SchemaChangeClass::MetadataOnly,
+                        "field name changed",
+                    );
                 }
-                if old.optional != new.optional {
-                    *incompatible = true;
-                    changes.push(format!("{path} field {} optionality changed", old.id));
+                if old.ty != new.ty {
+                    dir.all_incompatible();
+                    push_change(
+                        changes,
+                        &format!("{field_path}.type"),
+                        SchemaChangeClass::WireIncompatible,
+                        "field type changed",
+                    );
+                }
+                if old.presence != new.presence {
+                    push_change(
+                        changes,
+                        &format!("{field_path}.presence"),
+                        SchemaChangeClass::WireIncompatible,
+                        "field presence changed",
+                    );
+                    match (old.presence, new.presence) {
+                        (FieldPresence::Required, FieldPresence::Optional) => {
+                            dir.old_reads_new = CompatibilityClass::Incompatible;
+                            dir.old_preserves_new = CompatibilityClass::Incompatible;
+                        }
+                        (FieldPresence::Optional, FieldPresence::Required) => {
+                            dir.new_reads_old = CompatibilityClass::Incompatible;
+                        }
+                        _ => {}
+                    }
                 }
             }
             None => {
-                *incompatible = true;
-                changes.push(format!("{path} field {} removed", old.id));
+                push_change(
+                    changes,
+                    &format!("{path}.field.{}", old.id),
+                    SchemaChangeClass::WireIncompatible,
+                    "field removed",
+                );
+                if !new_unknown.accepts() {
+                    dir.new_reads_old = CompatibilityClass::Incompatible;
+                }
+                if matches!(old.presence, FieldPresence::Required) {
+                    dir.old_reads_new = CompatibilityClass::Incompatible;
+                    dir.old_preserves_new = CompatibilityClass::Incompatible;
+                }
             }
         }
     }
+
     for new in new_fields {
         if old_fields.iter().all(|field| field.id != new.id) {
-            changes.push(format!("{path} field {} added", new.id));
-            if !(new.optional && policy.allow_optional_field_additions) {
-                *incompatible = true;
+            push_change(
+                changes,
+                &format!("{path}.field.{}", new.id),
+                if new.presence.is_optional() {
+                    SchemaChangeClass::WireCompatible
+                } else {
+                    SchemaChangeClass::WireIncompatible
+                },
+                "field added",
+            );
+            if !new.presence.is_optional() {
+                dir.new_reads_old = CompatibilityClass::Incompatible;
+            }
+            if !old_unknown.accepts() {
+                dir.old_reads_new = CompatibilityClass::Incompatible;
+            }
+            if !old_unknown.preserves() {
+                dir.old_preserves_new = CompatibilityClass::Incompatible;
             }
         }
     }
 }
 
-fn compare_variants(
+fn compare_type_ref(
     path: &str,
-    old_variants: &[VariantDef],
-    new_variants: &[VariantDef],
-    policy: CompatibilityPolicy,
-    changes: &mut Vec<String>,
-    incompatible: &mut bool,
+    old: &TypeRef,
+    new: &TypeRef,
+    changes: &mut Vec<SchemaChange>,
+    dir: &mut Directional,
 ) {
-    for old in old_variants {
-        match new_variants.iter().find(|variant| variant.id == old.id) {
-            Some(new) => {
-                compare_fields(
-                    &format!("{path} variant {}", old.id),
-                    &old.fields,
-                    &new.fields,
-                    policy,
-                    changes,
-                    incompatible,
-                );
-            }
-            None => {
-                *incompatible = true;
-                changes.push(format!("{path} variant {} removed", old.id));
-            }
-        }
-    }
-    for new in new_variants {
-        if old_variants.iter().all(|variant| variant.id != new.id) {
-            changes.push(format!("{path} variant {} added", new.id));
-            if !policy.allow_variant_additions {
-                *incompatible = true;
-            }
-        }
+    if old != new {
+        dir.all_incompatible();
+        push_change(
+            changes,
+            path,
+            SchemaChangeClass::WireIncompatible,
+            "type reference changed",
+        );
     }
 }
 
-fn encode_schema(schema: &Schema, enc: &mut Encoder) -> Result<(), CborError> {
-    enc.array(4, |array| {
-        encode_item(array, &schema.profile)?;
-        encode_item(array, &schema.type_id)?;
-        encode_item(array, &schema.version)?;
-        array.value_with(|enc| encode_type_def(&schema.root, enc))?;
-        Ok(())
-    })
-}
-
-fn encode_type_def(def: &TypeDef, enc: &mut Encoder) -> Result<(), CborError> {
-    match def {
-        TypeDef::Struct {
-            fields,
-            unknown_fields,
-        } => enc.array(3, |array| {
-            encode_item(array, &"struct")?;
-            encode_item(array, &unknown_fields.as_str())?;
-            encode_fields(array, fields)?;
+fn encode_schema(
+    schema: &Schema,
+    kind: SchemaHashKind,
+    enc: &mut Encoder,
+) -> Result<(), CborError> {
+    match kind {
+        SchemaHashKind::Wire => enc.array(3, |array| {
+            encode_item(array, &schema.profile)?;
+            encode_item(array, &schema.type_id)?;
+            array.value_with(|enc| encode_type_def(&schema.root, kind, enc))?;
             Ok(())
         }),
-        TypeDef::Enum {
-            variants,
-            unknown_fields,
-        } => enc.array(3, |array| {
+        SchemaHashKind::Full => enc.array(4, |array| {
+            encode_item(array, &schema.profile)?;
+            encode_item(array, &schema.type_id)?;
+            encode_item(array, &schema.version)?;
+            array.value_with(|enc| encode_type_def(&schema.root, kind, enc))?;
+            Ok(())
+        }),
+    }
+}
+
+fn encode_type_def(
+    def: &TypeDef,
+    kind: SchemaHashKind,
+    enc: &mut Encoder,
+) -> Result<(), CborError> {
+    match def {
+        TypeDef::Struct(field_set) => enc.array(3, |array| {
+            encode_item(array, &"struct")?;
+            encode_item(array, &field_set.unknown_fields.as_str())?;
+            encode_fields(array, &field_set.fields, kind)?;
+            Ok(())
+        }),
+        TypeDef::Enum(enum_def) => enc.array(4, |array| {
             encode_item(array, &"enum")?;
-            encode_item(array, &unknown_fields.as_str())?;
+            encode_item(array, &enum_def.unknown_fields.as_str())?;
+            encode_item(array, &enum_def.unknown_variants.as_str())?;
             array.value_with(|enc| {
-                let mut variants: Vec<&VariantDef> = variants.iter().collect();
+                let mut variants: Vec<&VariantDef> = enum_def.variants.iter().collect();
                 variants.sort_by_key(|variant| variant.id);
                 enc.array(variants.len(), |array| {
                     for variant in variants {
-                        array.value_with(|enc| encode_variant(variant, enc))?;
+                        array.value_with(|enc| encode_variant(variant, kind, enc))?;
                     }
                     Ok(())
                 })
             })?;
             Ok(())
         }),
-        TypeDef::Primitive { name } => enc.array(2, |array| {
+        TypeDef::Transparent { inner } => enc.array(2, |array| {
+            encode_item(array, &"transparent")?;
+            array.value_with(|enc| encode_type_ref(inner, enc))?;
+            Ok(())
+        }),
+        TypeDef::Primitive { ty } => enc.array(2, |array| {
             encode_item(array, &"primitive")?;
-            encode_item(array, name)?;
+            array.value_with(|enc| encode_type_ref(ty, enc))?;
             Ok(())
         }),
     }
@@ -517,36 +996,97 @@ fn encode_type_def(def: &TypeDef, enc: &mut Encoder) -> Result<(), CborError> {
 fn encode_fields(
     array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
     fields: &[FieldDef],
+    kind: SchemaHashKind,
 ) -> Result<(), CborError> {
     array.value_with(|enc| {
         let mut fields: Vec<&FieldDef> = fields.iter().collect();
         fields.sort_by_key(|field| field.id);
         enc.array(fields.len(), |array| {
             for field in fields {
-                array.value_with(|enc| encode_field(field, enc))?;
+                array.value_with(|enc| encode_field(field, kind, enc))?;
             }
             Ok(())
         })
     })
 }
 
-fn encode_field(field: &FieldDef, enc: &mut Encoder) -> Result<(), CborError> {
-    enc.array(4, |array| {
-        encode_item(array, &field.id)?;
-        encode_item(array, &field.name)?;
-        encode_item(array, &field.ty)?;
-        encode_item(array, &field.optional)?;
-        Ok(())
-    })
+fn encode_field(
+    field: &FieldDef,
+    kind: SchemaHashKind,
+    enc: &mut Encoder,
+) -> Result<(), CborError> {
+    match kind {
+        SchemaHashKind::Wire => enc.array(3, |array| {
+            encode_item(array, &field.id)?;
+            array.value_with(|enc| encode_type_ref(&field.ty, enc))?;
+            encode_item(array, &field.presence.as_str())?;
+            Ok(())
+        }),
+        SchemaHashKind::Full => enc.array(4, |array| {
+            encode_item(array, &field.id)?;
+            encode_item(array, &field.name)?;
+            array.value_with(|enc| encode_type_ref(&field.ty, enc))?;
+            encode_item(array, &field.presence.as_str())?;
+            Ok(())
+        }),
+    }
 }
 
-fn encode_variant(variant: &VariantDef, enc: &mut Encoder) -> Result<(), CborError> {
-    enc.array(3, |array| {
-        encode_item(array, &variant.id)?;
-        encode_item(array, &variant.name)?;
-        encode_fields(array, &variant.fields)?;
-        Ok(())
-    })
+fn encode_variant(
+    variant: &VariantDef,
+    kind: SchemaHashKind,
+    enc: &mut Encoder,
+) -> Result<(), CborError> {
+    match kind {
+        SchemaHashKind::Wire => enc.array(2, |array| {
+            encode_item(array, &variant.id)?;
+            encode_fields(array, &variant.fields, kind)?;
+            Ok(())
+        }),
+        SchemaHashKind::Full => enc.array(3, |array| {
+            encode_item(array, &variant.id)?;
+            encode_item(array, &variant.name)?;
+            encode_fields(array, &variant.fields, kind)?;
+            Ok(())
+        }),
+    }
+}
+
+fn encode_type_ref(ty: &TypeRef, enc: &mut Encoder) -> Result<(), CborError> {
+    match ty {
+        TypeRef::Unit => enc.text("unit"),
+        TypeRef::Bool => enc.text("bool"),
+        TypeRef::U8 => enc.text("u8"),
+        TypeRef::U16 => enc.text("u16"),
+        TypeRef::U32 => enc.text("u32"),
+        TypeRef::U64 => enc.text("u64"),
+        TypeRef::I8 => enc.text("i8"),
+        TypeRef::I16 => enc.text("i16"),
+        TypeRef::I32 => enc.text("i32"),
+        TypeRef::I64 => enc.text("i64"),
+        TypeRef::Text => enc.text("text"),
+        TypeRef::Bytes => enc.text("bytes"),
+        TypeRef::CanonicalCbor => enc.text("canonical_cbor"),
+        TypeRef::FixedBytes { len } => enc.array(2, |array| {
+            encode_item(array, &"fixed_bytes")?;
+            encode_item(array, len)?;
+            Ok(())
+        }),
+        TypeRef::Vec { item } => enc.array(2, |array| {
+            encode_item(array, &"vec")?;
+            array.value_with(|enc| encode_type_ref(item, enc))?;
+            Ok(())
+        }),
+        TypeRef::Named { type_id, version } => enc.array(3, |array| {
+            encode_item(array, &"named")?;
+            encode_item(array, type_id)?;
+            match version {
+                Some(version) => encode_item(array, version)?,
+                None => array.null()?,
+            }
+            Ok(())
+        }),
+    }
 }
 
 fn encode_item<T: CborEncode + ?Sized>(
@@ -556,8 +1096,16 @@ fn encode_item<T: CborEncode + ?Sized>(
     array.value_with(|enc| value.encode(enc))
 }
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 macro_rules! passthrough_abi {
-    ($($ty:ty),* $(,)?) => {
+    ($($ty:ty => $ref:expr),* $(,)?) => {
         $(
             impl AbiEncode for $ty {
                 fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
@@ -572,11 +1120,31 @@ macro_rules! passthrough_abi {
                     CborDecode::decode(decoder)
                 }
             }
+
+            impl AbiTypeRef for $ty {
+                fn abi_type_ref() -> TypeRef {
+                    $ref
+                }
+            }
         )*
     };
 }
 
-passthrough_abi!((), bool, u8, u16, u32, u64, i8, i16, i32, i64, String);
+passthrough_abi!(
+    () => TypeRef::Unit,
+    bool => TypeRef::Bool,
+    u8 => TypeRef::U8,
+    u16 => TypeRef::U16,
+    u32 => TypeRef::U32,
+    u64 => TypeRef::U64,
+    i8 => TypeRef::I8,
+    i16 => TypeRef::I16,
+    i32 => TypeRef::I32,
+    i64 => TypeRef::I64,
+    String => TypeRef::Text,
+    Bytes => TypeRef::Bytes,
+    CanonicalCbor => TypeRef::CanonicalCbor,
+);
 
 impl AbiEncode for &str {
     fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
@@ -589,6 +1157,64 @@ impl<'de> AbiDecode<'de> for &'de str {
         decoder: &mut Decoder<'de, CHECKED>,
     ) -> Result<Self, CborError> {
         CborDecode::decode(decoder)
+    }
+}
+
+impl AbiTypeRef for &str {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::Text
+    }
+}
+
+impl AbiEncode for BytesRef<'_> {
+    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl AbiTypeRef for BytesRef<'_> {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::Bytes
+    }
+}
+
+impl AbiEncode for CanonicalCborRef<'_> {
+    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl<'de> AbiDecode<'de> for CanonicalCborRef<'de> {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+    ) -> Result<Self, CborError> {
+        CborDecode::decode(decoder)
+    }
+}
+
+impl AbiTypeRef for CanonicalCborRef<'_> {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::CanonicalCbor
+    }
+}
+
+impl<const N: usize> AbiEncode for [u8; N] {
+    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl<'de, const N: usize> AbiDecode<'de> for [u8; N] {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+    ) -> Result<Self, CborError> {
+        CborDecode::decode(decoder)
+    }
+}
+
+impl<const N: usize> AbiTypeRef for [u8; N] {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::FixedBytes { len: N as u32 }
     }
 }
 
@@ -613,5 +1239,13 @@ impl<'de, T: AbiDecode<'de>> AbiDecode<'de> for Vec<T> {
             out.push(value);
         }
         Ok(out)
+    }
+}
+
+impl<T: AbiTypeRef> AbiTypeRef for Vec<T> {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::Vec {
+            item: Box::new(T::abi_type_ref()),
+        }
     }
 }

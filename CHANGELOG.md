@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.16.0
+
+- **Breaking:** defined ABI profile `SACP_CBOR_ABI/1` with structured `TypeRef` schema identity, separate wire/full schema hashes, directional compatibility reports, unknown field and variant preservation, transparent newtypes, ABI facade paths, and golden-vector helpers.
+- Added `ErrorCode::InvalidAbiValue` for ABI-level validation failures over otherwise canonical bytes.
+
 ## 0.15.0
 
 - **Breaking:** crate-path attributes use token paths: `#[cbor(crate = my_crate::codec::cbor)]`.

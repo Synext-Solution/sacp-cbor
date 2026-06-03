@@ -1,127 +1,192 @@
 use sacp_cbor_abi::{
-    diff, diff_with_policy, CompatibilityClass, CompatibilityPolicy, FieldDef, Schema, TypeDef,
-    UnknownFieldPolicy, VariantDef,
+    diff, CompatibilityClass, EnumDef, FieldDef, FieldPresence, FieldSetDef, Schema, TypeDef,
+    TypeRef, UnknownFieldPolicy, UnknownVariantPolicy, VariantDef,
 };
 
-fn field(id: u32, ty: &str, optional: bool) -> FieldDef {
+fn field(id: u32, ty: TypeRef, presence: FieldPresence) -> FieldDef {
     FieldDef {
         id,
         name: format!("f{id}"),
-        ty: ty.to_string(),
-        optional,
+        ty,
+        presence,
     }
 }
 
-fn schema(fields: Vec<FieldDef>) -> Schema {
+fn renamed_field(id: u32, name: &str, ty: TypeRef, presence: FieldPresence) -> FieldDef {
+    FieldDef {
+        id,
+        name: name.to_string(),
+        ty,
+        presence,
+    }
+}
+
+fn struct_schema(fields: Vec<FieldDef>, unknown_fields: UnknownFieldPolicy) -> Schema {
     Schema::new(
         "example.Type",
         1,
-        TypeDef::Struct {
+        TypeDef::Struct(FieldSetDef {
             fields,
+            unknown_fields,
+        }),
+    )
+}
+
+fn enum_schema(variants: Vec<VariantDef>, unknown_variants: UnknownVariantPolicy) -> Schema {
+    Schema::new(
+        "example.Enum",
+        1,
+        TypeDef::Enum(EnumDef {
+            variants,
             unknown_fields: UnknownFieldPolicy::Reject,
-        },
+            unknown_variants,
+        }),
     )
 }
 
 #[test]
-fn optional_field_addition_is_compatible_by_default() {
-    let old = schema(vec![field(1, "u64", false)]);
-    let new = schema(vec![field(1, "u64", false), field(2, "String", true)]);
+fn optional_field_addition_is_directional() {
+    let new = struct_schema(
+        vec![
+            field(1, TypeRef::U64, FieldPresence::Required),
+            field(2, TypeRef::Text, FieldPresence::Optional),
+        ],
+        UnknownFieldPolicy::Reject,
+    );
+
+    let old_reject = struct_schema(
+        vec![field(1, TypeRef::U64, FieldPresence::Required)],
+        UnknownFieldPolicy::Reject,
+    );
+    let report = diff(&old_reject, &new);
+    assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Incompatible);
+    assert_eq!(report.old_preserves_new, CompatibilityClass::Incompatible);
+
+    let old_ignore = struct_schema(
+        vec![field(1, TypeRef::U64, FieldPresence::Required)],
+        UnknownFieldPolicy::Ignore,
+    );
+    let report = diff(&old_ignore, &new);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
+    assert_eq!(report.old_preserves_new, CompatibilityClass::Incompatible);
+
+    let old_preserve = struct_schema(
+        vec![field(1, TypeRef::U64, FieldPresence::Required)],
+        UnknownFieldPolicy::Preserve,
+    );
+    let report = diff(&old_preserve, &new);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
+    assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
+}
+
+#[test]
+fn required_field_addition_blocks_new_reads_old() {
+    let old = struct_schema(
+        vec![field(1, TypeRef::U64, FieldPresence::Required)],
+        UnknownFieldPolicy::Ignore,
+    );
+    let new = struct_schema(
+        vec![
+            field(1, TypeRef::U64, FieldPresence::Required),
+            field(2, TypeRef::Text, FieldPresence::Required),
+        ],
+        UnknownFieldPolicy::Reject,
+    );
+
     let report = diff(&old, &new);
-    assert_eq!(report.class, CompatibilityClass::Compatible);
+    assert_eq!(report.new_reads_old, CompatibilityClass::Incompatible);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
 }
 
 #[test]
-fn required_field_addition_and_type_changes_are_incompatible() {
-    let old = schema(vec![field(1, "u64", false)]);
-    let new_required = schema(vec![field(1, "u64", false), field(2, "String", false)]);
-    assert_eq!(
-        diff(&old, &new_required).class,
-        CompatibilityClass::Incompatible
+fn type_change_is_incompatible_in_every_direction() {
+    let old = struct_schema(
+        vec![field(1, TypeRef::U64, FieldPresence::Required)],
+        UnknownFieldPolicy::Preserve,
+    );
+    let new = struct_schema(
+        vec![field(1, TypeRef::Text, FieldPresence::Required)],
+        UnknownFieldPolicy::Preserve,
     );
 
-    let changed_type = schema(vec![field(1, "String", false)]);
-    assert_eq!(
-        diff(&old, &changed_type).class,
-        CompatibilityClass::Incompatible
-    );
-
-    let changed_optionality = schema(vec![field(1, "u64", true)]);
-    assert_eq!(
-        diff(&old, &changed_optionality).class,
-        CompatibilityClass::Incompatible
-    );
+    let report = diff(&old, &new);
+    assert_eq!(report.new_reads_old, CompatibilityClass::Incompatible);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Incompatible);
+    assert_eq!(report.old_preserves_new, CompatibilityClass::Incompatible);
 }
 
 #[test]
-fn profile_and_unknown_policy_changes_are_incompatible() {
-    let old = schema(vec![field(1, "u64", false)]);
-    let mut changed_profile = old.clone();
-    changed_profile.profile = "other".to_string();
-    assert_eq!(
-        diff(&old, &changed_profile).class,
-        CompatibilityClass::Incompatible
+fn metadata_rename_keeps_wire_hash_and_read_compatibility() {
+    let old = struct_schema(
+        vec![renamed_field(
+            1,
+            "amount",
+            TypeRef::U64,
+            FieldPresence::Required,
+        )],
+        UnknownFieldPolicy::Reject,
+    );
+    let new = struct_schema(
+        vec![renamed_field(
+            1,
+            "units",
+            TypeRef::U64,
+            FieldPresence::Required,
+        )],
+        UnknownFieldPolicy::Reject,
     );
 
-    let changed_policy = Schema::new(
-        "example.Type",
-        1,
-        TypeDef::Struct {
-            fields: vec![field(1, "u64", false)],
-            unknown_fields: UnknownFieldPolicy::Ignore,
-        },
-    );
-    assert_eq!(
-        diff(&old, &changed_policy).class,
-        CompatibilityClass::Incompatible
-    );
+    assert_eq!(old.wire_hash().unwrap(), new.wire_hash().unwrap());
+    assert_ne!(old.full_hash().unwrap(), new.full_hash().unwrap());
+
+    let report = diff(&old, &new);
+    assert_eq!(report.bidirectional, CompatibilityClass::Compatible);
+    assert!(report
+        .changes
+        .iter()
+        .any(|change| change.message == "field name changed"));
 }
 
 #[test]
-fn enum_variant_addition_is_policy_controlled() {
-    let old = Schema::new(
-        "example.Enum",
-        1,
-        TypeDef::Enum {
-            variants: vec![VariantDef {
+fn enum_variant_addition_requires_unknown_variant_preservation() {
+    let old_reject = enum_schema(
+        vec![VariantDef {
+            id: 1,
+            name: "A".to_string(),
+            fields: Vec::new(),
+        }],
+        UnknownVariantPolicy::Reject,
+    );
+    let old_preserve = enum_schema(
+        vec![VariantDef {
+            id: 1,
+            name: "A".to_string(),
+            fields: Vec::new(),
+        }],
+        UnknownVariantPolicy::Preserve,
+    );
+    let new = enum_schema(
+        vec![
+            VariantDef {
                 id: 1,
                 name: "A".to_string(),
                 fields: Vec::new(),
-            }],
-            unknown_fields: UnknownFieldPolicy::Reject,
-        },
-    );
-    let new = Schema::new(
-        "example.Enum",
-        2,
-        TypeDef::Enum {
-            variants: vec![
-                VariantDef {
-                    id: 1,
-                    name: "A".to_string(),
-                    fields: Vec::new(),
-                },
-                VariantDef {
-                    id: 2,
-                    name: "B".to_string(),
-                    fields: Vec::new(),
-                },
-            ],
-            unknown_fields: UnknownFieldPolicy::Reject,
-        },
+            },
+            VariantDef {
+                id: 2,
+                name: "B".to_string(),
+                fields: Vec::new(),
+            },
+        ],
+        UnknownVariantPolicy::Reject,
     );
 
-    assert_eq!(diff(&old, &new).class, CompatibilityClass::Incompatible);
-    assert_eq!(
-        diff_with_policy(
-            &old,
-            &new,
-            CompatibilityPolicy {
-                allow_optional_field_additions: true,
-                allow_variant_additions: true,
-            },
-        )
-        .class,
-        CompatibilityClass::Compatible
-    );
+    let report = diff(&old_reject, &new);
+    assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Incompatible);
+
+    let report = diff(&old_preserve, &new);
+    assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
+    assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
 }

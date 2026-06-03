@@ -97,6 +97,8 @@ pub enum ErrorCode {
     UnknownEnumVariant,
     /// Unknown struct or enum payload field key.
     UnknownField,
+    /// Decoded bytes are canonical but violate an ABI-level value rule.
+    InvalidAbiValue,
 
     /// Patch operations overlap or conflict.
     PatchConflict,
@@ -184,6 +186,7 @@ impl fmt::Display for CborError {
             ErrorCode::ExpectedEnum => "expected CBOR enum value",
             ErrorCode::UnknownEnumVariant => "unknown CBOR enum variant",
             ErrorCode::UnknownField => "unknown CBOR field",
+            ErrorCode::InvalidAbiValue => "invalid ABI value",
             ErrorCode::PatchConflict => "patch operations conflict",
             ErrorCode::IndexOutOfBounds => "array index out of bounds",
             ErrorCode::InvalidQuery => "invalid query arguments",
