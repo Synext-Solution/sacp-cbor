@@ -11,6 +11,26 @@ fn encoder_rejects_output_byte_limit() {
     let mut enc = Encoder::with_limits(limits).unwrap();
     let err = enc.text("aa").unwrap_err();
     assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
+    assert!(enc.is_empty());
+
+    enc.null().unwrap();
+    assert_eq!(enc.finish().unwrap().as_bytes(), &[0xf6]);
+}
+
+#[test]
+fn encoder_rejects_output_byte_limit_without_partially_written_array_item() {
+    let limits = EncodeLimits {
+        max_output_bytes: 3,
+        ..EncodeLimits::unbounded()
+    };
+    let mut enc = Encoder::with_limits(limits).unwrap();
+    enc.array(1, |array| {
+        let err = array.bytes(&[0, 1]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::MessageLenLimitExceeded);
+        array.null()
+    })
+    .unwrap();
+    assert_eq!(enc.finish().unwrap().as_bytes(), &[0x81, 0xf6]);
 }
 
 #[test]

@@ -1024,5 +1024,7 @@ Common trait coverage for derive-driven models includes:
 
 ## Benchmarks
 
-A separate benchmark workspace lives under `benchmarks/` and runs cross-crate CBOR benchmarks
-with shared datasets. See `benchmarks/README.md` for setup and usage.
+A separate benchmark workspace lives under `benchmarks/` and runs scenario-driven cross-crate
+CBOR benchmarks (validate / ingest / decode / encode / patch pipelines) on realistic SACP
+message workloads, with pivot-table reports and a baseline-comparison mode for regression
+tracking. See `benchmarks/README.md` for setup and usage.

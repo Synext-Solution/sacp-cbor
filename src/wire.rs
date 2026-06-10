@@ -357,11 +357,8 @@ impl Frame {
 }
 
 trait StackOps {
-    fn is_empty(&self) -> bool;
     fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError>;
     fn pop(&mut self) -> Option<Frame>;
-    fn peek(&self) -> Option<&Frame>;
-    fn peek_mut(&mut self) -> Option<&mut Frame>;
 }
 
 #[cfg(feature = "alloc")]
@@ -390,11 +387,6 @@ impl FrameStack {
         if let Some(items) = &mut self.heap {
             items.clear();
         }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.heap.as_ref().map_or(self.len == 0, Vec::is_empty)
     }
 
     #[inline]
@@ -434,44 +426,10 @@ impl FrameStack {
             }
         }
     }
-
-    #[inline]
-    #[allow(clippy::option_if_let_else)]
-    fn peek(&self) -> Option<&Frame> {
-        match &self.heap {
-            Some(items) => items.last(),
-            None => {
-                if self.len == 0 {
-                    None
-                } else {
-                    Some(&self.inline[self.len - 1])
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn peek_mut(&mut self) -> Option<&mut Frame> {
-        match &mut self.heap {
-            Some(items) => items.last_mut(),
-            None => {
-                if self.len == 0 {
-                    None
-                } else {
-                    Some(&mut self.inline[self.len - 1])
-                }
-            }
-        }
-    }
 }
 
 #[cfg(feature = "alloc")]
 impl StackOps for FrameStack {
-    #[inline]
-    fn is_empty(&self) -> bool {
-        Self::is_empty(self)
-    }
-
     #[inline]
     fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         Self::push(self, frame, off)
@@ -480,16 +438,6 @@ impl StackOps for FrameStack {
     #[inline]
     fn pop(&mut self) -> Option<Frame> {
         Self::pop(self)
-    }
-
-    #[inline]
-    fn peek(&self) -> Option<&Frame> {
-        Self::peek(self)
-    }
-
-    #[inline]
-    fn peek_mut(&mut self) -> Option<&mut Frame> {
-        Self::peek_mut(self)
     }
 }
 
@@ -514,11 +462,6 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[inline]
-    const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         if self.len < N {
             self.inline[self.len] = Some(frame);
@@ -537,31 +480,10 @@ impl<const N: usize> FrameStack<N> {
         self.len -= 1;
         self.inline[self.len].take()
     }
-
-    #[inline]
-    const fn peek(&self) -> Option<&Frame> {
-        if self.len == 0 {
-            return None;
-        }
-        self.inline[self.len - 1].as_ref()
-    }
-
-    #[inline]
-    fn peek_mut(&mut self) -> Option<&mut Frame> {
-        if self.len == 0 {
-            return None;
-        }
-        self.inline[self.len - 1].as_mut()
-    }
 }
 
 #[cfg(not(feature = "alloc"))]
 impl<const N: usize> StackOps for FrameStack<N> {
-    #[inline]
-    fn is_empty(&self) -> bool {
-        Self::is_empty(self)
-    }
-
     #[inline]
     fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         Self::push(self, frame, off)
@@ -570,16 +492,6 @@ impl<const N: usize> StackOps for FrameStack<N> {
     #[inline]
     fn pop(&mut self) -> Option<Frame> {
         Self::pop(self)
-    }
-
-    #[inline]
-    fn peek(&self) -> Option<&Frame> {
-        Self::peek(self)
-    }
-
-    #[inline]
-    fn peek_mut(&mut self) -> Option<&mut Frame> {
-        Self::peek_mut(self)
     }
 }
 
@@ -787,7 +699,6 @@ fn skip_primitive<const CHECKED: bool>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
     cursor: &mut Cursor<'_>,
     limits: Option<&DecodeLimits>,
@@ -795,69 +706,63 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
     base_depth: usize,
     stack: &mut S,
 ) -> Result<(), CborError> {
-    let mut local_depth: usize = 0;
-    let mut started = false;
+    // The innermost open container lives in `cur`; the spill stack is touched
+    // only when opening or closing a nested container, keeping the per-item
+    // loop free of stack peeks.
+    let mut cur: Option<Frame> = None;
+    // Number of open containers, including `cur`.
+    let mut open_depth: usize = 0;
 
     loop {
-        while let Some(frame) = stack.peek() {
-            if !frame.is_done() {
-                break;
+        if let Some(frame) = &mut cur {
+            if frame.is_done() {
+                open_depth -= 1;
+                match stack.pop() {
+                    Some(parent) => {
+                        cur = Some(parent);
+                        continue;
+                    }
+                    None => return Ok(()),
+                }
             }
-            let _ = stack
-                .pop()
-                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, cursor.position()))?;
-            local_depth = local_depth.saturating_sub(1);
-            if stack.is_empty() && started {
-                return Ok(());
-            }
-        }
 
-        if let Some(Frame::Map {
-            expecting_key: true,
-            ..
-        }) = stack.peek()
-        {
-            let frame = stack
-                .peek_mut()
-                .ok_or_else(|| CborError::new(ErrorCode::MalformedCanonical, cursor.position()))?;
-            let Frame::Map {
+            if let Frame::Map {
                 expecting_key,
                 prev_key_range,
                 ..
             } = frame
-            else {
-                return Err(CborError::new(
-                    ErrorCode::MalformedCanonical,
-                    cursor.position(),
-                ));
-            };
-
-            let key_start = cursor.position();
-            let ib = cursor.read_u8()?;
-            let major = ib >> 5;
-            let ai = ib & 0x1f;
-            if major != 3 {
-                return Err(CborError::new(ErrorCode::MapKeyMustBeText, key_start));
-            }
-            if CHECKED {
-                let _ = parse_text_from_header::<CHECKED>(cursor, limits, key_start, ai)?;
-            } else {
-                let len = read_len::<CHECKED>(cursor, ai, key_start)?;
-                if let Some(limits) = limits {
-                    if len > limits.max_text_len {
-                        return Err(CborError::new(ErrorCode::TextLenLimitExceeded, key_start));
+            {
+                if *expecting_key {
+                    let key_start = cursor.position();
+                    let ib = cursor.read_u8()?;
+                    let major = ib >> 5;
+                    let ai = ib & 0x1f;
+                    if major != 3 {
+                        return Err(CborError::new(ErrorCode::MapKeyMustBeText, key_start));
                     }
+                    if CHECKED {
+                        let _ = parse_text_from_header::<CHECKED>(cursor, limits, key_start, ai)?;
+                    } else {
+                        let len = read_len::<CHECKED>(cursor, ai, key_start)?;
+                        if let Some(limits) = limits {
+                            if len > limits.max_text_len {
+                                return Err(CborError::new(
+                                    ErrorCode::TextLenLimitExceeded,
+                                    key_start,
+                                ));
+                            }
+                        }
+                        let _ = cursor.read_exact(len)?;
+                    }
+                    let key_end = cursor.position();
+
+                    if CHECKED {
+                        check_map_key_order(cursor.data(), prev_key_range, key_start, key_end)?;
+                    }
+
+                    *expecting_key = false;
                 }
-                let _ = cursor.read_exact(len)?;
             }
-            let key_end = cursor.position();
-
-            if CHECKED {
-                check_map_key_order(cursor.data(), prev_key_range, key_start, key_end)?;
-            }
-
-            *expecting_key = false;
-            continue;
         }
 
         let off = cursor.position();
@@ -865,20 +770,27 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
         let major = ib >> 5;
         let ai = ib & 0x1f;
 
-        let next_depth = base_depth + local_depth + 1;
+        let next_depth = base_depth + open_depth + 1;
         let new_frame =
             skip_primitive::<CHECKED>(cursor, limits, items_seen, next_depth, off, major, ai)?;
-        started = true;
 
-        if let Some(frame) = stack.peek_mut() {
+        if let Some(frame) = &mut cur {
             consume_value(frame, off)?;
-        } else if new_frame.is_none() {
-            return Ok(());
         }
 
-        if let Some(frame) = new_frame {
-            stack.push(frame, off)?;
-            local_depth = local_depth.saturating_add(1);
+        match new_frame {
+            Some(frame) => {
+                if let Some(parent) = cur.take() {
+                    stack.push(parent, off)?;
+                }
+                cur = Some(frame);
+                open_depth += 1;
+            }
+            None => {
+                if cur.is_none() {
+                    return Ok(());
+                }
+            }
         }
     }
 }

@@ -13,7 +13,7 @@ pub fn canonical_key_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-pub fn sort_map_entries(entries: &mut Vec<(String, BenchValue)>) {
+pub fn sort_map_entries(entries: &mut [(String, BenchValue)]) {
     entries.sort_by(|(ak, _), (bk, _)| canonical_key_cmp(ak, bk));
 }
 

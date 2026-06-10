@@ -6,7 +6,7 @@ use crate::profile::{
     NEGATIVE_ZERO_BITS,
 };
 use crate::wire::{read_len_at, read_uint_arg_at};
-use crate::{CborError, Encoder, ErrorCode};
+use crate::{CborError, EncodeLimits, Encoder, ErrorCode};
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
     match actual {
@@ -293,4 +293,19 @@ fn encoder_array_slot_conservation_for_one_scalar() {
     enc.array(1, |array| array.null()).unwrap();
     let out = enc.finish().unwrap();
     assert!(out.as_bytes() == [0x81, 0xf6]);
+}
+
+#[kani::proof]
+fn encoder_rolls_back_after_text_output_limit() {
+    let limits = EncodeLimits {
+        max_output_bytes: 2,
+        ..EncodeLimits::unbounded()
+    };
+    let mut enc = Encoder::with_limits(limits).unwrap();
+    let err = enc.text("aa").unwrap_err();
+    assert!(err.code == ErrorCode::MessageLenLimitExceeded);
+    assert!(enc.is_empty());
+    enc.null().unwrap();
+    let out = enc.finish().unwrap();
+    assert!(out.as_bytes() == [0xf6]);
 }

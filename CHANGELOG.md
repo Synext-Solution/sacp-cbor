@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.1
+
+- Optimized the shared validate/skip hot loop: the innermost open container is
+  held in a register and the frame stack is touched only at container
+  boundaries, removing per-item stack peeks. Speeds up `validate_canonical`,
+  zero-copy queries, and editing (measured ~25% faster small-message
+  validation, ~17% faster validate+query ingest, up to ~45% faster deep query
+  paths). No API or wire-format changes.
+- Optimized canonical encoding: item headers are built in a fixed buffer and
+  written with a single reservation, and text/bytes payloads share one
+  reservation with their header (~20% faster typical message encoding).
+- Redesigned the benchmark suite around real SACP pipeline scenarios
+  (validate / ingest / patch / encode / decode) on realistic message workloads,
+  with pivot-table reports, competitor ratios, and a baseline regression mode
+  (see `benchmarks/README.md`).
+
 ## 0.16.0
 
 - **Breaking:** defined ABI profile `SACP_CBOR_ABI/1` with structured `TypeRef` schema identity, separate wire/full schema hashes, directional compatibility reports, unknown field and variant preservation, transparent newtypes, ABI facade paths, and golden-vector helpers.

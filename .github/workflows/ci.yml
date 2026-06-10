@@ -70,6 +70,39 @@ jobs:
       - name: Docs
         run: cargo doc --workspace --no-deps --all-features
 
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Fetch datasets
+        run: ./benchmarks/scripts/fetch_datasets.sh
+
+      - name: Clippy (bench harness)
+        working-directory: benchmarks
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Bench smoke run
+        working-directory: benchmarks
+        env:
+          BENCH_FAST: "1"
+        run: cargo bench
+
+      - name: Generate report
+        working-directory: benchmarks
+        run: cargo run -p bench_harness --bin report
+
+      - name: Upload bench report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: benchmarks/reports/latest/
+
   release:
     needs: [test, miri]
     runs-on: ubuntu-latest

@@ -47,6 +47,7 @@ mod impls {
     }
 
     impl<'b, C> minicbor::Decode<'b, C> for BenchValue {
+        #[allow(clippy::only_used_in_recursion)]
         fn decode(d: &mut Decoder<'b>, ctx: &mut C) -> Result<Self, DecodeError> {
             match d.datatype()? {
                 Type::Null => {

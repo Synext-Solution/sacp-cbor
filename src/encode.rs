@@ -90,6 +90,20 @@ impl VecSink {
         Ok(())
     }
 
+    /// Writes `a` followed by `b` with a single reservation, so the buffer is
+    /// untouched if the combined length cannot be accommodated.
+    #[inline]
+    fn write2(&mut self, a: &[u8], b: &[u8]) -> Result<(), CborError> {
+        let total = a
+            .len()
+            .checked_add(b.len())
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.buf.len()))?;
+        self.reserve(total)?;
+        self.buf.extend_from_slice(a);
+        self.buf.extend_from_slice(b);
+        Ok(())
+    }
+
     fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
         if self.buf.len() == self.buf.capacity() || self.buf.len() == self.max_len {
             self.reserve(1)?;
@@ -119,15 +133,18 @@ fn encode_int(sink: &mut VecSink, v: i64) -> Result<(), CborError> {
 }
 
 fn encode_bytes(sink: &mut VecSink, bytes: &[u8]) -> Result<(), CborError> {
-    encode_major_len(sink, 2, bytes.len())?;
-    sink.write(bytes)
+    let len_u64 =
+        u64::try_from(bytes.len()).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
+    let (header, header_len) = major_uint_header(2, len_u64);
+    sink.write2(&header[..header_len], bytes)
 }
 
 fn encode_text(sink: &mut VecSink, s: &str) -> Result<(), CborError> {
     // `str` guarantees valid UTF-8.
     let b = s.as_bytes();
-    encode_major_len(sink, 3, b.len())?;
-    sink.write(b)
+    let len_u64 = u64::try_from(b.len()).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
+    let (header, header_len) = major_uint_header(3, len_u64);
+    sink.write2(&header[..header_len], b)
 }
 
 fn encode_float64(sink: &mut VecSink, bits: F64Bits) -> Result<(), CborError> {
@@ -143,28 +160,43 @@ fn encode_major_len(sink: &mut VecSink, major: u8, len: usize) -> Result<(), Cbo
     encode_major_uint(sink, major, len_u64)
 }
 
-fn encode_major_uint(sink: &mut VecSink, major: u8, value: u64) -> Result<(), CborError> {
+/// Builds the canonical header (initial byte plus minimal uint argument) for
+/// `major`/`value` into a fixed buffer, returning the buffer and its length.
+// `minimal_uint_ai` selects the narrowest width that holds `value`, so the
+// narrowing casts below cannot truncate.
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
     debug_assert!(major <= 7);
     let ai = minimal_uint_ai(value);
     debug_assert!(uint_argument_payload_len(ai).is_some());
-    sink.write_u8((major << 5) | ai)?;
+    let mut buf = [0u8; 9];
+    buf[0] = (major << 5) | ai;
     match ai {
-        0..=23 => Ok(()),
+        0..=23 => (buf, 1),
         24 => {
-            let v = u8::try_from(value).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-            sink.write_u8(v)
+            // `minimal_uint_ai` guarantees the value fits the selected width.
+            buf[1] = value as u8;
+            (buf, 2)
         }
         25 => {
-            let v = u16::try_from(value).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-            sink.write(&v.to_be_bytes())
+            buf[1..3].copy_from_slice(&(value as u16).to_be_bytes());
+            (buf, 3)
         }
         26 => {
-            let v = u32::try_from(value).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-            sink.write(&v.to_be_bytes())
+            buf[1..5].copy_from_slice(&(value as u32).to_be_bytes());
+            (buf, 5)
         }
-        27 => sink.write(&value.to_be_bytes()),
-        _ => unreachable!("minimal_uint_ai never returns reserved additional info"),
+        _ => {
+            buf[1..9].copy_from_slice(&value.to_be_bytes());
+            (buf, 9)
+        }
     }
+}
+
+fn encode_major_uint(sink: &mut VecSink, major: u8, value: u64) -> Result<(), CborError> {
+    let (header, header_len) = major_uint_header(major, value);
+    sink.write(&header[..header_len])
 }
 
 #[derive(Clone, Copy)]

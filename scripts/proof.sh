@@ -34,6 +34,7 @@ harnesses=(
   encoder_rolls_back_after_array_underfill
   encoder_root_slot_accepts_exactly_one_value
   encoder_array_slot_conservation_for_one_scalar
+  encoder_rolls_back_after_text_output_limit
 )
 
 for harness in "${harnesses[@]}"; do
