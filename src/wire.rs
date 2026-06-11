@@ -831,7 +831,6 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn skip_one_value<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
     policy: WalkPolicy<'_>,
