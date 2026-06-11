@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.2
+
+- Re-exported `ArrayDecoder`, `MapDecoder`, and `MapKey` at the crate root:
+  the container guards are part of the streaming decoder's public API and
+  must be nameable for downstream helper functions.
+- Added `ArrayDecoder::position` and `MapDecoder::position`: the current
+  byte offset of the underlying decoder, for error reporting and span
+  capture inside guard traversals.
+
 ## 0.17.1
 
 - Added `Decoder::<true>::new_checked_with`: a checked streaming decoder that

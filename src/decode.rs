@@ -695,6 +695,13 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         self.remaining
     }
 
+    /// Current byte offset of the underlying decoder.
+    #[inline]
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.decoder.position()
+    }
+
     /// Decode the next array element.
     ///
     /// Returns `Ok(None)` when the array is exhausted.
@@ -775,6 +782,13 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     #[must_use]
     pub const fn remaining(&self) -> usize {
         self.remaining
+    }
+
+    /// Current byte offset of the underlying decoder.
+    #[inline]
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.decoder.position()
     }
 
     /// Decode the next map key as text with source offsets.
