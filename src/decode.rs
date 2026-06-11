@@ -14,7 +14,7 @@ use crate::codec::CborDecode;
 use crate::profile::{validate_f64_bits, MAX_SAFE_INTEGER};
 use crate::query::{peek_kind_at, CborKind, CborValueRef};
 use crate::wire::{self, Cursor};
-use crate::{CborError, DecodeLimits, ErrorCode};
+use crate::{CborError, DecodeLimits, ErrorCode, ValidationOptions};
 
 #[cfg(feature = "alloc")]
 use crate::bytes::Bytes;
@@ -41,8 +41,11 @@ impl<K, V> MapEntries<K, V> {
 pub struct Decoder<'de, const CHECKED: bool> {
     cursor: Cursor<'de>,
     limits: DecodeLimits,
+    options: ValidationOptions,
     depth: usize,
     items_seen: usize,
+    /// Values fully consumed at depth 0 — exactly 1 for a witnessable pass.
+    root_values: usize,
     poison: Option<CborError>,
     scratch: wire::SkipScratch,
 }
@@ -70,6 +73,14 @@ pub struct MapDecoder<'a, 'de, const CHECKED: bool> {
     prev_key_range: Option<(usize, usize)>,
 }
 
+/// Raw parts of one consumed integer-kind value (the single counted
+/// funnel behind every integer decode).
+enum IntegerParts<'de> {
+    SafePos(u64),
+    SafeNeg(u64),
+    Big { negative: bool, mag: &'de [u8] },
+}
+
 /// Text key metadata returned by [`MapDecoder::next_key_ref`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapKey<'de> {
@@ -84,11 +95,13 @@ pub struct MapKey<'de> {
 impl<const CHECKED: bool> Drop for ArrayDecoder<'_, '_, CHECKED> {
     fn drop(&mut self) {
         if self.entered {
-            if self.remaining != 0 {
+            self.decoder.exit_container();
+            if self.remaining == 0 {
+                self.decoder.note_value_end();
+            } else {
                 let off = self.decoder.position();
                 self.decoder.poison(ErrorCode::MalformedCanonical, off);
             }
-            self.decoder.exit_container();
         }
     }
 }
@@ -96,11 +109,13 @@ impl<const CHECKED: bool> Drop for ArrayDecoder<'_, '_, CHECKED> {
 impl<const CHECKED: bool> Drop for MapDecoder<'_, '_, CHECKED> {
     fn drop(&mut self) {
         if self.entered {
-            if self.remaining != 0 || self.pending_value {
+            self.decoder.exit_container();
+            if self.remaining == 0 && !self.pending_value {
+                self.decoder.note_value_end();
+            } else {
                 let off = self.decoder.position();
                 self.decoder.poison(ErrorCode::MalformedCanonical, off);
             }
-            self.decoder.exit_container();
         }
     }
 }
@@ -112,7 +127,53 @@ impl<'de> Decoder<'de, true> {
     ///
     /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
     pub const fn new_checked(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
-        Self::new_with(bytes, limits)
+        Self::new_with(bytes, limits, ValidationOptions::new())
+    }
+
+    /// Construct a checked decoder that additionally enforces the given
+    /// restriction modes (e.g. [`ValidationOptions::no_float`]) on every
+    /// consumed value, including skipped subtrees.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
+    pub const fn new_checked_with(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+    ) -> Result<Self, CborError> {
+        Self::new_with(bytes, limits, options)
+    }
+
+    /// Complete a checked pass and return the canonical witness.
+    ///
+    /// Succeeds only when this decoder consumed the input as **exactly one
+    /// canonical item**: no poisoned container guard, no trailing bytes,
+    /// and exactly one value completed at the root. Every consuming method
+    /// of a checked decoder applies the same canonical-grammar checks as
+    /// [`validate_canonical`](crate::validate_canonical) (and the same
+    /// restriction modes as
+    /// [`validate_canonical_with`](crate::validate_canonical_with) when
+    /// constructed via [`new_checked_with`](Self::new_checked_with)), so a
+    /// successful `finish` attests the same property — one validation-grade
+    /// pass, no second traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stored poison, `TrailingBytes` when input remains, or
+    /// `MalformedCanonical` when the pass did not consume exactly one root
+    /// value.
+    pub fn finish(self) -> Result<CanonicalCborRef<'de>, CborError> {
+        self.check_poison()?;
+        let pos = self.cursor.position();
+        let data = self.cursor.data();
+        if pos != data.len() {
+            return Err(CborError::new(ErrorCode::TrailingBytes, pos));
+        }
+        if self.root_values != 1 {
+            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
+        }
+        Ok(CanonicalCborRef::new(data))
     }
 }
 
@@ -128,12 +189,16 @@ impl<'de> Decoder<'de, false> {
         canon: CanonicalCborRef<'de>,
         limits: DecodeLimits,
     ) -> Result<Self, CborError> {
-        Self::new_with(canon.as_bytes(), limits)
+        Self::new_with(canon.as_bytes(), limits, ValidationOptions::new())
     }
 }
 
 impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
-    const fn new_with(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
+    const fn new_with(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+    ) -> Result<Self, CborError> {
         if let Err(err) = limits.validate() {
             return Err(err);
         }
@@ -143,11 +208,67 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         Ok(Self {
             cursor: Cursor::with_pos(bytes, 0),
             limits,
+            options,
             depth: 0,
             items_seen: 0,
+            root_values: 0,
             poison: None,
             scratch: wire::SkipScratch::new(),
         })
+    }
+
+    /// Record the completion of one whole value at the current depth.
+    ///
+    /// Hot-path note: root counting feeds `finish`, which exists only on
+    /// checked decoders — the whole body const-folds away for the trusted
+    /// path. On the checked path it is one register compare; in nested
+    /// positions (the overwhelmingly common case) the branch is never
+    /// taken and predicts perfectly.
+    #[inline]
+    fn note_value_end(&mut self) {
+        if CHECKED && self.depth == 0 {
+            self.root_values += 1;
+        }
+    }
+
+    /// Seal a value-consuming operation: success completes a value,
+    /// failure poisons the decoder.
+    ///
+    /// Errors are sticky by design: a failed consuming operation may have
+    /// advanced the cursor past a partial value, so continuing would
+    /// traverse an incoherent framing of the input. Poisoning makes every
+    /// later operation — `finish` included — return the original error
+    /// instead. Cost on the success path: one branch on `Ok` plus the
+    /// `note_value_end` compare; the poison store is on the cold error arm.
+    #[inline]
+    fn seal_value<T>(&mut self, result: Result<T, CborError>) -> Result<T, CborError> {
+        match result {
+            Ok(value) => {
+                self.note_value_end();
+                Ok(value)
+            }
+            Err(err) => {
+                self.poison_err(err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Poison a non-completing operation's failure (container entry, key
+    /// reads): sticky, but no value completion on success.
+    #[inline]
+    fn seal_step<T>(&mut self, result: Result<T, CborError>) -> Result<T, CborError> {
+        if let Err(err) = &result {
+            self.poison_err(*err);
+        }
+        result
+    }
+
+    #[inline]
+    fn poison_err(&mut self, err: CborError) {
+        if self.poison.is_none() {
+            self.poison = Some(err);
+        }
     }
 
     /// Return the current byte offset in the input.
@@ -248,7 +369,47 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         wire::parse_bignum::<CHECKED>(&mut self.cursor, Some(&self.limits), off, ai)
     }
 
+    /// Consume one integer-kind value (safe int or bignum) and return its
+    /// raw parts plus the header offset. The counted funnel for the
+    /// arbitrary-precision decoders (`BigInt`, `Integer`); the primitive
+    /// paths below stay direct for hot-loop performance.
+    fn parse_integer_parts(&mut self) -> Result<(IntegerParts<'de>, usize), CborError> {
+        let result = self.parse_integer_parts_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_integer_parts_raw(&mut self) -> Result<(IntegerParts<'de>, usize), CborError> {
+        let (major, ai, off) = self.read_header()?;
+        match major {
+            0 => {
+                let v = self.read_uint_arg(ai, off)?;
+                if CHECKED && v > MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok((IntegerParts::SafePos(v), off))
+            }
+            1 => {
+                let n = self.read_uint_arg(ai, off)?;
+                if CHECKED && n >= MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                Ok((IntegerParts::SafeNeg(n), off))
+            }
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                Ok((IntegerParts::Big { negative, mag }, off))
+            }
+            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
+        }
+    }
+
     fn parse_integer_i128(&mut self) -> Result<i128, CborError> {
+        let result = self.parse_integer_i128_raw();
+        self.seal_value(result)
+    }
+
+    #[inline]
+    fn parse_integer_i128_raw(&mut self) -> Result<i128, CborError> {
         let (major, ai, off) = self.read_header()?;
         match major {
             0 => {
@@ -278,6 +439,12 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_integer_u128(&mut self) -> Result<u128, CborError> {
+        let result = self.parse_integer_u128_raw();
+        self.seal_value(result)
+    }
+
+    #[inline]
+    fn parse_integer_u128_raw(&mut self) -> Result<u128, CborError> {
         let (major, ai, off) = self.read_header()?;
         match major {
             0 => {
@@ -300,6 +467,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_float64(&mut self) -> Result<f64, CborError> {
+        let result = self.parse_float64_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_float64_raw(&mut self) -> Result<f64, CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 7 {
             return Err(CborError::new(ErrorCode::ExpectedFloat, off));
@@ -321,6 +493,9 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
                 _ => Err(CborError::new(ErrorCode::ExpectedFloat, off)),
             };
         }
+        if CHECKED && self.options.forbid_float {
+            return Err(CborError::new(ErrorCode::FloatForbidden, off));
+        }
         let bits = self.cursor.read_be_u64()?;
         if CHECKED {
             validate_f64_bits(bits).map_err(|code| CborError::new(code, off))?;
@@ -329,6 +504,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_bool(&mut self) -> Result<bool, CborError> {
+        let result = self.parse_bool_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_bool_raw(&mut self) -> Result<bool, CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 7 {
             return Err(CborError::new(ErrorCode::ExpectedBool, off));
@@ -342,6 +522,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_null(&mut self) -> Result<(), CborError> {
+        let result = self.parse_null_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_null_raw(&mut self) -> Result<(), CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 7 {
             return Err(CborError::new(ErrorCode::ExpectedNull, off));
@@ -377,6 +562,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_bytes(&mut self) -> Result<&'de [u8], CborError> {
+        let result = self.parse_bytes_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_bytes_raw(&mut self) -> Result<&'de [u8], CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 2 {
             return Err(CborError::new(ErrorCode::ExpectedBytes, off));
@@ -385,6 +575,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     fn parse_text(&mut self) -> Result<&'de str, CborError> {
+        let result = self.parse_text_raw();
+        self.seal_value(result)
+    }
+
+    fn parse_text_raw(&mut self) -> Result<&'de str, CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 3 {
             return Err(CborError::new(ErrorCode::ExpectedText, off));
@@ -398,6 +593,20 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns `ExpectedArray` if the next value is not an array, or a limit error.
     pub fn array(&mut self) -> Result<ArrayDecoder<'_, 'de, CHECKED>, CborError> {
+        let entry = self.array_entry();
+        let (len, entered) = self.seal_step(entry)?;
+        if !entered {
+            // An empty array is already a complete value.
+            self.note_value_end();
+        }
+        Ok(ArrayDecoder {
+            decoder: self,
+            remaining: len,
+            entered,
+        })
+    }
+
+    fn array_entry(&mut self) -> Result<(usize, bool), CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 4 {
             return Err(CborError::new(ErrorCode::ExpectedArray, off));
@@ -408,11 +617,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         }
         self.bump_items(len, off)?;
         let entered = self.enter_container(len, off)?;
-        Ok(ArrayDecoder {
-            decoder: self,
-            remaining: len,
-            entered,
-        })
+        Ok((len, entered))
     }
 
     /// Decode a map header and return a guard for its entries.
@@ -421,6 +626,22 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns `ExpectedMap` if the next value is not a map, or a limit error.
     pub fn map(&mut self) -> Result<MapDecoder<'_, 'de, CHECKED>, CborError> {
+        let entry = self.map_entry();
+        let (len, entered) = self.seal_step(entry)?;
+        if !entered {
+            // An empty map is already a complete value.
+            self.note_value_end();
+        }
+        Ok(MapDecoder {
+            decoder: self,
+            remaining: len,
+            entered,
+            pending_value: false,
+            prev_key_range: None,
+        })
+    }
+
+    fn map_entry(&mut self) -> Result<(usize, bool), CborError> {
         let (major, ai, off) = self.read_header()?;
         if major != 5 {
             return Err(CborError::new(ErrorCode::ExpectedMap, off));
@@ -434,13 +655,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
         self.bump_items(items, off)?;
         let entered = self.enter_container(len, off)?;
-        Ok(MapDecoder {
-            decoder: self,
-            remaining: len,
-            entered,
-            pending_value: false,
-            prev_key_range: None,
-        })
+        Ok((len, entered))
     }
 
     /// Skip exactly one CBOR value while enforcing decode limits.
@@ -450,13 +665,14 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// Returns a decode error if the value is malformed or violates limits.
     pub fn skip_value(&mut self) -> Result<(), CborError> {
         self.check_poison()?;
-        wire::skip_one_value_with_scratch::<CHECKED>(
+        let result = wire::skip_one_value_with_scratch::<CHECKED>(
             &mut self.cursor,
-            wire::WalkPolicy::new(Some(&self.limits), crate::ValidationOptions::new()),
+            wire::WalkPolicy::new(Some(&self.limits), self.options),
             &mut self.items_seen,
             self.depth,
             &mut self.scratch,
-        )
+        );
+        self.seal_value(result)
     }
 
     /// Peek at the kind of the next CBOR value without consuming it.
@@ -504,12 +720,39 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     where
         F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, CborError>,
     {
+        self.decode_next_with(f)
+    }
+
+    /// Decode the next array element using a custom decoder with a
+    /// caller-defined error type.
+    ///
+    /// A caller error aborts the element mid-consumption, so it poisons
+    /// the decoder like any decode failure: the pass can no longer reach
+    /// [`Decoder::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the closure's error, or a decode error if the array is
+    /// malformed.
+    pub fn decode_next_with<F, T, E>(&mut self, f: F) -> Result<Option<T>, E>
+    where
+        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, E>,
+        E: From<CborError>,
+    {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let value = f(self.decoder)?;
-        self.remaining -= 1;
-        Ok(Some(value))
+        match f(self.decoder) {
+            Ok(value) => {
+                self.remaining -= 1;
+                Ok(Some(value))
+            }
+            Err(err) => {
+                let off = self.decoder.position();
+                self.decoder.poison(ErrorCode::MalformedCanonical, off);
+                Err(err)
+            }
+        }
     }
 
     /// Skip all remaining elements in the array.
@@ -542,6 +785,8 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if decoding fails or the map is malformed.
     pub fn next_key_ref(&mut self) -> Result<Option<MapKey<'de>>, CborError> {
+        // Pending-state misuse is detected before any byte is consumed —
+        // recoverable, never sticky.
         if self.pending_value {
             return Err(CborError::new(
                 ErrorCode::MalformedCanonical,
@@ -551,6 +796,14 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
         if self.remaining == 0 {
             return Ok(None);
         }
+        let result = self.next_key_ref_consume();
+        if let Err(err) = &result {
+            self.decoder.poison_err(*err);
+        }
+        result
+    }
+
+    fn next_key_ref_consume(&mut self) -> Result<Option<MapKey<'de>>, CborError> {
         let key_start = self.decoder.position();
         let (major, ai, off) = self.decoder.read_header()?;
         if major != 3 {
@@ -592,16 +845,45 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     where
         F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, CborError>,
     {
+        self.decode_value_with(f)
+    }
+
+    /// Decode the value corresponding to the last returned key using a
+    /// custom decoder with a caller-defined error type.
+    ///
+    /// A caller error aborts the value mid-consumption, so it poisons the
+    /// decoder like any decode failure: the pass can no longer reach
+    /// [`Decoder::finish`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the closure's error, or a decode error if the map is
+    /// malformed.
+    pub fn decode_value_with<F, T, E>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, E>,
+        E: From<CborError>,
+    {
         if !self.pending_value {
-            return Err(CborError::new(
-                ErrorCode::MalformedCanonical,
-                self.decoder.position(),
-            ));
+            // Detected before any byte is consumed — recoverable.
+            let err = CborError::new(ErrorCode::MalformedCanonical, self.decoder.position());
+            return Err(E::from(err));
         }
-        let value = f(self.decoder)?;
-        self.pending_value = false;
-        self.remaining -= 1;
-        Ok(value)
+        match f(self.decoder) {
+            Ok(value) => {
+                self.pending_value = false;
+                self.remaining -= 1;
+                Ok(value)
+            }
+            Err(err) => {
+                // The value may be partially consumed; the original decode
+                // error (if any) was already stored by the failing funnel
+                // and poison_err keeps the first error.
+                let off = self.decoder.position();
+                self.decoder.poison(ErrorCode::MalformedCanonical, off);
+                Err(err)
+            }
+        }
     }
 
     /// Skip the value corresponding to the last returned key.
@@ -611,6 +893,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     /// Returns an error if no key is pending or if skipping fails.
     pub fn skip_value(&mut self) -> Result<(), CborError> {
         if !self.pending_value {
+            // Detected before any byte is consumed — recoverable.
             return Err(CborError::new(
                 ErrorCode::MalformedCanonical,
                 self.decoder.position(),
@@ -793,45 +1076,38 @@ impl<'de> CborDecode<'de> for u128 {
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for BigInt {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
-        let (major, ai, off) = decoder.read_header()?;
-        if major != 6 {
-            return Err(CborError::new(ErrorCode::ExpectedInteger, off));
+        let (parts, off) = decoder.parse_integer_parts()?;
+        match parts {
+            IntegerParts::Big { negative, mag } => {
+                let magnitude = alloc_util::try_vec_from_slice(mag, off)?;
+                Self::new(negative, magnitude).map_err(|err| CborError::new(err.code, off))
+            }
+            IntegerParts::SafePos(_) | IntegerParts::SafeNeg(_) => {
+                Err(CborError::new(ErrorCode::ExpectedInteger, off))
+            }
         }
-        let (negative, mag) = decoder.parse_bignum(off, ai)?;
-        let magnitude = alloc_util::try_vec_from_slice(mag, off)?;
-        Self::new(negative, magnitude).map_err(|err| CborError::new(err.code, off))
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for Integer {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
-        let (major, ai, off) = decoder.read_header()?;
-        match major {
-            0 => {
-                let v = decoder.read_uint_arg(ai, off)?;
-                if CHECKED && v > MAX_SAFE_INTEGER {
-                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
-                }
+        let (parts, off) = decoder.parse_integer_parts()?;
+        match parts {
+            IntegerParts::SafePos(v) => {
                 let v_i = i64::try_from(v)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Self::safe(v_i).map_err(|err| CborError::new(err.code, off))
             }
-            1 => {
-                let n = decoder.read_uint_arg(ai, off)?;
-                if CHECKED && n >= MAX_SAFE_INTEGER {
-                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
-                }
+            IntegerParts::SafeNeg(n) => {
                 let n_i = i64::try_from(n)
                     .map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))?;
                 Self::safe(-1 - n_i).map_err(|err| CborError::new(err.code, off))
             }
-            6 => {
-                let (negative, mag) = decoder.parse_bignum(off, ai)?;
+            IntegerParts::Big { negative, mag } => {
                 let magnitude = alloc_util::try_vec_from_slice(mag, off)?;
                 Self::big(negative, magnitude).map_err(|err| CborError::new(err.code, off))
             }
-            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
         }
     }
 }
