@@ -617,7 +617,7 @@ impl Encoder {
         let mut items_seen = self.items_seen;
         wire::skip_one_value::<false>(
             &mut cursor,
-            Some(&limits),
+            wire::WalkPolicy::new(Some(&limits), crate::ValidationOptions::new()),
             &mut items_seen,
             self.stack.len(),
         )?;

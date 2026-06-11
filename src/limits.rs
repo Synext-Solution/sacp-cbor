@@ -118,6 +118,45 @@ impl Default for EncodeLimits {
     }
 }
 
+/// Grammar-restriction options for canonical validation.
+///
+/// [`DecodeLimits`] bounds resources; `ValidationOptions` selects optional *restriction modes* of
+/// the SACP-CBOR/1 grammar. The default options accept the full SACP-CBOR/1 grammar. Restriction
+/// modes only ever reject more inputs: every item accepted under a restriction mode is also a
+/// valid SACP-CBOR/1 item.
+///
+/// Modes are a property of a validation call, not of the validated bytes: the canonical witness
+/// types attest SACP-CBOR/1 canonicality only. Trusted re-traversal of already-validated bytes
+/// (queries, editing, trusted decode) ignores restriction modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ValidationOptions {
+    /// Reject float64 values anywhere in the item.
+    ///
+    /// For deployments whose durable data model excludes floating point, this enforces the
+    /// no-float restriction at the validation boundary instead of by schema convention. Rejected
+    /// values produce [`ErrorCode::FloatForbidden`](crate::ErrorCode::FloatForbidden) at the
+    /// float header offset.
+    pub forbid_float: bool,
+}
+
+impl ValidationOptions {
+    /// Options accepting the full SACP-CBOR/1 grammar.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            forbid_float: false,
+        }
+    }
+
+    /// Return these options with float64 values forbidden.
+    #[must_use]
+    pub const fn no_float(mut self) -> Self {
+        self.forbid_float = true;
+        self
+    }
+}
+
 impl DecodeLimits {
     /// Validate this limit set for the active feature configuration.
     ///

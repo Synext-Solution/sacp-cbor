@@ -52,6 +52,32 @@ safe integer range.
 Floats are encoded only as CBOR float64. Negative zero is rejected. NaN is accepted only as the
 canonical bit pattern `0x7ff8_0000_0000_0000`. Positive and negative infinity are allowed.
 
+## Text Identity
+
+Text strings are validated as UTF-8 and compared as encoded bytes. The profile applies **no
+Unicode normalization**: two text strings are equal exactly when their UTF-8 bytes are equal.
+Visually identical strings with different code point sequences are different values, different map
+keys, and produce different canonical bytes and hashes. Producers that require a normal form (such
+as NFC) must normalize before encoding; the profile neither performs nor verifies normalization,
+so any normal-form requirement is a schema-layer contract, not a wire rule.
+
+## Validation Modes
+
+Validation accepts an optional set of restriction modes (`ValidationOptions`). Restriction modes
+only reject more inputs: every item accepted under a restriction mode is also a valid SACP-CBOR/1
+item, so restricted and unrestricted consumers interoperate in one direction by construction.
+Modes do not define new wire profiles; the wire grammar above is the only grammar.
+
+The **no-float mode** (`ValidationOptions::no_float`) rejects float64 values (major type 7,
+additional info 27) anywhere in the item with `FloatForbidden` at the float header offset. It
+exists for deployments whose durable data model excludes floating point and which want that rule
+enforced at the validation boundary rather than by schema convention.
+
+Modes are a property of a validation call, not of the validated bytes: the canonical witness types
+attest SACP-CBOR/1 canonicality only. Trusted re-traversal of already-validated bytes (queries,
+editing, trusted decode) ignores restriction modes; callers that require a restriction across an
+editing or re-encoding round trip re-validate the output under the same options.
+
 ## Resource Limits
 
 `DecodeLimits` applies to input validation and decoding:
@@ -138,8 +164,9 @@ constructors and unchecked UTF-8 conversion for already canonical data.
 
 ## Verification Status
 
-The crate verifies this profile with validation vectors, derive compile-fail tests, feature-matrix
-builds, benchmark/fuzz target compilation, and a Miri smoke test for the unsafe feature.
+The crate verifies this profile with validation vectors (including no-float restriction-mode
+vectors), derive compile-fail tests, feature-matrix builds, benchmark/fuzz target compilation, and
+a Miri smoke test for the unsafe feature.
 
 Bounded Kani proof harnesses, compiled only under `cfg(kani)`, cover these core obligations:
 

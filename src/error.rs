@@ -71,6 +71,8 @@ pub enum ErrorCode {
     NegativeZeroForbidden,
     /// Float64 NaN encoding is not canonical.
     NonCanonicalNaN,
+    /// Float64 rejected by validation options (no-float mode).
+    FloatForbidden,
 
     /// Serde conversion failed.
     SerdeError,
@@ -173,6 +175,7 @@ impl fmt::Display for CborError {
 
             ErrorCode::NegativeZeroForbidden => "negative zero forbidden",
             ErrorCode::NonCanonicalNaN => "non-canonical NaN encoding",
+            ErrorCode::FloatForbidden => "float64 forbidden by validation options",
             ErrorCode::SerdeError => "serde conversion failed",
 
             ErrorCode::ExpectedMap => "expected CBOR map",

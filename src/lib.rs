@@ -58,6 +58,21 @@
 //! `max_total_items` because both keys and values are scanned. [`DecodeLimits::validate`] rejects
 //! configurations this build cannot enforce, such as no-alloc depth values above the fixed stack.
 //!
+//! **Validation modes**
+//!
+//! [`ValidationOptions`] selects optional restriction modes of the grammar. Restriction modes only
+//! reject more inputs: every item accepted under a restriction mode is also a valid SACP-CBOR/1
+//! item. The **no-float mode** ([`ValidationOptions::no_float`]) rejects float64 values anywhere
+//! in the item with [`ErrorCode::FloatForbidden`], for deployments whose durable data model
+//! excludes floating point. Use [`validate_canonical_with`] to validate under explicit options;
+//! [`validate_canonical`] accepts the full grammar.
+//!
+//! **Text identity**
+//!
+//! Text strings are validated as UTF-8 and compared as encoded bytes. The profile applies no
+//! Unicode normalization: two text strings are equal exactly when their UTF-8 bytes are equal.
+//! Producers that require a normal form (such as NFC) must normalize before encoding.
+//!
 //! **Allocation policy**
 //!
 //! Validation and borrowed query traversal are allocation-free. Owned APIs use fallible reservation
@@ -129,8 +144,8 @@ pub use crate::canonical::CanonicalCborRef;
 pub use crate::codec::CborDecode;
 pub use crate::decode::{decode, decode_canonical, Decoder};
 pub use crate::error::{CborError, ErrorCode};
-pub use crate::limits::{DecodeLimits, EncodeLimits};
-pub use crate::parse::validate_canonical;
+pub use crate::limits::{DecodeLimits, EncodeLimits, ValidationOptions};
+pub use crate::parse::{validate_canonical, validate_canonical_with};
 
 #[cfg(feature = "alloc")]
 pub mod encode;

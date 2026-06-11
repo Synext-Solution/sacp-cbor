@@ -1,5 +1,5 @@
 #[cfg(feature = "alloc")]
-use crate::{CborError, DecodeLimits};
+use crate::{CborError, DecodeLimits, ValidationOptions};
 
 /// A validated canonical SACP-CBOR/1 data item borrowed from an input buffer.
 ///
@@ -135,6 +135,22 @@ impl CanonicalCbor {
         canon.to_owned()
     }
 
+    /// Validate and copy `bytes` into an owned canonical representation under explicit
+    /// [`ValidationOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item or if a restriction
+    /// mode rejects the item.
+    pub fn from_slice_with(
+        bytes: &[u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+    ) -> Result<Self, CborError> {
+        let canon = crate::validate_canonical_with(bytes, limits, options)?;
+        canon.to_owned()
+    }
+
     /// Validate and wrap an owned canonical CBOR buffer without copying.
     ///
     /// # Errors
@@ -142,6 +158,22 @@ impl CanonicalCbor {
     /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item.
     pub fn from_vec(bytes: Vec<u8>, limits: DecodeLimits) -> Result<Self, CborError> {
         crate::validate_canonical(&bytes, limits)?;
+        Ok(Self { bytes })
+    }
+
+    /// Validate and wrap an owned canonical CBOR buffer without copying, under explicit
+    /// [`ValidationOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bytes` are not a canonical SACP-CBOR/1 data item or if a restriction
+    /// mode rejects the item.
+    pub fn from_vec_with(
+        bytes: Vec<u8>,
+        limits: DecodeLimits,
+        options: ValidationOptions,
+    ) -> Result<Self, CborError> {
+        crate::validate_canonical_with(&bytes, limits, options)?;
         Ok(Self { bytes })
     }
 

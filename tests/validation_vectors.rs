@@ -1,5 +1,19 @@
 use sacp_cbor::profile::MAX_SAFE_INTEGER;
-use sacp_cbor::{validate_canonical, DecodeLimits, Decoder, ErrorCode};
+use sacp_cbor::{
+    validate_canonical, validate_canonical_with, CanonicalCbor, DecodeLimits, Decoder, ErrorCode,
+    ValidationOptions,
+};
+
+fn assert_invalid_with(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    options: ValidationOptions,
+    code: ErrorCode,
+) -> usize {
+    let err = validate_canonical_with(bytes, limits, options).unwrap_err();
+    assert_eq!(err.code, code);
+    err.offset
+}
 
 fn assert_invalid(bytes: &[u8], limits: DecodeLimits, code: ErrorCode) -> usize {
     let err = validate_canonical(bytes, limits).unwrap_err();
@@ -612,4 +626,110 @@ fn enforces_declared_length_limits_at_encoding_boundaries() {
     limits.max_bytes_len = 255;
     validate_canonical(&bytes_255, limits).unwrap();
     assert_invalid(&bytes_256, limits, ErrorCode::BytesLenLimitExceeded);
+}
+
+fn f64_encoded(bits: u64) -> Vec<u8> {
+    let mut out = vec![0xfb];
+    out.extend_from_slice(&bits.to_be_bytes());
+    out
+}
+
+#[test]
+fn no_float_mode_rejects_root_float() {
+    let bytes = f64_encoded(1.5f64.to_bits());
+    let limits = DecodeLimits::for_bytes(bytes.len());
+
+    validate_canonical(&bytes, limits).unwrap();
+    validate_canonical_with(&bytes, limits, ValidationOptions::new()).unwrap();
+
+    let offset = assert_invalid_with(
+        &bytes,
+        limits,
+        ValidationOptions::new().no_float(),
+        ErrorCode::FloatForbidden,
+    );
+    assert_eq!(offset, 0);
+}
+
+#[test]
+fn no_float_mode_rejects_nested_floats_at_header_offset() {
+    // [1, 1.5]
+    let mut in_array = vec![0x82, 0x01];
+    in_array.extend(f64_encoded(1.5f64.to_bits()));
+    let limits = DecodeLimits::for_bytes(in_array.len());
+    validate_canonical(&in_array, limits).unwrap();
+    let offset = assert_invalid_with(
+        &in_array,
+        limits,
+        ValidationOptions::new().no_float(),
+        ErrorCode::FloatForbidden,
+    );
+    assert_eq!(offset, 2);
+
+    // {"a": 1.5}
+    let mut in_map = vec![0xa1, 0x61, b'a'];
+    in_map.extend(f64_encoded(1.5f64.to_bits()));
+    let limits = DecodeLimits::for_bytes(in_map.len());
+    validate_canonical(&in_map, limits).unwrap();
+    let offset = assert_invalid_with(
+        &in_map,
+        limits,
+        ValidationOptions::new().no_float(),
+        ErrorCode::FloatForbidden,
+    );
+    assert_eq!(offset, 3);
+}
+
+#[test]
+fn no_float_mode_rejects_infinity_and_precedes_float_bit_checks() {
+    let no_float = ValidationOptions::new().no_float();
+
+    // Infinity is valid SACP-CBOR/1 but rejected in no-float mode.
+    let inf = f64_encoded(f64::INFINITY.to_bits());
+    let limits = DecodeLimits::for_bytes(inf.len());
+    validate_canonical(&inf, limits).unwrap();
+    assert_invalid_with(&inf, limits, no_float, ErrorCode::FloatForbidden);
+
+    // A non-canonical NaN fails the float bit checks under default options, but no-float mode
+    // rejects at the header before reading the payload bits.
+    let bad_nan = f64_encoded(0x7ff8_0000_0000_0001);
+    let limits = DecodeLimits::for_bytes(bad_nan.len());
+    assert_invalid(&bad_nan, limits, ErrorCode::NonCanonicalNaN);
+    assert_invalid_with(&bad_nan, limits, no_float, ErrorCode::FloatForbidden);
+}
+
+#[test]
+fn no_float_mode_accepts_float_free_items() {
+    let no_float = ValidationOptions::new().no_float();
+
+    // {"a":[1,"x",h'00',true,null],"b":-5}
+    let bytes = [
+        0xa2, 0x61, b'a', 0x85, 0x01, 0x61, b'x', 0x41, 0x00, 0xf5, 0xf6, 0x61, b'b', 0x24,
+    ];
+    let limits = DecodeLimits::for_bytes(bytes.len());
+    let canon = validate_canonical_with(&bytes, limits, no_float).unwrap();
+    assert_eq!(canon.as_bytes(), bytes);
+
+    // Bignums are integers, not floats.
+    let bignum = [0xc2, 0x47, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let limits = DecodeLimits::for_bytes(bignum.len());
+    validate_canonical_with(&bignum, limits, no_float).unwrap();
+}
+
+#[test]
+fn owned_constructors_honor_validation_options() {
+    let no_float = ValidationOptions::new().no_float();
+    let float_doc = f64_encoded(2.5f64.to_bits());
+    let int_doc = [0x01];
+
+    let limits = DecodeLimits::for_bytes(float_doc.len());
+    let err = CanonicalCbor::from_slice_with(&float_doc, limits, no_float).unwrap_err();
+    assert_eq!(err.code, ErrorCode::FloatForbidden);
+    let err = CanonicalCbor::from_vec_with(float_doc.clone(), limits, no_float).unwrap_err();
+    assert_eq!(err.code, ErrorCode::FloatForbidden);
+    CanonicalCbor::from_slice_with(&float_doc, limits, ValidationOptions::new()).unwrap();
+
+    let limits = DecodeLimits::for_bytes(int_doc.len());
+    CanonicalCbor::from_slice_with(&int_doc, limits, no_float).unwrap();
+    CanonicalCbor::from_vec_with(int_doc.to_vec(), limits, no_float).unwrap();
 }

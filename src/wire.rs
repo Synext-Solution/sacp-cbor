@@ -10,7 +10,32 @@ use crate::profile::{
     MAX_SAFE_INTEGER,
 };
 use crate::utf8;
-use crate::{CborError, DecodeLimits, ErrorCode};
+use crate::{CborError, DecodeLimits, ErrorCode, ValidationOptions};
+
+/// Resource limits plus grammar-restriction options for one walk of a value.
+///
+/// Limits bound resources; options select restriction modes (checked walks only).
+#[derive(Clone, Copy)]
+pub struct WalkPolicy<'a> {
+    pub limits: Option<&'a DecodeLimits>,
+    pub options: ValidationOptions,
+}
+
+impl<'a> WalkPolicy<'a> {
+    #[inline]
+    pub const fn new(limits: Option<&'a DecodeLimits>, options: ValidationOptions) -> Self {
+        Self { limits, options }
+    }
+
+    /// Policy for trusted re-traversal: no limits, no restriction modes.
+    #[inline]
+    pub const fn trusted() -> Self {
+        Self {
+            limits: None,
+            options: ValidationOptions::new(),
+        }
+    }
+}
 
 pub struct Cursor<'a> {
     data: &'a [u8],
@@ -249,7 +274,13 @@ pub fn value_end_trusted_with_scratch(
 ) -> Result<usize, CborError> {
     let mut cursor = Cursor::with_pos(data, start);
     let mut items_seen = 0;
-    skip_one_value_with_scratch::<false>(&mut cursor, None, &mut items_seen, 0, scratch)?;
+    skip_one_value_with_scratch::<false>(
+        &mut cursor,
+        WalkPolicy::trusted(),
+        &mut items_seen,
+        0,
+        scratch,
+    )?;
     Ok(cursor.position())
 }
 
@@ -587,13 +618,14 @@ fn consume_value(frame: &mut Frame, off: usize) -> Result<(), CborError> {
 #[inline]
 fn skip_primitive<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
-    limits: Option<&DecodeLimits>,
+    policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     next_depth: usize,
     off: usize,
     major: u8,
     ai: u8,
 ) -> Result<Option<Frame>, CborError> {
+    let limits = policy.limits;
     match major {
         0 => {
             let v = read_uint_arg::<CHECKED>(cursor, ai, off)?;
@@ -678,6 +710,9 @@ fn skip_primitive<const CHECKED: bool>(
             match ai {
                 20..=22 => {}
                 27 => {
+                    if CHECKED && policy.options.forbid_float {
+                        return Err(CborError::new(ErrorCode::FloatForbidden, off));
+                    }
                     let bits = cursor.read_be_u64()?;
                     if CHECKED {
                         validate_f64_bits(bits).map_err(|code| CborError::new(code, off))?;
@@ -701,11 +736,12 @@ fn skip_primitive<const CHECKED: bool>(
 
 fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
     cursor: &mut Cursor<'_>,
-    limits: Option<&DecodeLimits>,
+    policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     base_depth: usize,
     stack: &mut S,
 ) -> Result<(), CborError> {
+    let limits = policy.limits;
     // The innermost open container lives in `cur`; the spill stack is touched
     // only when opening or closing a nested container, keeping the per-item
     // loop free of stack peeks.
@@ -772,7 +808,7 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
 
         let next_depth = base_depth + open_depth + 1;
         let new_frame =
-            skip_primitive::<CHECKED>(cursor, limits, items_seen, next_depth, off, major, ai)?;
+            skip_primitive::<CHECKED>(cursor, policy, items_seen, next_depth, off, major, ai)?;
 
         if let Some(frame) = &mut cur {
             consume_value(frame, off)?;
@@ -798,7 +834,7 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
 #[allow(clippy::too_many_lines)]
 pub fn skip_one_value<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
-    limits: Option<&DecodeLimits>,
+    policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     base_depth: usize,
 ) -> Result<(), CborError> {
@@ -806,16 +842,16 @@ pub fn skip_one_value<const CHECKED: bool>(
     let mut stack = FrameStack::new();
     #[cfg(not(feature = "alloc"))]
     let mut stack = FrameStack::<INLINE_STACK>::new();
-    skip_one_value_inner::<CHECKED, _>(cursor, limits, items_seen, base_depth, &mut stack)
+    skip_one_value_inner::<CHECKED, _>(cursor, policy, items_seen, base_depth, &mut stack)
 }
 
 pub fn skip_one_value_with_scratch<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
-    limits: Option<&DecodeLimits>,
+    policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     base_depth: usize,
     scratch: &mut SkipScratch,
 ) -> Result<(), CborError> {
     scratch.stack.clear();
-    skip_one_value_inner::<CHECKED, _>(cursor, limits, items_seen, base_depth, &mut scratch.stack)
+    skip_one_value_inner::<CHECKED, _>(cursor, policy, items_seen, base_depth, &mut scratch.stack)
 }

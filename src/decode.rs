@@ -452,7 +452,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         self.check_poison()?;
         wire::skip_one_value_with_scratch::<CHECKED>(
             &mut self.cursor,
-            Some(&self.limits),
+            wire::WalkPolicy::new(Some(&self.limits), crate::ValidationOptions::new()),
             &mut self.items_seen,
             self.depth,
             &mut self.scratch,

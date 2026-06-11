@@ -41,6 +41,14 @@ This crate enforces a strict “canonical profile”:
   - Only `false`, `true`, and `null` are supported (plus float64, encoded under major type 7).
   - Other simple values are rejected.
 
+Two profile semantics are fixed and documented in [`SPEC.md`](SPEC.md):
+
+- **Text identity:** no Unicode normalization; text equality is UTF-8 byte equality. Producers
+  that require a normal form (such as NFC) must normalize before encoding.
+- **Validation modes:** `ValidationOptions` selects optional restriction modes that only reject
+  more inputs. The **no-float mode** (`ValidationOptions::new().no_float()`) rejects float64
+  anywhere in the item — for deployments whose durable data model excludes floating point.
+
 If you need tags beyond bignums, indefinite lengths, non-text map keys, half/float32 encodings, etc., this crate is the wrong tool.
 
 The maintained wire/profile contract lives in [`SPEC.md`](SPEC.md).
@@ -164,6 +172,17 @@ fn main() -> Result<(), sacp_cbor::CborError> {
   println!("validated {} bytes", canon.as_bytes().len());
   Ok(())
 }
+```
+
+For float-free deployments, validate under the no-float restriction mode:
+
+```rust
+use sacp_cbor::{validate_canonical_with, DecodeLimits, ValidationOptions};
+
+let input: &[u8] = /* ... */;
+let limits = DecodeLimits::for_bytes(input.len());
+let canon = validate_canonical_with(input, limits, ValidationOptions::new().no_float())?;
+// Any float64 in the item is rejected with ErrorCode::FloatForbidden.
 ```
 
 **Complexity**
@@ -867,7 +886,7 @@ pub struct CborError {
   - `IntegerOutsideSafeRange`, `ForbiddenOrMalformedTag`, `BignumNotCanonical`, `BignumMustBeOutsideSafeRange`
 - Floats:
 
-  - `NegativeZeroForbidden`, `NonCanonicalNaN`
+  - `NegativeZeroForbidden`, `NonCanonicalNaN`, `FloatForbidden` (no-float mode)
 - Type expectation errors (query/edit):
 
   - `ExpectedMap`, `ExpectedArray`, `ExpectedInteger`, `ExpectedText`, `ExpectedBytes`,
@@ -894,6 +913,19 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
   - Validates canonical + single item and returns a typed wrapper.
   - Time: `O(n)`, Space: `O(d)`
+
+- `validate_canonical_with(bytes, limits, options) -> Result<CanonicalCborRef, CborError>`
+
+  - Same, under explicit `ValidationOptions` restriction modes.
+  - No-float mode adds no cost to float-free inputs (the check sits on the float header path).
+
+- `ValidationOptions`
+
+  - Grammar-restriction modes; `ValidationOptions::new().no_float()` rejects float64 anywhere.
+  - Restriction modes only reject more inputs; they never change the wire grammar.
+  - Modes are a property of the validation call, not of the bytes: trusted re-traversal
+    (queries, editing, trusted decode) ignores them, so re-validate edited output under the
+    same options if you need the restriction to hold across a round trip.
 
 - `DecodeLimits::for_bytes(max_message_bytes) -> DecodeLimits`
 
@@ -933,6 +965,8 @@ Common trait coverage for derive-driven models includes:
 - `CanonicalCbor` (`alloc`, owned)
 
   - `from_slice(bytes, limits)` — validates then copies (`O(n)`)
+  - `from_slice_with(bytes, limits, options)` / `from_vec_with(bytes, limits, options)` —
+    same, under explicit `ValidationOptions`
   - `as_bytes/into_bytes` — `O(1)`
   - query/edit methods same as `CanonicalCborRef`
 
