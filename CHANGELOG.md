@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.17.1
+
+- Added `Decoder::<true>::new_checked_with`: a checked streaming decoder that
+  enforces `ValidationOptions` restriction modes (e.g. no-float) on every
+  consumed value, skipped subtrees included.
+- Added `Decoder::<true>::finish`, completing a checked pass into a
+  `CanonicalCborRef` witness. A full typed traversal now validates in a
+  single pass — no separate `validate_canonical` traversal needed. `finish`
+  succeeds only when the pass consumed the input as exactly one canonical
+  item (no poison, no trailing bytes, exactly one root value); acceptance
+  equivalence with `validate_canonical[_with]` is property-tested
+  (`tests/decode_witness.rs`).
+- Added `MapDecoder::decode_value_with` and `ArrayDecoder::decode_next_with`:
+  closure decoding with caller-defined error types (`E: From<CborError>`);
+  caller errors poison the pass.
+- Decode errors that consume input are now sticky: the decoder is poisoned
+  and every later operation (including `finish`) fails with the first
+  error. Non-consuming state-machine misuse (e.g. `next_value` before
+  `next_key_ref`) remains recoverable. Stickiness is what makes the
+  `finish` witness sound against callers that swallow errors.
+- Fixed `Decoder::skip_value` ignoring restriction modes: skipped subtrees
+  are now validated under the decoder's `ValidationOptions` (reachable only
+  through the new `new_checked_with` constructor, so no released behavior
+  changes).
+- Root-value accounting and the options field are const-folded away on the
+  trusted path; the decode hot loops are A/B-verified neutral within noise.
+- README install snippets now track the current release line, enforced by a
+  release-job check.
+
 ## 0.17.0
 
 - Added an opt-in **no-float validation mode**: `ValidationOptions` (builder
