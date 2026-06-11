@@ -76,19 +76,19 @@ This crate supports `no_std` when default features are disabled. Default feature
 **Default Rust (std + alloc):**
 ```toml
 [dependencies]
-sacp-cbor = "0.16"
+sacp-cbor = "0.17"
 ```
 
 **`no_std` + `alloc`:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.16", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.17", default-features = false, features = ["alloc"] }
 ```
 
 **`std` + serde + sha2:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.16", default-features = false, features = ["std", "serde", "sha2"] }
+sacp-cbor = { version = "0.17", default-features = false, features = ["std", "serde", "sha2"] }
 ```
 
 > In Rust code the crate name is typically `sacp_cbor` (hyphen becomes underscore).
