@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.17.0
+
+- Added an opt-in **no-float validation mode**: `ValidationOptions` (builder
+  `ValidationOptions::new().no_float()`), `validate_canonical_with`,
+  `CanonicalCbor::from_slice_with`, and `CanonicalCbor::from_vec_with` reject float64 values
+  anywhere in an item with the new `ErrorCode::FloatForbidden` at the float header offset.
+  Restriction modes only reject more inputs — every item accepted under a restriction mode is
+  also a valid SACP-CBOR/1 item — and default validation is unchanged. The check sits on the
+  float header path, so float-free inputs validate at the same cost as before.
+- `SPEC.md` now defines **text identity** (no Unicode normalization; text equality is UTF-8 byte
+  equality — codifying existing behavior as a normative commitment) and the **validation modes**
+  contract (modes are a property of a validation call, not of the canonical witness; trusted
+  re-traversal ignores them).
+- `sacp-cbor-abi` 0.3.0 tracks the sacp-cbor 0.17 dependency; no ABI schema or wire changes.
+
 ## 0.16.1
 
 - Optimized the shared validate/skip hot loop: the innermost open container is
