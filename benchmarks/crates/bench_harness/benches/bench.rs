@@ -115,6 +115,253 @@ fn load_appendix_canonical() -> &'static Vec<sacp_cbor::CanonicalCbor> {
 }
 
 /* =========================
+ * ABI fixtures
+ * ========================= */
+
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(type_id = "bench.AbiMessage", version = 1, unknown_fields = "preserve")]
+struct AbiBenchMessage {
+    #[abi(id = 1)]
+    id: String,
+    #[abi(id = 2)]
+    kind: String,
+    #[abi(id = 3)]
+    seq: u64,
+    #[abi(id = 4)]
+    route: String,
+    #[abi(id = 5, optional)]
+    note: Option<String>,
+    #[abi(id = 6)]
+    payload: sacp_cbor::bytes::Bytes,
+    #[abi(id = 7)]
+    values: Vec<u64>,
+    #[abi(unknown_fields)]
+    unknown: sacp_cbor_abi::UnknownFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(type_id = "bench.AbiFlat16", version = 1)]
+struct AbiFlat16 {
+    #[abi(id = 1)]
+    f01: u64,
+    #[abi(id = 2)]
+    f02: u64,
+    #[abi(id = 3)]
+    f03: u64,
+    #[abi(id = 4)]
+    f04: u64,
+    #[abi(id = 5)]
+    f05: String,
+    #[abi(id = 6)]
+    f06: String,
+    #[abi(id = 7)]
+    f07: String,
+    #[abi(id = 8)]
+    f08: String,
+    #[abi(id = 9, optional)]
+    f09: Option<String>,
+    #[abi(id = 10, optional)]
+    f10: Option<String>,
+    #[abi(id = 11)]
+    f11: u64,
+    #[abi(id = 12)]
+    f12: u64,
+    #[abi(id = 13)]
+    f13: u64,
+    #[abi(id = 14)]
+    f14: u64,
+    #[abi(id = 15)]
+    f15: u64,
+    #[abi(id = 16)]
+    f16: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(
+    type_id = "bench.AbiUnknownIgnore",
+    version = 1,
+    unknown_fields = "ignore"
+)]
+struct AbiUnknownIgnore {
+    #[abi(id = 1)]
+    value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(
+    type_id = "bench.AbiUnknownPreserve",
+    version = 1,
+    unknown_fields = "preserve"
+)]
+struct AbiUnknownPreserve {
+    #[abi(id = 1)]
+    value: u64,
+    #[abi(unknown_fields)]
+    unknown: sacp_cbor_abi::UnknownFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(type_id = "bench.AbiCommand", version = 1)]
+enum AbiBenchCommand {
+    #[abi(id = 1)]
+    Route {
+        #[abi(id = 1)]
+        id: String,
+        #[abi(id = 2)]
+        seq: u64,
+        #[abi(id = 3)]
+        payload: sacp_cbor::bytes::Bytes,
+    },
+    #[abi(id = 2)]
+    Ack,
+    #[abi(unknown)]
+    Unknown(sacp_cbor_abi::UnknownVariant),
+}
+
+struct AbiWorkload {
+    name: &'static str,
+    canon: sacp_cbor::CanonicalCbor,
+}
+
+static ABI_MESSAGE_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
+static ABI_FLAT16_WORKLOAD: OnceLock<AbiWorkload> = OnceLock::new();
+static ABI_UNKNOWN_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
+static ABI_COMMAND_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
+
+fn abi_payload(len: usize) -> sacp_cbor::bytes::Bytes {
+    let bytes = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
+    sacp_cbor::bytes::Bytes::new(bytes)
+}
+
+fn abi_canon<T: sacp_cbor_abi::AbiEncode>(value: &T) -> sacp_cbor::CanonicalCbor {
+    sacp_cbor_abi::encode_to_canonical(value).expect("encode ABI workload")
+}
+
+fn abi_message_workloads() -> &'static [AbiWorkload] {
+    ABI_MESSAGE_WORKLOADS.get_or_init(|| {
+        let fast = fast_mode_enabled();
+        let specs: &[(&str, usize, usize, Option<usize>)] = if fast {
+            &[
+                ("abi_flat4", 0, 4, None),
+                ("abi_blob64k", 64 * 1024, 8, Some(16)),
+            ]
+        } else {
+            &[
+                ("abi_flat4", 0, 4, None),
+                ("abi_text4k", 0, 16, Some(4096)),
+                ("abi_blob64k", 64 * 1024, 32, Some(64)),
+            ]
+        };
+        specs
+            .iter()
+            .map(|(name, payload_len, values_len, note_len)| {
+                let note = note_len.map(|len| "x".repeat(len));
+                let value = AbiBenchMessage {
+                    id: "msg-0000000000000001".to_string(),
+                    kind: "tool_result".to_string(),
+                    seq: 42,
+                    route: "worker.dispatch".to_string(),
+                    note,
+                    payload: abi_payload(*payload_len),
+                    values: (0..*values_len as u64).collect(),
+                    unknown: sacp_cbor_abi::UnknownFields::empty(),
+                };
+                AbiWorkload {
+                    name,
+                    canon: abi_canon(&value),
+                }
+            })
+            .collect()
+    })
+}
+
+fn abi_flat16_workload() -> &'static AbiWorkload {
+    ABI_FLAT16_WORKLOAD.get_or_init(|| AbiWorkload {
+        name: "abi_flat16",
+        canon: abi_canon(&AbiFlat16 {
+            f01: 1,
+            f02: 2,
+            f03: 3,
+            f04: 4,
+            f05: "alpha".to_string(),
+            f06: "beta".to_string(),
+            f07: "gamma".to_string(),
+            f08: "delta".to_string(),
+            f09: Some("epsilon".to_string()),
+            f10: Some("zeta".to_string()),
+            f11: 11,
+            f12: 12,
+            f13: 13,
+            f14: 14,
+            f15: 15,
+            f16: 16,
+        }),
+    })
+}
+
+fn abi_unknown_workloads() -> &'static [AbiWorkload] {
+    ABI_UNKNOWN_WORKLOADS.get_or_init(|| {
+        let specs: &[(&str, usize, usize)] = if fast_mode_enabled() {
+            &[("unknown4_small", 4, 16), ("unknown16_4k", 16, 4096)]
+        } else {
+            &[
+                ("unknown4_small", 4, 16),
+                ("unknown16_256b", 16, 256),
+                ("unknown64_4k", 64, 4096),
+            ]
+        };
+        specs
+            .iter()
+            .map(|(name, count, payload_len)| {
+                let mut fields = Vec::with_capacity(*count);
+                for i in 0..*count {
+                    let payload = sacp_cbor::encode_to_canonical(&abi_payload(*payload_len))
+                        .expect("encode unknown payload");
+                    fields.push(sacp_cbor_abi::UnknownField {
+                        id: 10 + i as u32,
+                        value: payload,
+                    });
+                }
+                let value = AbiUnknownPreserve {
+                    value: 7,
+                    unknown: sacp_cbor_abi::UnknownFields::try_from_vec(fields)
+                        .expect("unknown fields sorted"),
+                };
+                AbiWorkload {
+                    name,
+                    canon: abi_canon(&value),
+                }
+            })
+            .collect()
+    })
+}
+
+fn abi_command_workloads() -> &'static [AbiWorkload] {
+    ABI_COMMAND_WORKLOADS.get_or_init(|| {
+        let known = AbiBenchCommand::Route {
+            id: "msg-0000000000000001".to_string(),
+            seq: 42,
+            payload: abi_payload(if fast_mode_enabled() { 1024 } else { 16 * 1024 }),
+        };
+        let unknown = AbiBenchCommand::Unknown(sacp_cbor_abi::UnknownVariant {
+            id: 9,
+            payload: sacp_cbor::encode_to_canonical(&abi_payload(4096))
+                .expect("encode unknown variant payload"),
+        });
+        vec![
+            AbiWorkload {
+                name: "known_payload",
+                canon: abi_canon(&known),
+            },
+            AbiWorkload {
+                name: "unknown_payload",
+                canon: abi_canon(&unknown),
+            },
+        ]
+    })
+}
+
+/* =========================
  * Pipeline scenarios
  * ========================= */
 
@@ -289,6 +536,274 @@ fn bench_roundtrip(c: &mut Criterion) {
                 )
                 .unwrap();
                 black_box(out);
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_abi_decode_owned(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_decode_owned");
+    for data in abi_message_workloads() {
+        let bytes = data.canon.as_bytes();
+        group.throughput(Throughput::Bytes(bytes.len() as u64));
+        group.bench_function(BenchmarkId::new("abi-owned", data.name), |b| {
+            b.iter(|| {
+                let out: AbiBenchMessage =
+                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                        .unwrap();
+                black_box(out);
+            })
+        });
+    }
+
+    let flat16 = abi_flat16_workload();
+    let bytes = flat16.canon.as_bytes();
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function(BenchmarkId::new("abi-owned", flat16.name), |b| {
+        b.iter(|| {
+            let out: AbiFlat16 =
+                sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                    .unwrap();
+            black_box(out);
+        })
+    });
+    group.finish();
+}
+
+fn bench_abi_view_access(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_view_access");
+    for data in abi_message_workloads() {
+        let bytes = data.canon.as_bytes();
+        group.throughput(Throughput::Bytes(bytes.len() as u64));
+
+        group.bench_function(BenchmarkId::new("abi-view", data.name), |b| {
+            b.iter(|| {
+                let view =
+                    AbiBenchMessageView::from_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                black_box(view.id().unwrap());
+                black_box(view.kind().unwrap());
+                black_box(view.seq().unwrap());
+                black_box(view.route().unwrap());
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("abi-view-checked", data.name), |b| {
+            b.iter(|| {
+                let canon = sacp_cbor::validate_canonical(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                )
+                .unwrap();
+                let view = AbiBenchMessageView::from_canonical(canon).unwrap();
+                black_box(view.id().unwrap());
+                black_box(view.kind().unwrap());
+                black_box(view.seq().unwrap());
+                black_box(view.route().unwrap());
+            })
+        });
+
+        group.bench_function(
+            BenchmarkId::new("abi-view-array-get-last", data.name),
+            |b| {
+                b.iter(|| {
+                    let view = AbiBenchMessageView::from_canonical(black_box(
+                        data.canon.as_canonical_ref(),
+                    ))
+                    .unwrap();
+                    let values = view.values().unwrap();
+                    let len = values.len().unwrap();
+                    black_box(values.get(len - 1).unwrap());
+                })
+            },
+        );
+
+        group.bench_function(BenchmarkId::new("abi-owned-trusted", data.name), |b| {
+            b.iter(|| {
+                let out: AbiBenchMessage =
+                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                black_box((&out.id, &out.kind, out.seq, &out.route));
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("abi-owned", data.name), |b| {
+            b.iter(|| {
+                let out: AbiBenchMessage =
+                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                        .unwrap();
+                black_box((&out.id, &out.kind, out.seq, &out.route));
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_abi_unknown_preserve(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_unknown_preserve");
+    for data in abi_unknown_workloads() {
+        let bytes = data.canon.as_bytes();
+        group.throughput(Throughput::Bytes(bytes.len() as u64));
+
+        group.bench_function(BenchmarkId::new("ignore", data.name), |b| {
+            b.iter(|| {
+                let out: AbiUnknownIgnore =
+                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                        .unwrap();
+                black_box(out.value);
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("preserve-owned", data.name), |b| {
+            b.iter(|| {
+                let out: AbiUnknownPreserve =
+                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                        .unwrap();
+                black_box(out.unknown.len());
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("preserve-owned-trusted", data.name), |b| {
+            b.iter(|| {
+                let out: AbiUnknownPreserve =
+                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                black_box(out.unknown.len());
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("preserve-view", data.name), |b| {
+            b.iter(|| {
+                let view = AbiUnknownPreserveView::from_canonical(black_box(
+                    data.canon.as_canonical_ref(),
+                ))
+                .unwrap();
+                let count = view
+                    .unknown_fields()
+                    .unwrap()
+                    .map(|field| field.unwrap().value.byte_len())
+                    .sum::<usize>();
+                black_box(count);
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("preserve-view-checked", data.name), |b| {
+            b.iter(|| {
+                let canon = sacp_cbor::validate_canonical(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                )
+                .unwrap();
+                let view = AbiUnknownPreserveView::from_canonical(canon).unwrap();
+                let count = view
+                    .unknown_fields()
+                    .unwrap()
+                    .map(|field| field.unwrap().value.byte_len())
+                    .sum::<usize>();
+                black_box(count);
+            })
+        });
+    }
+    group.finish();
+}
+
+fn bench_abi_enum_access(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_enum_access");
+    for data in abi_command_workloads() {
+        let bytes = data.canon.as_bytes();
+        group.throughput(Throughput::Bytes(bytes.len() as u64));
+
+        group.bench_function(BenchmarkId::new("view", data.name), |b| {
+            b.iter(|| {
+                let view =
+                    AbiBenchCommandView::from_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                black_box(view.variant_id());
+                if let Some(route) = view.as_route().unwrap() {
+                    black_box(route.id().unwrap());
+                    black_box(route.seq().unwrap());
+                }
+                if let Some(unknown) = view.unknown_variant() {
+                    black_box(unknown.payload.byte_len());
+                }
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("view-checked", data.name), |b| {
+            b.iter(|| {
+                let canon = sacp_cbor::validate_canonical(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                )
+                .unwrap();
+                let view = AbiBenchCommandView::from_canonical(canon).unwrap();
+                black_box(view.variant_id());
+                if let Some(route) = view.as_route().unwrap() {
+                    black_box(route.id().unwrap());
+                    black_box(route.seq().unwrap());
+                }
+                if let Some(unknown) = view.unknown_variant() {
+                    black_box(unknown.payload.byte_len());
+                }
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("view-repeat", data.name), |b| {
+            b.iter(|| {
+                let view =
+                    AbiBenchCommandView::from_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                if let Some(route) = view.as_route().unwrap() {
+                    black_box(route.id().unwrap());
+                }
+                if let Some(route) = view.as_route().unwrap() {
+                    black_box(route.seq().unwrap());
+                }
+                if let Some(unknown) = view.unknown_variant() {
+                    black_box(unknown.payload.byte_len());
+                }
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("owned-trusted", data.name), |b| {
+            b.iter(|| {
+                let out: AbiBenchCommand =
+                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
+                        .unwrap();
+                match &out {
+                    AbiBenchCommand::Route { id, seq, .. } => {
+                        black_box(id);
+                        black_box(seq);
+                    }
+                    AbiBenchCommand::Ack => {
+                        black_box(0u8);
+                    }
+                    AbiBenchCommand::Unknown(unknown) => {
+                        black_box(unknown.payload.as_bytes().len());
+                    }
+                }
+            })
+        });
+
+        group.bench_function(BenchmarkId::new("owned", data.name), |b| {
+            b.iter(|| {
+                let out: AbiBenchCommand =
+                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
+                        .unwrap();
+                match &out {
+                    AbiBenchCommand::Route { id, seq, .. } => {
+                        black_box(id);
+                        black_box(seq);
+                    }
+                    AbiBenchCommand::Ack => {
+                        black_box(0u8);
+                    }
+                    AbiBenchCommand::Unknown(unknown) => {
+                        black_box(unknown.id);
+                        black_box(unknown.payload.as_bytes().len());
+                    }
+                };
             })
         });
     }
@@ -651,6 +1166,10 @@ criterion_group! {
         bench_decode_typed,
         bench_encode,
         bench_roundtrip,
+        bench_abi_decode_owned,
+        bench_abi_view_access,
+        bench_abi_unknown_preserve,
+        bench_abi_enum_access,
         bench_patch,
         bench_appendix_a,
         bench_micro_query,

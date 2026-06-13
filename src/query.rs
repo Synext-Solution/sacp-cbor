@@ -211,6 +211,31 @@ impl<'a> IntegerRef<'a> {
         }
     }
 
+    /// Return this integer as an `i128`, if it fits.
+    #[inline]
+    #[must_use]
+    pub fn as_i128(self) -> Option<i128> {
+        match self {
+            Self::Safe(v) => Some(i128::from(v)),
+            Self::Big(b) => {
+                let n = crate::int::magnitude_to_u128(b.magnitude)?;
+                let n = i128::try_from(n).ok()?;
+                Some(if b.negative { -1 - n } else { n })
+            }
+        }
+    }
+
+    /// Return this integer as a `u128`, if it is non-negative and fits.
+    #[inline]
+    #[must_use]
+    pub fn as_u128(self) -> Option<u128> {
+        match self {
+            Self::Safe(v) => u128::try_from(v).ok(),
+            Self::Big(b) if !b.negative => crate::int::magnitude_to_u128(b.magnitude),
+            Self::Big(_) => None,
+        }
+    }
+
     /// Return the bignum reference, if present.
     #[must_use]
     pub const fn as_bigint(self) -> Option<BigIntRef<'a>> {
@@ -255,10 +280,18 @@ impl<'a> CborValueRef<'a> {
     }
 
     /// Returns the raw bytes (canonical CBOR encoding) for this value.
+    #[inline]
     #[must_use]
     pub fn as_bytes(self) -> &'a [u8] {
         // Invariants are guaranteed by construction from validated canonical bytes.
         &self.data[self.start..self.end]
+    }
+
+    /// Returns this value as a borrowed canonical CBOR item.
+    #[inline]
+    #[must_use]
+    pub fn as_canonical_ref(self) -> CanonicalCborRef<'a> {
+        CanonicalCborRef::new(self.as_bytes())
     }
 
     /// Returns the starting offset (in bytes) of this value within the message.
@@ -268,6 +301,7 @@ impl<'a> CborValueRef<'a> {
     }
 
     /// Returns the byte length of this value's canonical encoding.
+    #[inline]
     #[must_use]
     pub fn byte_len(self) -> usize {
         debug_assert!(self.start <= self.end);
@@ -279,12 +313,14 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError` if the underlying bytes are malformed.
+    #[inline]
     pub fn kind(self) -> Result<CborKind, CborError> {
         let mut pos = self.start;
         peek_kind_at::<false>(self.data, &mut pos)
     }
 
     /// Returns `true` if this value is CBOR `null`.
+    #[inline]
     #[must_use]
     pub fn is_null(self) -> bool {
         self.data.get(self.start) == Some(&0xf6)
@@ -295,6 +331,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedMap` if the value is not a map.
+    #[inline]
     pub fn map(self) -> Result<MapRef<'a>, CborError> {
         let (len, entries_start) = parse_map_header(self.data, self.start)?;
         Ok(MapRef {
@@ -310,6 +347,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedArray` if the value is not an array.
+    #[inline]
     pub fn array(self) -> Result<ArrayRef<'a>, CborError> {
         let (len, items_start) = parse_array_header(self.data, self.start)?;
         Ok(ArrayRef {
@@ -325,6 +363,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedMap` if the value is not a map.
+    #[inline]
     pub fn get_key(self, key: &str) -> Result<Option<Self>, CborError> {
         self.map()?.get(key)
     }
@@ -334,6 +373,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedArray` if the value is not an array.
+    #[inline]
     pub fn get_index(self, index: usize) -> Result<Option<Self>, CborError> {
         self.array()?.get(index)
     }
@@ -346,6 +386,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError` for type mismatches or malformed canonical input.
+    #[inline]
     pub fn at(self, path: &[PathElem<'_>]) -> Result<Option<Self>, CborError> {
         let mut cur = self;
         for pe in path {
@@ -368,6 +409,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedInteger` if the value is not an integer or is malformed.
+    #[inline]
     pub fn integer(self) -> Result<IntegerRef<'a>, CborError> {
         let mut pos = self.start;
         let off = self.start;
@@ -419,6 +461,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedText` if the value is not a text string or is malformed.
+    #[inline]
     pub fn text(self) -> Result<&'a str, CborError> {
         let mut pos = self.start;
         let off = self.start;
@@ -440,6 +483,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedBytes` if the value is not a byte string or is malformed.
+    #[inline]
     pub fn bytes(self) -> Result<&'a [u8], CborError> {
         let mut pos = self.start;
         let off = self.start;
@@ -461,6 +505,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedBool` if the value is not a boolean or is malformed.
+    #[inline]
     pub fn bool(self) -> Result<bool, CborError> {
         let off = self.start;
         let b = *self.data.get(off).ok_or_else(|| malformed(off))?;
@@ -477,6 +522,7 @@ impl<'a> CborValueRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError::ExpectedFloat` if the value is not a float64 or is malformed.
+    #[inline]
     pub fn float64(self) -> Result<f64, CborError> {
         let mut pos = self.start;
         let off = self.start;
@@ -905,6 +951,7 @@ impl<'a> ArrayRef<'a> {
     /// # Errors
     ///
     /// Returns `CborError` if the array is malformed.
+    #[inline]
     pub fn get(self, index: usize) -> Result<Option<CborValueRef<'a>>, CborError> {
         if index >= self.len {
             return Ok(None);
@@ -927,6 +974,7 @@ impl<'a> ArrayRef<'a> {
     /// Iterates over array items in order.
     ///
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
+    #[inline]
     pub fn iter(self) -> impl Iterator<Item = Result<CborValueRef<'a>, CborError>> + 'a {
         ArrayIter {
             data: self.data,
@@ -944,6 +992,7 @@ impl<'a> CanonicalCborRef<'a> {
     /// Canonical validation guarantees the message is exactly one CBOR item, so the
     /// root value spans the full byte slice.
     #[must_use]
+    #[inline]
     pub const fn root(self) -> CborValueRef<'a> {
         CborValueRef::new(self.as_bytes(), 0, self.as_bytes().len())
     }
@@ -962,6 +1011,7 @@ impl<'a> CanonicalCborRef<'a> {
 impl CanonicalCbor {
     /// Returns a borrowed view of the root CBOR item.
     #[must_use]
+    #[inline]
     pub fn root(&self) -> CborValueRef<'_> {
         let b = self.as_bytes();
         CborValueRef::new(b, 0, b.len())
@@ -1329,6 +1379,7 @@ struct ArrayIter<'a> {
 impl<'a> Iterator for ArrayIter<'a> {
     type Item = Result<CborValueRef<'a>, CborError>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;

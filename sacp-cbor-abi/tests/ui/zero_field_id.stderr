@@ -1,0 +1,5 @@
+error: ABI IDs must be nonzero
+ --> tests/ui/zero_field_id.rs:6:16
+  |
+6 |     #[abi(id = 0)]
+  |                ^

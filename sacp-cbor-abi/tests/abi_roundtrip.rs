@@ -1,7 +1,8 @@
+use sacp_cbor::bytes::Bytes;
 use sacp_cbor::{CanonicalCbor, DecodeLimits, ErrorCode};
 use sacp_cbor_abi::{
-    assert_abi_rejects, assert_abi_vector, decode, encode_to_vec, AbiType, CborAbi,
-    CompatibilityClass, UnknownFields, UnknownVariant,
+    assert_abi_rejects, assert_abi_vector, decode, encode_to_vec, AbiDeleteMode, AbiFieldSetRef,
+    AbiPatchValue, AbiSetMode, AbiType, CborAbi, CompatibilityClass, UnknownFields, UnknownVariant,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
@@ -35,6 +36,32 @@ struct TransferRenamed {
 struct Borrowed<'a> {
     #[abi(id = 1)]
     name: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
+#[abi(
+    type_id = "ledger.ViewPayload",
+    version = 1,
+    unknown_fields = "preserve"
+)]
+struct ViewPayload {
+    #[abi(id = 1)]
+    route: String,
+    #[abi(id = 2, optional)]
+    memo: Option<String>,
+    #[abi(id = 3)]
+    payload: Bytes,
+    #[abi(unknown_fields)]
+    unknown: UnknownFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
+#[abi(type_id = "ledger.VectorPayload", version = 1)]
+struct VectorPayload {
+    #[abi(id = 1)]
+    items: Vec<u64>,
+    #[abi(id = 2)]
+    label: String,
 }
 
 type AccountAlias = u64;
@@ -180,6 +207,80 @@ fn borrowed_text_fields_decode_without_copying() {
 }
 
 #[test]
+fn generated_view_accessors_are_zero_copy() {
+    let value = ViewPayload {
+        route: String::from("route-a"),
+        memo: Some(String::from("memo-a")),
+        payload: Bytes::new(vec![1, 2, 3, 4]),
+        unknown: UnknownFields::try_from_vec(vec![sacp_cbor_abi::UnknownField {
+            id: 9,
+            value: canon(&[0xf5]),
+        }])
+        .unwrap(),
+    };
+    let bytes = encode_to_vec(&value).unwrap();
+    let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let view = ViewPayloadView::from_canonical(canon.as_canonical_ref()).unwrap();
+
+    assert_eq!(view.route().unwrap(), "route-a");
+    assert_eq!(view.memo().unwrap(), Some("memo-a"));
+    assert_eq!(view.payload().unwrap().as_slice(), &[1, 2, 3, 4]);
+    assert_eq!(view.payload_raw().unwrap().as_bytes(), &[0x44, 1, 2, 3, 4]);
+
+    let start = canon.as_bytes().as_ptr() as usize;
+    let end = start + canon.as_bytes().len();
+    let route_ptr = view.route().unwrap().as_ptr() as usize;
+    let payload_ptr = view.payload().unwrap().as_slice().as_ptr() as usize;
+    assert!((start..end).contains(&route_ptr));
+    assert!((start..end).contains(&payload_ptr));
+
+    let unknown: Vec<_> = view.unknown_fields().unwrap().map(Result::unwrap).collect();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].id, 9);
+    assert_eq!(unknown[0].value.as_bytes(), &[0xf5]);
+
+    assert_eq!(view.to_owned().unwrap(), value);
+}
+
+#[test]
+fn generated_view_integer_accessors_preserve_bignum_semantics() {
+    let value = Transfer {
+        from: 1,
+        to: 2,
+        amount: u64::MAX,
+        memo: None,
+    };
+    let bytes = encode_to_vec(&value).unwrap();
+    let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let view = TransferView::from_canonical(canon.as_canonical_ref()).unwrap();
+
+    assert_eq!(view.amount().unwrap(), u64::MAX);
+    assert_eq!(view.amount_raw().unwrap().as_bytes()[0], 0xc2);
+    assert_eq!(view.to_owned().unwrap(), value);
+}
+
+#[test]
+fn generated_view_arrays_decode_items_lazily() {
+    let bytes = [
+        0x84, 0x01, 0x82, 0x01, 0x63, b'b', b'a', b'd', 0x02, 0x62, b'o', b'k',
+    ];
+    assert_abi_rejects::<VectorPayload>(&bytes, ErrorCode::ExpectedInteger);
+    let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let view = VectorPayloadView::from_canonical(canon.as_canonical_ref()).unwrap();
+
+    assert_eq!(view.label().unwrap(), "ok");
+    let items = view.items().unwrap();
+    assert_eq!(items.len().unwrap(), 2);
+    assert_eq!(items.get(0).unwrap(), Some(1));
+    let err = items.get(1).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedInteger);
+    assert_eq!(
+        view.to_owned().unwrap_err().code,
+        ErrorCode::ExpectedInteger
+    );
+}
+
+#[test]
 fn unknown_fields_can_be_ignored_or_preserved() {
     let bytes = [0x84, 0x01, 0x05, 0x02, 0xf5];
     let decoded: Lenient = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
@@ -189,6 +290,17 @@ fn unknown_fields_can_be_ignored_or_preserved() {
     assert_eq!(decoded.value, 5);
     assert_eq!(decoded.unknown.len(), 1);
     assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn generated_view_rejects_invalid_field_ids() {
+    let zero_unknown = [0x84, 0x00, 0xf5, 0x01, 0x05];
+    assert_abi_rejects::<Lenient>(&zero_unknown, ErrorCode::InvalidAbiValue);
+    let canon =
+        CanonicalCbor::from_slice(&zero_unknown, DecodeLimits::for_bytes(zero_unknown.len()))
+            .unwrap();
+    let err = LenientView::from_canonical(canon.as_canonical_ref()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidAbiValue);
 }
 
 #[test]
@@ -228,6 +340,35 @@ fn enum_abi_preserves_unknown_variants() {
 }
 
 #[test]
+fn generated_enum_view_validates_and_caches_payload() {
+    let accepted =
+        CanonicalCbor::from_slice(&[0x82, 0x01, 0x82, 0x01, 0x07], DecodeLimits::for_bytes(5))
+            .unwrap();
+    let view = DecisionView::from_canonical(accepted.as_canonical_ref()).unwrap();
+    assert_eq!(view.variant_id(), 1);
+    assert!(view.is_accepted());
+    let payload = view.as_accepted().unwrap().unwrap();
+    assert_eq!(payload.id().unwrap(), 7);
+
+    let bad_payload =
+        CanonicalCbor::from_slice(&[0x82, 0x01, 0xf6], DecodeLimits::for_bytes(3)).unwrap();
+    let err = DecisionView::from_canonical(bad_payload.as_canonical_ref()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::ExpectedArray);
+
+    let unknown =
+        CanonicalCbor::from_slice(&[0x82, 0x09, 0xf5], DecodeLimits::for_bytes(3)).unwrap();
+    let view = DecisionView::from_canonical(unknown.as_canonical_ref()).unwrap();
+    let unknown = view.unknown_variant().unwrap();
+    assert_eq!(unknown.id, 9);
+    assert_eq!(unknown.payload.as_bytes(), &[0xf5]);
+
+    assert_abi_rejects::<Decision>(&[0x82, 0x00, 0xf5], ErrorCode::InvalidAbiValue);
+    let zero = CanonicalCbor::from_slice(&[0x82, 0x00, 0xf5], DecodeLimits::for_bytes(3)).unwrap();
+    let err = DecisionView::from_canonical(zero.as_canonical_ref()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidAbiValue);
+}
+
+#[test]
 fn transparent_newtype_uses_inner_wire_encoding() {
     let value = AccountId(String::from("abc"));
     assert_abi_vector("account-id", &value, "63616263");
@@ -239,6 +380,10 @@ fn transparent_newtype_uses_inner_wire_encoding() {
 #[test]
 fn transparent_validation_failure_is_an_abi_value_error() {
     assert_abi_rejects::<ValidatedAccountId>(&[0x60], ErrorCode::InvalidAbiValue);
+
+    let canon = CanonicalCbor::from_slice(&[0x60], DecodeLimits::for_bytes(1)).unwrap();
+    let err = ValidatedAccountIdView::from_canonical(canon.as_canonical_ref()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidAbiValue);
 }
 
 #[test]
@@ -258,4 +403,48 @@ fn decode_rejects_missing_unknown_duplicate_and_unsorted_fields() {
         &[0x86, 0x02, 0x02, 0x01, 0x01, 0x03, 0x18, 0x32],
         ErrorCode::NonCanonicalMapOrder,
     );
+}
+
+#[test]
+fn abi_field_set_editor_merges_raw_and_encoded_ops() {
+    let bytes = [
+        0x86, 0x01, 0x62, b'a', b'a', 0x03, 0x43, 1, 2, 3, 0x05, 0xf5,
+    ];
+    let doc = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let fields = AbiFieldSetRef::from_value(doc.as_canonical_ref().root()).unwrap();
+    let raw_one = fields.get(1).unwrap().unwrap();
+
+    let mut editor = fields.edit();
+    let err = editor
+        .set(0, AbiSetMode::Upsert, AbiPatchValue::Raw(raw_one))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidAbiValue);
+
+    editor
+        .set(
+            2,
+            AbiSetMode::InsertOnly,
+            AbiPatchValue::Encoded(canon(&[0xf4])),
+        )
+        .unwrap();
+    editor
+        .set(4, AbiSetMode::Upsert, AbiPatchValue::Raw(raw_one))
+        .unwrap();
+    editor.delete(3, AbiDeleteMode::Require).unwrap();
+
+    let updated = editor.apply().unwrap();
+    assert_eq!(hex(updated.as_bytes()), "880162616102f40462616105f5");
+
+    let updated_fields = AbiFieldSetRef::from_value(updated.as_canonical_ref().root()).unwrap();
+    assert!(updated_fields.get(3).unwrap().is_none());
+    assert_eq!(
+        updated_fields.get(4).unwrap().unwrap().as_bytes(),
+        raw_one.as_bytes()
+    );
+
+    let err = match updated_fields.unknown_fields(&[4, 1]) {
+        Ok(_) => panic!("unsorted known ABI field IDs accepted"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, ErrorCode::InvalidQuery);
 }

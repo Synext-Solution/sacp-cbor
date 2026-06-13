@@ -15,8 +15,20 @@ use sacp_cbor::{
 };
 use sha2::{Digest, Sha256};
 
+mod edit;
+mod view;
+
+#[cfg(kani)]
+#[path = "../../proofs/abi_kani.rs"]
+mod proofs;
+
+pub use edit::{AbiDeleteMode, AbiFieldSetEditor, AbiPatchValue, AbiSetMode};
 #[cfg(feature = "derive")]
 pub use sacp_cbor_abi_derive::CborAbi;
+pub use view::{
+    AbiArrayView, AbiFieldEntryRef, AbiFieldSetRef, AbiView, AbiViewField, UnknownFieldRef,
+    UnknownVariantRef,
+};
 
 /// Support items used by generated code.
 #[doc(hidden)]
@@ -25,6 +37,13 @@ pub mod __private {
     pub use sacp_cbor;
 
     use super::{UnknownFields, UnknownVariant};
+
+    /// Decode and validate a nonzero ABI field or variant ID.
+    pub fn decode_abi_id(
+        value: sacp_cbor::query::CborValueRef<'_>,
+    ) -> Result<u32, sacp_cbor::CborError> {
+        super::view::abi_field_id(value)
+    }
 
     /// Encode one ABI field ID in a field-set array.
     pub fn encode_field_id(
@@ -578,6 +597,19 @@ pub fn decode<'de, T: AbiDecode<'de>>(
     let mut decoder = Decoder::<true>::new_checked(bytes, limits)?;
     let value = T::abi_decode(&mut decoder)?;
     if decoder.position() != bytes.len() {
+        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
+    }
+    Ok(value)
+}
+
+/// Decode an ABI value from an already validated canonical CBOR witness.
+pub fn decode_canonical<'de, T: AbiDecode<'de>>(
+    cbor: CanonicalCborRef<'de>,
+) -> Result<T, CborError> {
+    let mut decoder =
+        Decoder::<false>::new_trusted(cbor, DecodeLimits::for_bytes(cbor.as_bytes().len()))?;
+    let value = T::abi_decode(&mut decoder)?;
+    if decoder.position() != cbor.as_bytes().len() {
         return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
     }
     Ok(value)

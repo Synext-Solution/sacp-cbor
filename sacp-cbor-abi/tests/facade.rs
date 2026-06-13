@@ -1,9 +1,10 @@
 mod wire {
     pub mod abi {
         pub use sacp_cbor_abi::{
-            __private, decode, encode_to_vec, AbiDecode, AbiEncode, AbiType, AbiTypeRef, CborAbi,
-            FieldDef, FieldPresence, FieldSetDef, Schema, TypeDef, TypeRef, UnknownField,
-            UnknownFieldPolicy, UnknownFields,
+            __private, decode, decode_canonical, encode_to_vec, AbiDecode, AbiEncode,
+            AbiFieldSetRef, AbiType, AbiTypeRef, AbiView, AbiViewField, CborAbi, FieldDef,
+            FieldPresence, FieldSetDef, Schema, TypeDef, TypeRef, UnknownField, UnknownFieldPolicy,
+            UnknownFieldRef, UnknownFields,
         };
     }
 
@@ -37,4 +38,15 @@ fn facade_abi_derive_roundtrips() {
     assert_eq!(decoded.amount, 5);
     assert_eq!(decoded.unknown.len(), 1);
     assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
+
+    let canon = sacp_cbor::CanonicalCbor::from_slice(
+        &bytes,
+        sacp_cbor::DecodeLimits::for_bytes(bytes.len()),
+    )
+    .unwrap();
+    let view = TransferView::from_canonical(canon.as_canonical_ref()).unwrap();
+    assert_eq!(view.amount().unwrap(), 5);
+    let unknown: Vec<_> = view.unknown_fields().unwrap().map(Result::unwrap).collect();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].id, 2);
 }

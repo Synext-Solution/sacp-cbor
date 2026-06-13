@@ -135,7 +135,7 @@ pub struct ValidationOptions {
     ///
     /// For deployments whose durable data model excludes floating point, this enforces the
     /// no-float restriction at the validation boundary instead of by schema convention. Rejected
-    /// values produce [`ErrorCode::FloatForbidden`](crate::ErrorCode::FloatForbidden) at the
+    /// values produce [`ErrorCode::FloatForbidden`] at the
     /// float header offset.
     pub forbid_float: bool,
 }

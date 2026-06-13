@@ -16,7 +16,7 @@ fi
 
 "$CARGO_KANI" --version >/dev/null
 
-harnesses=(
+core_harnesses=(
   uint_argument_classifier_is_minimal
   encoded_uint_payload_roundtrips_through_checked_reader
   checked_uint_arg_ai24_matches_minimal_rule
@@ -37,6 +37,16 @@ harnesses=(
   encoder_rolls_back_after_text_output_limit
 )
 
-for harness in "${harnesses[@]}"; do
+abi_harnesses=(
+  abi_id_validator_accepts_exact_nonzero_u32_range
+  sorted_query_ids_accepts_exact_nonzero_singleton
+  sorted_query_ids_accepts_exact_strict_nonzero_order_for_len3
+)
+
+for harness in "${core_harnesses[@]}"; do
   "$CARGO_KANI" --harness "$harness"
+done
+
+for harness in "${abi_harnesses[@]}"; do
+  "$CARGO_KANI" -p sacp-cbor-abi --harness "$harness"
 done

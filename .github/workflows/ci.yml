@@ -78,10 +78,14 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
       - name: Fetch datasets
         run: ./benchmarks/scripts/fetch_datasets.sh
+
+      - name: Format (bench harness)
+        working-directory: benchmarks
+        run: cargo fmt --all -- --check
 
       - name: Clippy (bench harness)
         working-directory: benchmarks
@@ -104,7 +108,7 @@ jobs:
           path: benchmarks/reports/latest/
 
   release:
-    needs: [test, miri]
+    needs: [test, bench-smoke, miri]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     steps:
@@ -144,7 +148,7 @@ jobs:
 
           # README must always face the current release line, never a past one.
           release_line="${version%.*}"
-          stale_readme="$(grep -oE 'sacp-cbor = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${release_line}" || true)"
+          stale_readme="$(grep -hoE 'sacp-cbor = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-abi/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${release_line}" || true)"
           if [ -n "${stale_readme}" ]; then
             echo "README references stale sacp-cbor version(s): ${stale_readme} (current line ${release_line})." >&2
             exit 1
@@ -213,6 +217,13 @@ jobs:
           abi_version="${abi_meta#* }"
           abi_root_dep_version="$(dependency_version "sacp-cbor-abi/Cargo.toml" "sacp-cbor")"
           abi_derive_dep_version="$(dependency_version "sacp-cbor-abi/Cargo.toml" "sacp-cbor-abi-derive")"
+          abi_release_line="${abi_version%.*}"
+
+          stale_abi_readme="$(grep -hoE 'sacp-cbor-abi = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-abi/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${abi_release_line}" || true)"
+          if [ -n "${stale_abi_readme}" ]; then
+            echo "README references stale sacp-cbor-abi version(s): ${stale_abi_readme} (current line ${abi_release_line})." >&2
+            exit 1
+          fi
 
           if [ "$abi_root_dep_version" != "$version" ]; then
             echo "sacp-cbor-abi dependency on sacp-cbor (${abi_root_dep_version}) does not match root version (${version})." >&2

@@ -20,6 +20,20 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
   - **serde** conversion utilities (`serde`).
   - **SHA-256** helpers for canonical bytes / canonical-encoded values (`sha2`).
 
+### Published crates
+
+This repository publishes four crates with different responsibilities:
+
+| Crate | Current line | Responsibility |
+|---|---:|---|
+| `sacp-cbor` | `0.17` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
+| `sacp-cbor-derive` | `0.17` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
+| `sacp-cbor-abi` | `0.4` | Stable public ABI schemas, numeric field/variant IDs, compatibility reports, and zero-copy ABI views. |
+| `sacp-cbor-abi-derive` | `0.3` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
+
+Use `sacp-cbor` for canonical CBOR infrastructure and internal Rust-shape codecs. Use
+`sacp-cbor-abi` for public protocols that must remain stable across Rust refactors.
+
 ### Design constraints (important)
 
 This crate enforces a strict “canonical profile”:
@@ -643,39 +657,229 @@ let out = cbor_bytes!([canon, 1, 2, 3])?; // array whose first element is the ex
 
 ## Stable public ABI (`sacp-cbor-abi`)
 
-`#[derive(CborEncode, CborDecode)]` is intentionally a Rust-shape codec. It is useful for internal
-types, but public protocols should use the separate `sacp-cbor-abi` crate.
+`#[derive(CborEncode, CborDecode)]` is intentionally a Rust-shape codec: it follows the Rust
+container shape and is best for internal data. Public protocols should use the separate
+`sacp-cbor-abi` crate, where field and variant identity is explicit, numeric, and stable across
+renames, module moves, and private Rust refactors.
 
-The ABI layer is opt-in and uses stable numeric IDs:
+The ABI layer is opt-in:
 
 ```rust
-use sacp_cbor_abi::CborAbi;
+use sacp_cbor::{DecodeLimits, CanonicalCbor};
+use sacp_cbor_abi::{decode, encode_to_vec, AbiType, CborAbi};
 
-#[derive(CborAbi)]
+#[derive(Debug, PartialEq, Eq, CborAbi)]
 #[abi(type_id = "ledger.Transfer", version = 1)]
 struct Transfer {
-  #[abi(id = 1)]
-  from: u64,
-  #[abi(id = 2)]
-  to: u64,
-  #[abi(id = 3)]
-  amount: u64,
-  #[abi(id = 4, optional)]
-  memo: Option<String>,
+    #[abi(id = 1)]
+    from: u64,
+    #[abi(id = 2)]
+    to: u64,
+    #[abi(id = 3)]
+    amount: u64,
+    #[abi(id = 4, optional)]
+    memo: Option<String>,
+}
+
+let value = Transfer {
+    from: 1001,
+    to: 2002,
+    amount: 5000,
+    memo: None,
+};
+
+let bytes = encode_to_vec(&value)?;
+let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+assert_eq!(decoded, value);
+
+let wire_hash = Transfer::schema().wire_hash()?;
+let full_hash = Transfer::schema().full_hash()?;
+assert_ne!(wire_hash, full_hash);
+```
+
+### Wire contract
+
+ABI structs encode as canonical field-set arrays:
+
+```text
+[field_id, value, field_id, value, ...]
+```
+
+For the `Transfer` above, `memo: None` is omitted and the logical wire shape is:
+
+```text
+[1, 1001, 2, 2002, 3, 5000]
+```
+
+Field IDs and variant IDs must be nonzero `u32` values. On the wire, ABI field-set IDs must be
+strictly increasing; duplicate, decreasing, zero, and odd-length field-set arrays are rejected.
+Required `Option<T>` fields are rejected at derive time; optional fields must be declared with
+`#[abi(optional)]` and are omitted when `None`.
+
+Enums encode as `[variant_id, payload]`. Unit variants use `null`; named variants use the same
+field-set encoding as structs:
+
+```rust
+use sacp_cbor_abi::{CborAbi, UnknownVariant};
+
+#[derive(Debug, PartialEq, Eq, CborAbi)]
+#[abi(type_id = "ledger.Command", version = 1)]
+enum Command {
+    #[abi(id = 1)]
+    Route {
+        #[abi(id = 1)]
+        transfer_id: String,
+        #[abi(id = 2)]
+        priority: u64,
+    },
+    #[abi(id = 2)]
+    Ping,
+    #[abi(unknown)]
+    Unknown(UnknownVariant),
 }
 ```
 
-- Structs encode as field-set arrays: `[field_id, value, ...]`, sorted by field ID.
-- Enums encode as `[variant_id, payload]`; named variants use field-set payloads and unit variants use `null`.
-- Required `Option<T>` fields are rejected; optional fields are omitted when `None`.
-- Field types use stable `TypeRef` values; Rust path spelling is not schema identity.
-- `wire_hash` covers wire-significant schema data; `full_hash` also covers version and diagnostic names.
-- `sacp_cbor_abi::diff` reports `new_reads_old`, `old_reads_new`, and `old_preserves_new`.
-- Unknown fields can be rejected, ignored, or preserved with `UnknownFields`.
-- Unknown enum variants can be preserved with an `#[abi(unknown)]` variant.
-- Transparent newtypes encode exactly like their inner type while keeping a named ABI identity.
-- Lifetime-only ABI types can borrow decoded text and canonical sub-values from the input.
-- Facade crates can route generated code with `#[abi(crate = path::to::abi, cbor = path::to::cbor)]`.
+Unknown enum variants are rejected unless the enum has one `#[abi(unknown)]` variant. Preserved
+unknown variants retain the numeric variant ID and the borrowed/owned canonical payload.
+
+### Zero-copy views
+
+`#[derive(CborAbi)]` also generates a borrowed `TypeView<'a>` for read-heavy hot paths. A view is
+a validated ABI witness over canonical bytes: construction validates the ABI shell, required fields,
+ID order, and unknown-field policy, while accessors decode only the selected field payload.
+
+```rust
+let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+let view = TransferView::from_canonical(canon.as_canonical_ref())?;
+
+assert_eq!(view.amount()?, 5000);
+assert_eq!(view.memo()?, None);
+
+let raw_amount = view.amount_raw()?;
+assert_eq!(raw_amount.as_bytes(), &[0x19, 0x13, 0x88]); // 5000
+
+let owned_again = view.to_owned()?;
+assert_eq!(owned_again, value);
+```
+
+View accessor mapping is chosen for borrowing:
+
+- `String` and `&str` fields return `&'a str`.
+- `Bytes` and `BytesRef` fields return `BytesRef<'a>`.
+- `CanonicalCbor` and `CanonicalCborRef` fields return `CanonicalCborRef<'a>`.
+- `Vec<T>` fields return `AbiArrayView<'a, T>`; array elements are decoded when accessed.
+- Nested ABI types return their generated nested views.
+- `Option<T>` is represented by field presence and returns `Option<T::View>`.
+
+Named enum payload views are validated and cached during enum view construction, so repeated
+`as_route()` calls do not rescan the payload field-set. Transparent newtypes encode exactly like
+their inner type while keeping a named ABI identity; if `#[abi(try_from = "...")]` is present, the
+view constructor enforces the same invariant as owned decode.
+
+### Unknown fields
+
+Unknown fields can be rejected, ignored, or preserved. Preserve mode is the right choice when a
+service must forward fields introduced by a newer peer:
+
+```rust
+use sacp_cbor_abi::{CborAbi, UnknownFields};
+
+#[derive(Debug, PartialEq, Eq, CborAbi)]
+#[abi(
+    type_id = "ledger.TransferEnvelope",
+    version = 1,
+    unknown_fields = "preserve"
+)]
+struct TransferEnvelope {
+    #[abi(id = 1)]
+    transfer: Transfer,
+    #[abi(unknown_fields)]
+    unknown: UnknownFields,
+}
+```
+
+Owned decode stores preserved unknown fields as owned `CanonicalCbor`. The generated view exposes
+`unknown_fields()` as borrowed `UnknownFieldRef<'a>`, so forwarding or patching can inspect unknowns
+without copying their payloads.
+
+### Schema compatibility
+
+Rust names are diagnostic metadata; schema identity comes from `type_id`, numeric IDs, and stable
+field `TypeRef` values. Use `wire_hash` for wire compatibility and `full_hash` when diagnostics and
+version should be part of the identity:
+
+```rust
+use sacp_cbor_abi::{AbiType, CborAbi, CompatibilityClass, UnknownFields};
+
+#[derive(CborAbi)]
+#[abi(type_id = "ledger.Transfer", version = 1, unknown_fields = "preserve")]
+struct TransferV1 {
+    #[abi(id = 1)]
+    from: u64,
+    #[abi(id = 2)]
+    to: u64,
+    #[abi(id = 3)]
+    amount: u64,
+    #[abi(unknown_fields)]
+    unknown: UnknownFields,
+}
+
+#[derive(CborAbi)]
+#[abi(type_id = "ledger.Transfer", version = 2, unknown_fields = "preserve")]
+struct TransferV2 {
+    #[abi(id = 1)]
+    from: u64,
+    #[abi(id = 2)]
+    to: u64,
+    #[abi(id = 3)]
+    amount: u64,
+    #[abi(id = 4, optional)]
+    memo: Option<String>,
+    #[abi(unknown_fields)]
+    unknown: UnknownFields,
+}
+
+let report = sacp_cbor_abi::diff(&TransferV1::schema(), &TransferV2::schema());
+assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
+assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
+assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
+```
+
+### Facade crates
+
+Facade crates can route generated code through their own public module layout. The facade must
+re-export the ABI runtime items used by generated code:
+
+```rust
+pub mod wire {
+    pub mod abi {
+        pub use sacp_cbor_abi::*;
+    }
+    pub mod cbor {
+        pub use sacp_cbor::{
+            CanonicalCbor, CborDecode, CborError, Decoder, Encoder, ErrorCode,
+        };
+    }
+}
+
+use crate::wire::abi::CborAbi;
+
+#[derive(CborAbi)]
+#[abi(
+    crate = crate::wire::abi,
+    cbor = crate::wire::cbor,
+    type_id = "facade.Transfer",
+    version = 1
+)]
+struct FacadeTransfer {
+    #[abi(id = 1)]
+    amount: u64,
+}
+```
+
+Use the owned path (`encode_to_vec`, `decode`, `decode_canonical`) for business logic and re-encode.
+Use the generated view path for routing, filtering, forwarding, and patching where only a subset of
+fields is needed.
 
 ---
 

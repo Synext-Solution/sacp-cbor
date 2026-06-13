@@ -75,6 +75,7 @@ pub struct MapDecoder<'a, 'de, const CHECKED: bool> {
 
 /// Raw parts of one consumed integer-kind value (the single counted
 /// funnel behind every integer decode).
+#[cfg(feature = "alloc")]
 enum IntegerParts<'de> {
     SafePos(u64),
     SafeNeg(u64),
@@ -373,11 +374,13 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// raw parts plus the header offset. The counted funnel for the
     /// arbitrary-precision decoders (`BigInt`, `Integer`); the primitive
     /// paths below stay direct for hot-loop performance.
+    #[cfg(feature = "alloc")]
     fn parse_integer_parts(&mut self) -> Result<(IntegerParts<'de>, usize), CborError> {
         let result = self.parse_integer_parts_raw();
         self.seal_value(result)
     }
 
+    #[cfg(feature = "alloc")]
     fn parse_integer_parts_raw(&mut self) -> Result<(IntegerParts<'de>, usize), CborError> {
         let (major, ai, off) = self.read_header()?;
         match major {

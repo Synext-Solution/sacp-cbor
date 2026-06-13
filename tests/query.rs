@@ -206,6 +206,10 @@ fn kind_and_bignum_accessors() {
         .unwrap();
     assert!(!big.is_negative());
     assert_eq!(big.magnitude(), &[0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+    let big_int = arr.get(8).unwrap().unwrap().integer().unwrap();
+    assert_eq!(big_int.as_u128(), Some(9_007_199_254_740_992));
+    assert_eq!(big_int.as_i128(), Some(9_007_199_254_740_992));
 }
 
 #[test]

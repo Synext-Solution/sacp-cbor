@@ -14,6 +14,10 @@ use syn::{
     PathArguments, Type,
 };
 
+mod view;
+
+use view::{derive_enum_view, derive_struct_view};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UnknownFieldMode {
     Reject,
@@ -104,14 +108,30 @@ pub fn derive_cbor_abi(input: TokenStream) -> TokenStream {
     let out = (|| -> syn::Result<proc_macro2::TokenStream> {
         validate_generics(&input.generics)?;
         let attrs = parse_container_attrs(&input.attrs)?;
-        match &input.data {
+        let codec = match &input.data {
             Data::Struct(data) => derive_struct(&input.ident, &input.generics, data, &attrs),
             Data::Enum(data) => derive_enum(&input.ident, &input.generics, data, &attrs),
             Data::Union(u) => Err(syn::Error::new(
                 u.union_token.span(),
                 "CborAbi does not support unions",
             )),
-        }
+        }?;
+        let view = match &input.data {
+            Data::Struct(data) => {
+                derive_struct_view(&input.vis, &input.ident, &input.generics, data, &attrs)
+            }
+            Data::Enum(data) => {
+                derive_enum_view(&input.vis, &input.ident, &input.generics, data, &attrs)
+            }
+            Data::Union(u) => Err(syn::Error::new(
+                u.union_token.span(),
+                "CborAbi does not support unions",
+            )),
+        }?;
+        Ok(quote! {
+            #codec
+            #view
+        })
     })();
 
     match out {
@@ -145,6 +165,16 @@ fn decode_ty_generics(generics: &Generics) -> proc_macro2::TokenStream {
     }
 }
 
+fn ty_generics_with_lifetime(generics: &Generics, lifetime: &Lifetime) -> proc_macro2::TokenStream {
+    let count = generics.lifetimes().count();
+    if count == 0 {
+        quote! {}
+    } else {
+        let lifetimes = (0..count).map(|_| quote!(#lifetime));
+        quote!(<#(#lifetimes),*>)
+    }
+}
+
 fn decode_type(ty: &Type) -> Type {
     struct DecodeLifetime;
 
@@ -162,6 +192,28 @@ fn decode_type(ty: &Type) -> Type {
     }
 
     DecodeLifetime.fold_type(ty.clone())
+}
+
+fn view_type(ty: &Type, lifetime: &Lifetime) -> Type {
+    struct ViewLifetime {
+        lifetime: Lifetime,
+    }
+
+    impl Fold for ViewLifetime {
+        fn fold_lifetime(&mut self, _: Lifetime) -> Lifetime {
+            self.lifetime.clone()
+        }
+
+        fn fold_type_reference(&mut self, mut node: syn::TypeReference) -> syn::TypeReference {
+            node.lifetime = Some(self.lifetime.clone());
+            fold::fold_type_reference(self, node)
+        }
+    }
+
+    ViewLifetime {
+        lifetime: lifetime.clone(),
+    }
+    .fold_type(ty.clone())
 }
 
 fn parse_container_attrs(attrs: &[Attribute]) -> syn::Result<ContainerAttr> {
@@ -449,6 +501,12 @@ fn named_field_specs(fields: &syn::FieldsNamed) -> syn::Result<FieldSetSpec<'_>>
         let id = attr
             .id
             .ok_or_else(|| syn::Error::new(field.span(), "missing `abi(id = N)`"))?;
+        if id == 0 {
+            return Err(syn::Error::new(
+                field.span(),
+                "ABI field ID must be nonzero",
+            ));
+        }
         if seen.contains(&id) {
             return Err(syn::Error::new(
                 field.span(),
@@ -774,6 +832,12 @@ fn enum_variant_specs<'a>(
         let id = attr
             .id
             .ok_or_else(|| syn::Error::new(variant.span(), "missing `abi(id = N)` on variant"))?;
+        if id == 0 {
+            return Err(syn::Error::new(
+                variant.span(),
+                "ABI variant ID must be nonzero",
+            ));
+        }
         if seen.contains(&id) {
             return Err(syn::Error::new(
                 variant.span(),
@@ -1101,6 +1165,12 @@ fn decode_field_set_body(
                 #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ))?;
+            if __abi_id == 0 {
+                return Err(#cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::InvalidAbiValue,
+                    __abi_id_off,
+                ));
+            }
             if let ::core::option::Option::Some(prev) = __abi_prev_id {
                 if __abi_id == prev {
                     return Err(#cbor_path::CborError::new(
@@ -1284,6 +1354,12 @@ fn decode_enum_body(
             #cbor_path::ErrorCode::ArrayLenMismatch,
             __abi_arr_off,
         ))?;
+        if __abi_id == 0 {
+            return Err(#cbor_path::CborError::new(
+                #cbor_path::ErrorCode::InvalidAbiValue,
+                __abi_id_off,
+            ));
+        }
         match __abi_id {
             #(#arms,)*
             #unknown_arm

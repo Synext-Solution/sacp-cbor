@@ -39,6 +39,19 @@ Results are written to:
 
 ## Workloads
 
+ABI-specific scenarios are also part of this suite:
+`abi_decode_owned`, `abi_view_access`, `abi_unknown_preserve`, and
+`abi_enum_access`. They use `abi_flat4`, `abi_flat16`, `abi_text4k`, and
+`abi_blob64k` style messages to compare generated owned ABI decode against
+generated zero-copy ABI views.
+
+ABI benchmark implementation IDs distinguish trust boundaries:
+`abi-view` / `view` start from an already validated `CanonicalCborRef`,
+`abi-view-checked` / `view-checked` include validation from untrusted bytes,
+and `abi-owned-trusted` / `owned-trusted` decode owned values from an already
+validated canonical witness. Array-specific view costs are tracked separately
+with `abi-view-array-get-last`.
+
 Deterministically generated SACP message shapes (seeded xorshift, identical on
 every machine — see `bench_harness::datasets::workloads`):
 
