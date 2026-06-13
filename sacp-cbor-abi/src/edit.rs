@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use sacp_cbor::query::CborValueRef;
 use sacp_cbor::{CanonicalCbor, CborError, Encoder, ErrorCode};
 
-use crate::{AbiFieldSetRef, __private};
+use crate::AbiFieldSetRef;
 
 /// Value inserted by an ABI field-set edit.
 #[derive(Debug, Clone)]
@@ -178,7 +178,7 @@ impl<'a> AbiFieldSetEditor<'a> {
                 Self::emit_existing_op(array, &self.ops[op_index])?;
                 op_index += 1;
             } else {
-                __private::encode_field_id(array, entry.id)?;
+                crate::__private::encode_field_id(array, entry.id)?;
                 array.raw_value_ref(entry.value)?;
             }
         }
@@ -194,7 +194,7 @@ impl<'a> AbiFieldSetEditor<'a> {
         op: &AbiFieldSetOp<'a>,
     ) -> Result<(), CborError> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
-            __private::encode_field_id(array, *id)?;
+            crate::__private::encode_field_id(array, *id)?;
             Self::emit_patch_value(array, value)?;
         }
         Ok(())
@@ -205,7 +205,7 @@ impl<'a> AbiFieldSetEditor<'a> {
         op: &AbiFieldSetOp<'a>,
     ) -> Result<(), CborError> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
-            __private::encode_field_id(array, *id)?;
+            crate::__private::encode_field_id(array, *id)?;
             Self::emit_patch_value(array, value)?;
         }
         Ok(())
