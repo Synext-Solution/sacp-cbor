@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.6.0 `sacp-cbor-abi` release
+
+Published crates:
+
+- `sacp-cbor-abi` 0.6.0
+
+### `sacp-cbor-abi`
+
+- Fixed a serious runtime validation performance regression introduced in 0.5.0: no-hook
+  `RuntimeFieldSetSchema::validate_value` and `RuntimeFieldSetView::get_checked` now use a
+  dedicated no-hook validation engine instead of the hook-aware enter/exit callback engine.
+- Reduced runtime error layout pressure by compacting `RuntimeAbiError::HookRejected.offset` to
+  `u32` and adding `RuntimeAbiError::hook_rejected(reason, offset)` for ergonomic saturated
+  construction from `usize` offsets.
+- Restored the no-hook runtime validation hot path to zero hook callback work while keeping the
+  explicit hook APIs and their balanced enter/exit semantics unchanged.
+- This release is source-breaking relative to 0.5.0 for code that directly constructs or matches
+  `RuntimeAbiError::HookRejected { offset }` as a `usize`; use
+  `RuntimeAbiError::hook_rejected(...)` or match the compact `u32` field.
+
 ## 0.5.0 `sacp-cbor-abi` release
 
 Published crates:

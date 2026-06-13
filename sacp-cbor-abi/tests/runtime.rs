@@ -109,7 +109,7 @@ fn assert_cbor_code(err: RuntimeAbiError, code: ErrorCode) {
 }
 
 fn assert_hook_rejected(err: RuntimeAbiError, reason: &'static str, offset: usize) {
-    assert_eq!(err, RuntimeAbiError::HookRejected { reason, offset });
+    assert_eq!(err, RuntimeAbiError::hook_rejected(reason, offset));
 }
 
 fn inline_mode() -> RuntimeInline {
@@ -409,10 +409,10 @@ impl RuntimeValidationHooks for RejectFieldHook {
         value: CborValueRef<'_>,
     ) -> Result<(), RuntimeAbiError> {
         if field.id == 1 {
-            return Err(RuntimeAbiError::HookRejected {
-                reason: "field-refinement",
-                offset: value.offset(),
-            });
+            return Err(RuntimeAbiError::hook_rejected(
+                "field-refinement",
+                value.offset(),
+            ));
         }
         Ok(())
     }
@@ -461,10 +461,10 @@ impl RuntimeValidationHooks for TypeRefinementHook {
                         sacp_cbor::CborError::new(ErrorCode::ExpectedInteger, offset)
                     })?;
                     if prev.is_some_and(|prev| item <= prev) {
-                        return Err(RuntimeAbiError::HookRejected {
-                            reason: "vec-sorted-unique",
-                            offset: value.offset(),
-                        });
+                        return Err(RuntimeAbiError::hook_rejected(
+                            "vec-sorted-unique",
+                            value.offset(),
+                        ));
                     }
                     prev = Some(item);
                 }
@@ -474,10 +474,7 @@ impl RuntimeValidationHooks for TypeRefinementHook {
         };
 
         if let Some(reason) = reason {
-            Err(RuntimeAbiError::HookRejected {
-                reason,
-                offset: value.offset(),
-            })
+            Err(RuntimeAbiError::hook_rejected(reason, value.offset()))
         } else {
             Ok(())
         }

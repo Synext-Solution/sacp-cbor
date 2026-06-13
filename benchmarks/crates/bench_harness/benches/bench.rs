@@ -308,10 +308,10 @@ impl sacp_cbor_abi::RuntimeValidationHooks for AbiVecSortedUniqueHook {
             sacp_cbor::CborError::new(sacp_cbor::ErrorCode::ExpectedInteger, value.offset())
         })?;
         if self.prev.is_some_and(|prev| item <= prev) {
-            return Err(sacp_cbor_abi::RuntimeAbiError::HookRejected {
-                reason: "values not sorted unique",
-                offset: value.offset(),
-            });
+            return Err(sacp_cbor_abi::RuntimeAbiError::hook_rejected(
+                "values not sorted unique",
+                value.offset(),
+            ));
         }
         self.prev = Some(item);
         Ok(())

@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "sacp-cbor-abi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "sacp-cbor",
  "sacp-cbor-abi-derive",

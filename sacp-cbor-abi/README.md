@@ -13,7 +13,7 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 ```toml
 [dependencies]
 sacp-cbor = "0.17"
-sacp-cbor-abi = "0.5"
+sacp-cbor-abi = "0.6"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,7 +21,7 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.5", default-features = false }
+sacp-cbor-abi = { version = "0.6", default-features = false }
 ```
 
 ## Struct ABI
@@ -150,10 +150,10 @@ impl RuntimeValidationHooks for AmountHook {
             && ctx.field.is_some_and(|field| field.id == 3)
             && value.integer()?.as_u128() == Some(0)
         {
-            return Err(RuntimeAbiError::HookRejected {
-                reason: "amount must be nonzero",
-                offset: value.offset(),
-            });
+            return Err(RuntimeAbiError::hook_rejected(
+                "amount must be nonzero",
+                value.offset(),
+            ));
         }
         Ok(())
     }

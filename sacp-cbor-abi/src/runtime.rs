@@ -170,14 +170,32 @@ pub enum RuntimeAbiError {
     HookRejected {
         /// Static rejection reason.
         reason: &'static str,
-        /// Offset of the rejected canonical CBOR value.
-        offset: usize,
+        /// Offset of the rejected canonical CBOR value, saturated to `u32::MAX`.
+        offset: u32,
     },
 }
 
 impl From<CborError> for RuntimeAbiError {
     fn from(err: CborError) -> Self {
         Self::Cbor(err)
+    }
+}
+
+impl RuntimeAbiError {
+    /// Construct a hook rejection error.
+    ///
+    /// The stored offset is saturated to keep the runtime error type compact on validation hot
+    /// paths.
+    #[must_use]
+    pub const fn hook_rejected(reason: &'static str, offset: usize) -> Self {
+        Self::HookRejected {
+            reason,
+            offset: if offset > u32::MAX as usize {
+                u32::MAX
+            } else {
+                offset as u32
+            },
+        }
     }
 }
 
@@ -527,8 +545,7 @@ impl<'s> RuntimeFieldSetSchema<'s> {
         mode: M,
         config: RuntimeValidationConfig,
     ) -> Result<RuntimeFieldSetView<'a, 's>, RuntimeAbiError> {
-        let mut hooks = NoRuntimeValidationHooks;
-        self.validate_value_inner(value, &mode, config, 0, &mut hooks)
+        self.validate_value_no_hooks(value, &mode, config, 0)
     }
 
     /// Validate a field-set value using a static runtime type-validation mode and hooks.
@@ -553,6 +570,53 @@ impl<'s> RuntimeFieldSetSchema<'s> {
         let raw = AbiFieldSetRef::scan(value, |entry| {
             self.validate_shell_entry(entry, &mut required, &mut field_cursor)
         })?;
+
+        if !required.all_seen(self.required_count) {
+            return Err(CborError::new(ErrorCode::MissingKey, value.offset()).into());
+        }
+
+        Ok(RuntimeFieldSetView { raw, schema: self })
+    }
+
+    #[inline]
+    fn validate_value_no_hooks<'a, M: RuntimeTypeMode>(
+        &'s self,
+        value: CborValueRef<'a>,
+        mode: &M,
+        config: RuntimeValidationConfig,
+        depth: usize,
+    ) -> Result<RuntimeFieldSetView<'a, 's>, RuntimeAbiError> {
+        let mut required = RequiredSeen::new(self.required_count)?;
+        let mut runtime_error = None;
+        let mut field_cursor = 0usize;
+        let raw = match AbiFieldSetRef::scan(value, |entry| {
+            match self.validate_entry_no_hooks(
+                entry,
+                mode,
+                config,
+                depth,
+                &mut required,
+                &mut field_cursor,
+            ) {
+                Ok(()) => Ok(()),
+                Err(RuntimeAbiError::Cbor(err)) => Err(err),
+                Err(err) => {
+                    runtime_error = Some(err);
+                    Err(CborError::new(
+                        ErrorCode::InvalidAbiValue,
+                        entry.value.offset(),
+                    ))
+                }
+            }
+        }) {
+            Ok(raw) => raw,
+            Err(err) => {
+                if let Some(err) = runtime_error {
+                    return Err(err);
+                }
+                return Err(err.into());
+            }
+        };
 
         if !required.all_seen(self.required_count) {
             return Err(CborError::new(ErrorCode::MissingKey, value.offset()).into());
@@ -629,6 +693,34 @@ impl<'s> RuntimeFieldSetSchema<'s> {
             }
             None if self.def.unknown_fields == UnknownFieldPolicy::Reject => {
                 Err(CborError::new(ErrorCode::UnknownField, entry.id_offset))
+            }
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn validate_entry_no_hooks<'a, M: RuntimeTypeMode>(
+        &'s self,
+        entry: AbiFieldEntryRef<'a>,
+        mode: &M,
+        config: RuntimeValidationConfig,
+        depth: usize,
+        required: &mut RequiredSeen,
+        field_cursor: &mut usize,
+    ) -> Result<(), RuntimeAbiError> {
+        while *field_cursor < self.fields.len() && self.fields[*field_cursor].id < entry.id {
+            *field_cursor += 1;
+        }
+
+        match self.field_info_at_cursor(entry.id, *field_cursor) {
+            Some(info) => {
+                if let Some(index) = info.required_index {
+                    required.mark(index);
+                }
+                validate_type_ref_no_hooks(&info.def.ty, entry.value, mode, config, depth)
+            }
+            None if self.def.unknown_fields == UnknownFieldPolicy::Reject => {
+                Err(CborError::new(ErrorCode::UnknownField, entry.id_offset).into())
             }
             None => Ok(()),
         }
@@ -777,8 +869,13 @@ impl<'a, 's> RuntimeFieldSetView<'a, 's> {
         mode: M,
         config: RuntimeValidationConfig,
     ) -> Result<Option<CborValueRef<'a>>, RuntimeAbiError> {
-        let mut hooks = NoRuntimeValidationHooks;
-        self.get_checked_with_hooks(id, mode, config, &mut hooks)
+        let Some(value) = self.raw.get(id)? else {
+            return Ok(None);
+        };
+        if let Some(info) = self.schema.field_info(id) {
+            validate_type_ref_no_hooks(&info.def.ty, value, &mode, config, 0)?;
+        }
+        Ok(Some(value))
     }
 
     /// Return one raw field after validating its known runtime type with hooks.
@@ -872,6 +969,28 @@ impl<'a, 's> RuntimeFieldSetView<'a, 's> {
 }
 
 #[inline]
+fn validate_runtime_schema_no_hooks<M: RuntimeTypeMode>(
+    schema: &RuntimeSchema<'_>,
+    value: CborValueRef<'_>,
+    mode: &M,
+    config: RuntimeValidationConfig,
+    depth: usize,
+) -> Result<(), RuntimeAbiError> {
+    match schema {
+        RuntimeSchema::Struct(field_set) => {
+            field_set.validate_value_no_hooks(value, mode, config, depth)?;
+            Ok(())
+        }
+        RuntimeSchema::Transparent { inner } => {
+            validate_type_ref_no_hooks(inner, value, mode, config, depth)
+        }
+        RuntimeSchema::Primitive { ty } => {
+            validate_type_ref_no_hooks(ty, value, mode, config, depth)
+        }
+    }
+}
+
+#[inline]
 fn validate_runtime_schema_with_hooks<'ctx, M: RuntimeTypeMode, H: RuntimeValidationHooks>(
     schema: &RuntimeSchema<'_>,
     value: CborValueRef<'_>,
@@ -910,6 +1029,53 @@ fn validate_runtime_schema_with_hooks<'ctx, M: RuntimeTypeMode, H: RuntimeValida
                 field_set: parent_ctx.field_set,
             },
         ),
+    }
+}
+
+#[inline]
+fn validate_type_ref_no_hooks<M: RuntimeTypeMode>(
+    ty: &TypeRef,
+    value: CborValueRef<'_>,
+    mode: &M,
+    config: RuntimeValidationConfig,
+    depth: usize,
+) -> Result<(), RuntimeAbiError> {
+    match ty {
+        TypeRef::Unit => {
+            if value.is_null() {
+                Ok(())
+            } else {
+                Err(CborError::new(ErrorCode::ExpectedNull, value.offset()).into())
+            }
+        }
+        TypeRef::Bool => value.bool().map(|_| ()).map_err(Into::into),
+        TypeRef::U8 => validate_unsigned(value, u8::MAX as u128),
+        TypeRef::U16 => validate_unsigned(value, u16::MAX as u128),
+        TypeRef::U32 => validate_unsigned(value, u32::MAX as u128),
+        TypeRef::U64 => validate_unsigned(value, u64::MAX as u128),
+        TypeRef::I8 => validate_signed(value, i8::MIN as i128, i8::MAX as i128),
+        TypeRef::I16 => validate_signed(value, i16::MIN as i128, i16::MAX as i128),
+        TypeRef::I32 => validate_signed(value, i32::MIN as i128, i32::MAX as i128),
+        TypeRef::I64 => validate_signed(value, i64::MIN as i128, i64::MAX as i128),
+        TypeRef::Text => value.text().map(|_| ()).map_err(Into::into),
+        TypeRef::Bytes => value.bytes().map(|_| ()).map_err(Into::into),
+        TypeRef::FixedBytes { len } => {
+            let bytes = value.bytes()?;
+            if bytes.len() == *len as usize {
+                Ok(())
+            } else {
+                Err(CborError::new(ErrorCode::ExpectedBytes, value.offset()).into())
+            }
+        }
+        TypeRef::Vec { item } => validate_vec_no_hooks(item, value, mode, config, depth),
+        TypeRef::CanonicalCbor => Ok(()),
+        TypeRef::Named { type_id, version } => match mode.resolve_named(type_id, *version)? {
+            RuntimeNamedResolution::Opaque => Ok(()),
+            RuntimeNamedResolution::Schema(schema) => {
+                let next_depth = enter_nested(depth, config)?;
+                validate_runtime_schema_no_hooks(schema, value, mode, config, next_depth)
+            }
+        },
     }
 }
 
@@ -985,6 +1151,27 @@ fn validate_type_ref_body_with_hooks<'ctx, M: RuntimeTypeMode, H: RuntimeValidat
             }
         }
     }
+}
+
+#[inline]
+fn validate_vec_no_hooks<M: RuntimeTypeMode>(
+    item: &TypeRef,
+    value: CborValueRef<'_>,
+    mode: &M,
+    config: RuntimeValidationConfig,
+    depth: usize,
+) -> Result<(), RuntimeAbiError> {
+    let array = value.array()?;
+    for item_value in array.iter() {
+        validate_type_ref_no_hooks(
+            item,
+            item_value?,
+            mode,
+            config,
+            enter_nested(depth, config)?,
+        )?;
+    }
+    Ok(())
 }
 
 #[inline]
