@@ -52,6 +52,14 @@ and `abi-owned-trusted` / `owned-trusted` decode owned values from an already
 validated canonical witness. Array-specific view costs are tracked separately
 with `abi-view-array-get-last`.
 
+Runtime ABI rows measure schema-guided validation without generated Rust
+types on the same ABI workloads. `abi-runtime-view` validates only the ABI
+field-set shell and uses one sorted multi-field raw lookup, while
+`abi-runtime-validate-inline` additionally checks known fields against their
+`TypeRef`s. The `*-checked` runtime rows include canonical validation from
+untrusted bytes. `abi_runtime_compile` measures the one-time schema compilation
+cost that consumers should pay outside hot message paths.
+
 Deterministically generated SACP message shapes (seeded xorshift, identical on
 every machine — see `bench_harness::datasets::workloads`):
 

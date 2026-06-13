@@ -1,6 +1,7 @@
 use sacp_cbor::{CanonicalCbor, DecodeLimits};
 use sacp_cbor_abi::{
-    decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass, UnknownFields, UnknownVariant,
+    compile_runtime_schema, decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass,
+    RuntimeAbiOptions, RuntimeSchema, RuntimeTypeValidation, UnknownFields, UnknownVariant,
 };
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
@@ -121,6 +122,25 @@ fn stable_public_abi_readme_examples_match_api() {
     assert_eq!(view.memo().unwrap(), None);
     assert_eq!(view.amount_raw().unwrap().as_bytes(), &[0x19, 0x13, 0x88]);
     assert_eq!(view.to_owned().unwrap(), value);
+
+    let schema = Transfer::schema();
+    let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap();
+    let options = RuntimeAbiOptions {
+        type_validation: RuntimeTypeValidation::InlineOnly,
+        max_recursion_depth: 32,
+    };
+    let runtime_view = runtime
+        .validate_value(canon.as_canonical_ref().root(), &options)
+        .unwrap();
+    assert_eq!(
+        runtime_view
+            .require_raw(3)
+            .unwrap()
+            .integer()
+            .unwrap()
+            .as_u128(),
+        Some(5000)
+    );
 }
 
 #[test]

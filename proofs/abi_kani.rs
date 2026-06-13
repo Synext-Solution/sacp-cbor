@@ -1,3 +1,4 @@
+use crate::runtime::{validate_sorted_schema_ids, RequiredSeen};
 use crate::view::{validate_abi_id_value, validate_sorted_query_ids};
 use sacp_cbor::{CborError, ErrorCode};
 
@@ -50,4 +51,38 @@ fn sorted_query_ids_accepts_exact_strict_nonzero_order_for_len3() {
     } else {
         assert_err(actual, ErrorCode::InvalidQuery);
     }
+}
+
+#[kani::proof]
+#[kani::unwind(4)]
+fn runtime_schema_ids_accept_exact_strict_nonzero_order_for_len3() {
+    let ids = [kani::any::<u32>(), kani::any::<u32>(), kani::any::<u32>()];
+    let actual = validate_sorted_schema_ids(&ids);
+    let valid = ids[0] != 0 && ids[1] != 0 && ids[2] != 0 && ids[0] < ids[1] && ids[1] < ids[2];
+
+    if valid {
+        assert!(actual.is_ok());
+    } else {
+        assert!(actual.is_err());
+    }
+}
+
+#[kani::proof]
+fn runtime_required_seen_small_bitset_tracks_len3_exactly() {
+    let mark0: bool = kani::any();
+    let mark1: bool = kani::any();
+    let mark2: bool = kani::any();
+    let mut seen = RequiredSeen::new(3).unwrap();
+
+    if mark0 {
+        seen.mark(0);
+    }
+    if mark1 {
+        seen.mark(1);
+    }
+    if mark2 {
+        seen.mark(2);
+    }
+
+    assert!(seen.all_seen(3) == (mark0 && mark1 && mark2));
 }

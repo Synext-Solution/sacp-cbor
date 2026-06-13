@@ -16,6 +16,7 @@ use sacp_cbor::{
 use sha2::{Digest, Sha256};
 
 mod edit;
+mod runtime;
 mod view;
 
 #[cfg(kani)]
@@ -23,6 +24,11 @@ mod view;
 mod proofs;
 
 pub use edit::{AbiDeleteMode, AbiFieldSetEditor, AbiPatchValue, AbiSetMode};
+pub use runtime::{
+    compile_runtime_schema, AbiSchemaRegistry, RuntimeAbiError, RuntimeAbiOptions,
+    RuntimeFieldInfo, RuntimeFieldRef, RuntimeFieldSetSchema, RuntimeFieldSetView, RuntimeSchema,
+    RuntimeTypeValidation,
+};
 #[cfg(feature = "derive")]
 pub use sacp_cbor_abi_derive::CborAbi;
 pub use view::{

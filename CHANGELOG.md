@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+## 0.4.1 `sacp-cbor-abi` release
+
+Published crates:
+
+- `sacp-cbor-abi` 0.4.1
+
+### `sacp-cbor-abi`
+
+- Added runtime schema-guided field-set validation and zero-copy views via
+  `RuntimeFieldSetSchema`, `RuntimeFieldSetView`, `RuntimeAbiOptions`,
+  `RuntimeTypeValidation`, `AbiSchemaRegistry`, and `compile_runtime_schema`.
+- Added shell-only and deep `TypeRef` validation modes for runtime field-sets,
+  including primitive bounds, fixed bytes, vectors, named-type reject/opaque
+  policy, registry-backed named-type resolution, and recursion limits.
+- Added sorted multi-field raw lookup for runtime views with
+  `RuntimeFieldSetView::get_many_raw_sorted_into`, so callers can retrieve
+  selected fields in one scan after validation.
+- Optimized runtime validation and iteration hot paths by exploiting sorted
+  field IDs with monotonic schema cursors instead of per-field binary search.
+- Added runtime ABI Criterion rows for trusted/checked runtime views,
+  inline deep validation, unknown-field preservation, and one-time schema
+  compilation cost.
+- Added Kani proof targets for runtime schema ID validation and required-field
+  bitset tracking.
+
 ## 0.17.3 workspace release
 
 Published crates:

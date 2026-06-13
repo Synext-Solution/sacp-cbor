@@ -227,6 +227,55 @@ static ABI_MESSAGE_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
 static ABI_FLAT16_WORKLOAD: OnceLock<AbiWorkload> = OnceLock::new();
 static ABI_UNKNOWN_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
 static ABI_COMMAND_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
+static ABI_MESSAGE_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
+static ABI_MESSAGE_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
+    OnceLock::new();
+static ABI_UNKNOWN_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
+static ABI_UNKNOWN_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
+    OnceLock::new();
+
+fn runtime_inline_options() -> sacp_cbor_abi::RuntimeAbiOptions<'static> {
+    sacp_cbor_abi::RuntimeAbiOptions {
+        type_validation: sacp_cbor_abi::RuntimeTypeValidation::InlineOnly,
+        max_recursion_depth: 32,
+    }
+}
+
+fn abi_message_schema() -> &'static sacp_cbor_abi::Schema {
+    ABI_MESSAGE_SCHEMA.get_or_init(|| {
+        Box::leak(Box::new(
+            <AbiBenchMessage as sacp_cbor_abi::AbiType>::schema(),
+        ))
+    })
+}
+
+fn abi_message_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
+    ABI_MESSAGE_RUNTIME.get_or_init(|| {
+        match sacp_cbor_abi::compile_runtime_schema(abi_message_schema())
+            .expect("compile runtime ABI message schema")
+        {
+            sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+        }
+    })
+}
+
+fn abi_unknown_schema() -> &'static sacp_cbor_abi::Schema {
+    ABI_UNKNOWN_SCHEMA.get_or_init(|| {
+        Box::leak(Box::new(
+            <AbiUnknownPreserve as sacp_cbor_abi::AbiType>::schema(),
+        ))
+    })
+}
+
+fn abi_unknown_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
+    ABI_UNKNOWN_RUNTIME.get_or_init(|| {
+        match sacp_cbor_abi::compile_runtime_schema(abi_unknown_schema())
+            .expect("compile runtime ABI unknown schema")
+        {
+            sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+        }
+    })
+}
 
 fn abi_payload(len: usize) -> sacp_cbor::bytes::Bytes {
     let bytes = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
@@ -573,6 +622,10 @@ fn bench_abi_decode_owned(c: &mut Criterion) {
 
 fn bench_abi_view_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("abi_view_access");
+    let runtime_schema = abi_message_runtime_schema();
+    let runtime_options = runtime_inline_options();
+    const ROUTING_IDS: &[u32] = &[1, 2, 3, 4];
+
     for data in abi_message_workloads() {
         let bytes = data.canon.as_bytes();
         group.throughput(Throughput::Bytes(bytes.len() as u64));
@@ -589,6 +642,42 @@ fn bench_abi_view_access(c: &mut Criterion) {
             })
         });
 
+        group.bench_function(BenchmarkId::new("abi-runtime-view", data.name), |b| {
+            b.iter(|| {
+                let view = runtime_schema
+                    .view_value(black_box(data.canon.as_canonical_ref()).root())
+                    .unwrap();
+                let mut out = [None; 4];
+                view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                    .unwrap();
+                black_box(out[0].unwrap().text().unwrap());
+                black_box(out[1].unwrap().text().unwrap());
+                black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                black_box(out[3].unwrap().text().unwrap());
+            })
+        });
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-validate-inline", data.name),
+            |b| {
+                b.iter(|| {
+                    let view = runtime_schema
+                        .validate_value(
+                            black_box(data.canon.as_canonical_ref()).root(),
+                            &runtime_options,
+                        )
+                        .unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
+
         group.bench_function(BenchmarkId::new("abi-view-checked", data.name), |b| {
             b.iter(|| {
                 let canon = sacp_cbor::validate_canonical(
@@ -603,6 +692,50 @@ fn bench_abi_view_access(c: &mut Criterion) {
                 black_box(view.route().unwrap());
             })
         });
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-view-checked", data.name),
+            |b| {
+                b.iter(|| {
+                    let canon = sacp_cbor::validate_canonical(
+                        black_box(bytes),
+                        DecodeLimits::for_bytes(bytes.len()),
+                    )
+                    .unwrap();
+                    let view = runtime_schema.view_value(canon.root()).unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-validate-inline-checked", data.name),
+            |b| {
+                b.iter(|| {
+                    let canon = sacp_cbor::validate_canonical(
+                        black_box(bytes),
+                        DecodeLimits::for_bytes(bytes.len()),
+                    )
+                    .unwrap();
+                    let view = runtime_schema
+                        .validate_value(canon.root(), &runtime_options)
+                        .unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
 
         group.bench_function(
             BenchmarkId::new("abi-view-array-get-last", data.name),
@@ -642,6 +775,7 @@ fn bench_abi_view_access(c: &mut Criterion) {
 
 fn bench_abi_unknown_preserve(c: &mut Criterion) {
     let mut group = c.benchmark_group("abi_unknown_preserve");
+    let runtime_schema = abi_unknown_runtime_schema();
     for data in abi_unknown_workloads() {
         let bytes = data.canon.as_bytes();
         group.throughput(Throughput::Bytes(bytes.len() as u64));
@@ -704,7 +838,69 @@ fn bench_abi_unknown_preserve(c: &mut Criterion) {
                 black_box(count);
             })
         });
+
+        group.bench_function(BenchmarkId::new("runtime-preserve-view", data.name), |b| {
+            b.iter(|| {
+                let view = runtime_schema
+                    .view_value(black_box(data.canon.as_canonical_ref()).root())
+                    .unwrap();
+                let count = view
+                    .unknown_fields()
+                    .unwrap()
+                    .map(|field| field.unwrap().value.byte_len())
+                    .sum::<usize>();
+                black_box(count);
+            })
+        });
+
+        group.bench_function(
+            BenchmarkId::new("runtime-preserve-view-checked", data.name),
+            |b| {
+                b.iter(|| {
+                    let canon = sacp_cbor::validate_canonical(
+                        black_box(bytes),
+                        DecodeLimits::for_bytes(bytes.len()),
+                    )
+                    .unwrap();
+                    let view = runtime_schema.view_value(canon.root()).unwrap();
+                    let count = view
+                        .unknown_fields()
+                        .unwrap()
+                        .map(|field| field.unwrap().value.byte_len())
+                        .sum::<usize>();
+                    black_box(count);
+                })
+            },
+        );
     }
+    group.finish();
+}
+
+fn bench_abi_runtime_compile(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_runtime_compile");
+
+    if let sacp_cbor_abi::TypeDef::Struct(def) = &abi_message_schema().root {
+        group.bench_function(BenchmarkId::new("runtime-compile", "abi_message"), |b| {
+            b.iter(|| {
+                let schema = sacp_cbor_abi::RuntimeFieldSetSchema::compile(black_box(def)).unwrap();
+                black_box(schema);
+            })
+        });
+    }
+
+    if let sacp_cbor_abi::TypeDef::Struct(def) = &abi_unknown_schema().root {
+        group.bench_function(
+            BenchmarkId::new("runtime-compile", "unknown_preserve"),
+            |b| {
+                b.iter(|| {
+                    let schema =
+                        sacp_cbor_abi::RuntimeFieldSetSchema::compile(black_box(def)).unwrap();
+                    black_box(schema);
+                })
+            },
+        );
+    }
+
     group.finish();
 }
 
@@ -1170,6 +1366,7 @@ criterion_group! {
         bench_abi_view_access,
         bench_abi_unknown_preserve,
         bench_abi_enum_access,
+        bench_abi_runtime_compile,
         bench_patch,
         bench_appendix_a,
         bench_micro_query,

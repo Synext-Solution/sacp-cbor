@@ -105,6 +105,39 @@ Borrowed accessor mapping:
 - Nested ABI types return their generated nested views.
 - `Option<T>` is represented by field presence and returns `Option<T::View>`.
 
+## Runtime field-set views
+
+Runtime systems can validate and inspect field-set values from a `Schema` without a generated Rust
+type. Compile the schema once, then validate many canonical messages without copying field values:
+
+```rust
+use sacp_cbor_abi::{
+    compile_runtime_schema, RuntimeAbiOptions, RuntimeSchema, RuntimeTypeValidation,
+};
+
+let schema = Transfer::schema();
+let runtime = match compile_runtime_schema(&schema)? {
+    RuntimeSchema::Struct(runtime) => runtime,
+};
+
+let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+
+// Shell-only validation checks field-set shape, required fields, ordering, duplicates,
+// and unknown-field policy.
+let view = runtime.view_value(canon.as_canonical_ref().root())?;
+
+let raw_amount = view.require_raw(3)?;
+assert_eq!(raw_amount.integer()?.as_u128(), Some(5000));
+
+// Deep validation additionally checks known field values against their TypeRef.
+let options = RuntimeAbiOptions {
+    type_validation: RuntimeTypeValidation::InlineOnly,
+    max_recursion_depth: 32,
+};
+let checked = runtime.validate_value(canon.as_canonical_ref().root(), &options)?;
+assert!(checked.get_checked(4, &options)?.is_none());
+```
+
 ## Enums
 
 Enums encode as `[variant_id, payload]`. Unit variants use `null`; named variants use field-set
