@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## 0.5.0 `sacp-cbor-abi` release
+
+Published crates:
+
+- `sacp-cbor-abi` 0.5.0
+
+### `sacp-cbor-abi`
+
+- Added runtime validation hooks with field, type, named-type, vector, vector-item,
+  and balanced exit callbacks for semantic refinements on top of ABI validation.
+- Added `RuntimeNamedDecision::Accepted` as the only hook-controlled validation
+  replacement path, limited to `TypeRef::Named`; primitive and container ABI
+  validation cannot be bypassed by hooks.
+- Added hook-aware `validate_value_with_hooks` and `get_checked_with_hooks` on
+  top of generic/static-dispatch runtime modes; no-hook validation uses
+  monomorphized `NoRuntimeValidationHooks`.
+- Replaced runtime validation options with the lean static mode API:
+  `RuntimeInline`, `RuntimeRejectNamed`, `RuntimeResolveNamed<R>`,
+  `RuntimeTypeMode`, and `RuntimeValidationConfig`.
+- Changed `AbiSchemaRegistry` to return compiled `RuntimeSchema` values so named
+  recursion avoids schema compilation and allocation on the validation hot path.
+- Extended `RuntimeSchema` to cover struct, transparent, and primitive roots;
+  runtime enum views remain unsupported.
+- Added Criterion rows for concrete no-op hooks, concrete field hooks, named
+  compiled-registry validation, named hook acceptance, and vector sorted/unique
+  hook validation.
+- Added a required Kani CI job for the ABI proof harnesses before release.
+- **Breaking:** Removed `RuntimeAbiOptions` and `RuntimeTypeValidation`; callers
+  now pass a static runtime type mode directly and pass recursion limits through
+  `RuntimeValidationConfig` only where needed.
+- **Breaking:** `RuntimeFieldSetSchema::validate_value` and
+  `RuntimeFieldSetView::get_checked` now take generic `RuntimeTypeMode`
+  values.
+- **Breaking:** `RuntimeFieldSetSchema::validate_value_with_hooks` and
+  `RuntimeFieldSetView::get_checked_with_hooks` now take
+  `(mode, RuntimeValidationConfig, hooks)` and require concrete hook types for
+  the normal public hot path.
+- **Breaking:** `AbiSchemaRegistry::resolve` now returns a compiled
+  `RuntimeSchema` instead of a raw `Schema`.
+- **Breaking:** `RuntimeAbiError` is now `#[non_exhaustive]` and includes
+  `HookRejected`.
+
 ## 0.4.1 `sacp-cbor-abi` release
 
 Published crates:

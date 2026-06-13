@@ -13,7 +13,7 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 ```toml
 [dependencies]
 sacp-cbor = "0.17"
-sacp-cbor-abi = "0.4"
+sacp-cbor-abi = "0.5"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,7 +21,7 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.4", default-features = false }
+sacp-cbor-abi = { version = "0.5", default-features = false }
 ```
 
 ## Struct ABI
@@ -112,12 +112,14 @@ type. Compile the schema once, then validate many canonical messages without cop
 
 ```rust
 use sacp_cbor_abi::{
-    compile_runtime_schema, RuntimeAbiOptions, RuntimeSchema, RuntimeTypeValidation,
+    compile_runtime_schema, RuntimeAbiError, RuntimeHookOutcome, RuntimeInline,
+    RuntimeSchema, RuntimeTypeContext, RuntimeValidationConfig, RuntimeValidationHooks,
 };
 
 let schema = Transfer::schema();
 let runtime = match compile_runtime_schema(&schema)? {
     RuntimeSchema::Struct(runtime) => runtime,
+    _ => unreachable!("Transfer is a struct schema"),
 };
 
 let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
@@ -130,12 +132,41 @@ let raw_amount = view.require_raw(3)?;
 assert_eq!(raw_amount.integer()?.as_u128(), Some(5000));
 
 // Deep validation additionally checks known field values against their TypeRef.
-let options = RuntimeAbiOptions {
-    type_validation: RuntimeTypeValidation::InlineOnly,
-    max_recursion_depth: 32,
-};
-let checked = runtime.validate_value(canon.as_canonical_ref().root(), &options)?;
-assert!(checked.get_checked(4, &options)?.is_none());
+let checked = runtime.validate_value(canon.as_canonical_ref().root(), RuntimeInline)?;
+assert!(checked.get_checked(4, RuntimeInline)?.is_none());
+
+// Hooks add semantic refinements without taking ABI validation away from the runtime.
+struct AmountHook;
+
+impl RuntimeValidationHooks for AmountHook {
+    fn exit_type_ref(
+        &mut self,
+        ctx: RuntimeTypeContext<'_>,
+        _ty: &sacp_cbor_abi::TypeRef,
+        value: sacp_cbor::query::CborValueRef<'_>,
+        outcome: RuntimeHookOutcome,
+    ) -> Result<(), RuntimeAbiError> {
+        if outcome == RuntimeHookOutcome::Success
+            && ctx.field.is_some_and(|field| field.id == 3)
+            && value.integer()?.as_u128() == Some(0)
+        {
+            return Err(RuntimeAbiError::HookRejected {
+                reason: "amount must be nonzero",
+                offset: value.offset(),
+            });
+        }
+        Ok(())
+    }
+}
+
+let mut hooks = AmountHook;
+let checked = runtime.validate_value_with_hooks(
+    canon.as_canonical_ref().root(),
+    RuntimeInline,
+    RuntimeValidationConfig::default(),
+    &mut hooks,
+)?;
+assert_eq!(checked.require_raw(3)?.integer()?.as_u128(), Some(5000));
 ```
 
 ## Enums

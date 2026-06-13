@@ -28,7 +28,7 @@ This repository publishes four crates with different responsibilities:
 |---|---:|---|
 | `sacp-cbor` | `0.17` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
 | `sacp-cbor-derive` | `0.17` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
-| `sacp-cbor-abi` | `0.4` | Stable public ABI schemas, numeric field/variant IDs, compatibility reports, and zero-copy ABI views. |
+| `sacp-cbor-abi` | `0.5` | Stable public ABI schemas, numeric field/variant IDs, compatibility reports, runtime validation hooks, and zero-copy ABI views. |
 | `sacp-cbor-abi-derive` | `0.3` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
 
 Use `sacp-cbor` for canonical CBOR infrastructure and internal Rust-shape codecs. Use

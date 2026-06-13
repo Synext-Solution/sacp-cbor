@@ -25,9 +25,12 @@ mod proofs;
 
 pub use edit::{AbiDeleteMode, AbiFieldSetEditor, AbiPatchValue, AbiSetMode};
 pub use runtime::{
-    compile_runtime_schema, AbiSchemaRegistry, RuntimeAbiError, RuntimeAbiOptions,
-    RuntimeFieldInfo, RuntimeFieldRef, RuntimeFieldSetSchema, RuntimeFieldSetView, RuntimeSchema,
-    RuntimeTypeValidation,
+    compile_runtime_schema, AbiSchemaRegistry, NoRuntimeValidationHooks, RuntimeAbiError,
+    RuntimeFieldContext, RuntimeFieldInfo, RuntimeFieldRef, RuntimeFieldSetSchema,
+    RuntimeFieldSetView, RuntimeHookOutcome, RuntimeInline, RuntimeNamedDecision,
+    RuntimeNamedResolution, RuntimeRejectNamed, RuntimeResolveNamed, RuntimeSchema,
+    RuntimeTypeContext, RuntimeTypeMode, RuntimeValidationConfig, RuntimeValidationHooks,
+    RuntimeVecItemContext,
 };
 #[cfg(feature = "derive")]
 pub use sacp_cbor_abi_derive::CborAbi;

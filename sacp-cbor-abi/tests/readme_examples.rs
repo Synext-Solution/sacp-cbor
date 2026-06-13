@@ -1,7 +1,7 @@
 use sacp_cbor::{CanonicalCbor, DecodeLimits};
 use sacp_cbor_abi::{
     compile_runtime_schema, decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass,
-    RuntimeAbiOptions, RuntimeSchema, RuntimeTypeValidation, UnknownFields, UnknownVariant,
+    RuntimeInline, RuntimeSchema, UnknownFields, UnknownVariant,
 };
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
@@ -124,13 +124,12 @@ fn stable_public_abi_readme_examples_match_api() {
     assert_eq!(view.to_owned().unwrap(), value);
 
     let schema = Transfer::schema();
-    let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap();
-    let options = RuntimeAbiOptions {
-        type_validation: RuntimeTypeValidation::InlineOnly,
-        max_recursion_depth: 32,
+    let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap() else {
+        unreachable!("Transfer schema is a struct")
     };
+    let mode = RuntimeInline;
     let runtime_view = runtime
-        .validate_value(canon.as_canonical_ref().root(), &options)
+        .validate_value(canon.as_canonical_ref().root(), mode)
         .unwrap();
     assert_eq!(
         runtime_view

@@ -57,8 +57,12 @@ types on the same ABI workloads. `abi-runtime-view` validates only the ABI
 field-set shell and uses one sorted multi-field raw lookup, while
 `abi-runtime-validate-inline` additionally checks known fields against their
 `TypeRef`s. The `*-checked` runtime rows include canonical validation from
-untrusted bytes. `abi_runtime_compile` measures the one-time schema compilation
-cost that consumers should pay outside hot message paths.
+untrusted bytes. Runtime hook rows compare the monomorphized no-op hook path,
+concrete semantic field hooks, and a vector sorted/unique refinement hook.
+`abi_runtime_named` measures compiled-registry
+named recursion and named hook acceptance. `abi_runtime_compile` measures the
+one-time schema compilation cost that consumers should pay outside hot message
+paths.
 
 Deterministically generated SACP message shapes (seeded xorshift, identical on
 every machine — see `bench_harness::datasets::workloads`):

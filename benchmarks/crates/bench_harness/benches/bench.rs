@@ -233,11 +233,120 @@ static ABI_MESSAGE_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'stati
 static ABI_UNKNOWN_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
 static ABI_UNKNOWN_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
     OnceLock::new();
+static ABI_NAMED_CHILD_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
+static ABI_NAMED_CHILD_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeSchema<'static>> = OnceLock::new();
+static ABI_NAMED_ROOT_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
+    OnceLock::new();
+static ABI_NAMED_WORKLOAD: OnceLock<AbiWorkload> = OnceLock::new();
 
-fn runtime_inline_options() -> sacp_cbor_abi::RuntimeAbiOptions<'static> {
-    sacp_cbor_abi::RuntimeAbiOptions {
-        type_validation: sacp_cbor_abi::RuntimeTypeValidation::InlineOnly,
-        max_recursion_depth: 32,
+fn runtime_inline_mode() -> sacp_cbor_abi::RuntimeInline {
+    sacp_cbor_abi::RuntimeInline
+}
+
+fn runtime_config() -> sacp_cbor_abi::RuntimeValidationConfig {
+    sacp_cbor_abi::RuntimeValidationConfig::default()
+}
+
+struct AbiRoutingFieldHook;
+
+impl sacp_cbor_abi::RuntimeValidationHooks for AbiRoutingFieldHook {
+    fn exit_field(
+        &mut self,
+        _ctx: sacp_cbor_abi::RuntimeFieldContext<'_>,
+        field: &sacp_cbor_abi::FieldDef,
+        value: sacp_cbor::query::CborValueRef<'_>,
+        outcome: sacp_cbor_abi::RuntimeHookOutcome,
+    ) -> Result<(), sacp_cbor_abi::RuntimeAbiError> {
+        if outcome != sacp_cbor_abi::RuntimeHookOutcome::Success {
+            return Ok(());
+        }
+        match field.id {
+            1 | 2 | 4 => {
+                black_box(!value.text()?.is_empty());
+            }
+            3 => {
+                black_box(value.integer()?.as_u128().is_some());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct AbiVecSortedUniqueHook {
+    prev: Option<u128>,
+}
+
+impl sacp_cbor_abi::RuntimeValidationHooks for AbiVecSortedUniqueHook {
+    fn enter_vec(
+        &mut self,
+        ctx: sacp_cbor_abi::RuntimeTypeContext<'_>,
+        _item: &sacp_cbor_abi::TypeRef,
+        _value: sacp_cbor::query::CborValueRef<'_>,
+        _len: usize,
+    ) -> Result<(), sacp_cbor_abi::RuntimeAbiError> {
+        if ctx.field.is_some_and(|field| field.id == 7) {
+            self.prev = None;
+        }
+        Ok(())
+    }
+
+    fn exit_vec_item(
+        &mut self,
+        ctx: sacp_cbor_abi::RuntimeVecItemContext<'_>,
+        _item: &sacp_cbor_abi::TypeRef,
+        value: sacp_cbor::query::CborValueRef<'_>,
+        outcome: sacp_cbor_abi::RuntimeHookOutcome,
+    ) -> Result<(), sacp_cbor_abi::RuntimeAbiError> {
+        if outcome != sacp_cbor_abi::RuntimeHookOutcome::Success
+            || ctx.field.is_none_or(|field| field.id != 7)
+        {
+            return Ok(());
+        }
+        let item = value.integer()?.as_u128().ok_or_else(|| {
+            sacp_cbor::CborError::new(sacp_cbor::ErrorCode::ExpectedInteger, value.offset())
+        })?;
+        if self.prev.is_some_and(|prev| item <= prev) {
+            return Err(sacp_cbor_abi::RuntimeAbiError::HookRejected {
+                reason: "values not sorted unique",
+                offset: value.offset(),
+            });
+        }
+        self.prev = Some(item);
+        Ok(())
+    }
+}
+
+struct AbiAcceptNamedHook;
+
+impl sacp_cbor_abi::RuntimeValidationHooks for AbiAcceptNamedHook {
+    fn validate_named(
+        &mut self,
+        _ctx: sacp_cbor_abi::RuntimeTypeContext<'_>,
+        _type_id: &str,
+        _version: Option<u32>,
+        _value: sacp_cbor::query::CborValueRef<'_>,
+    ) -> Result<sacp_cbor_abi::RuntimeNamedDecision, sacp_cbor_abi::RuntimeAbiError> {
+        Ok(sacp_cbor_abi::RuntimeNamedDecision::Accepted)
+    }
+}
+
+struct AbiBenchRegistry {
+    schema: &'static sacp_cbor_abi::RuntimeSchema<'static>,
+}
+
+impl sacp_cbor_abi::AbiSchemaRegistry for AbiBenchRegistry {
+    fn resolve<'r>(
+        &'r self,
+        type_id: &str,
+        version: Option<u32>,
+    ) -> Option<&'r sacp_cbor_abi::RuntimeSchema<'r>> {
+        if type_id == "bench.NamedChild" && version == Some(1) {
+            Some(self.schema)
+        } else {
+            None
+        }
     }
 }
 
@@ -255,6 +364,7 @@ fn abi_message_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema
             .expect("compile runtime ABI message schema")
         {
             sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+            _ => unreachable!("AbiBenchMessage schema is a struct"),
         }
     })
 }
@@ -273,7 +383,57 @@ fn abi_unknown_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema
             .expect("compile runtime ABI unknown schema")
         {
             sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+            _ => unreachable!("AbiUnknownPreserve schema is a struct"),
         }
+    })
+}
+
+fn abi_named_child_schema() -> &'static sacp_cbor_abi::Schema {
+    ABI_NAMED_CHILD_SCHEMA.get_or_init(|| {
+        Box::leak(Box::new(sacp_cbor_abi::Schema::new(
+            "bench.NamedChild",
+            1,
+            sacp_cbor_abi::TypeDef::Primitive {
+                ty: sacp_cbor_abi::TypeRef::U64,
+            },
+        )))
+    })
+}
+
+fn abi_named_child_runtime_schema() -> &'static sacp_cbor_abi::RuntimeSchema<'static> {
+    ABI_NAMED_CHILD_RUNTIME.get_or_init(|| {
+        sacp_cbor_abi::compile_runtime_schema(abi_named_child_schema())
+            .expect("compile named child runtime schema")
+    })
+}
+
+fn abi_named_root_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
+    ABI_NAMED_ROOT_RUNTIME.get_or_init(|| {
+        let def = Box::leak(Box::new(sacp_cbor_abi::FieldSetDef {
+            fields: vec![sacp_cbor_abi::FieldDef {
+                id: 1,
+                name: "child".to_string(),
+                ty: sacp_cbor_abi::TypeRef::Named {
+                    type_id: "bench.NamedChild".to_string(),
+                    version: Some(1),
+                },
+                presence: sacp_cbor_abi::FieldPresence::Required,
+            }],
+            unknown_fields: sacp_cbor_abi::UnknownFieldPolicy::Reject,
+        }));
+        sacp_cbor_abi::RuntimeFieldSetSchema::compile(def)
+            .expect("compile named root runtime schema")
+    })
+}
+
+fn abi_named_workload() -> &'static AbiWorkload {
+    ABI_NAMED_WORKLOAD.get_or_init(|| AbiWorkload {
+        name: "named_u64",
+        canon: sacp_cbor::CanonicalCbor::from_slice(
+            &[0x82, 0x01, 0x18, 0x2a],
+            DecodeLimits::for_bytes(4),
+        )
+        .expect("named workload is canonical"),
     })
 }
 
@@ -623,7 +783,8 @@ fn bench_abi_decode_owned(c: &mut Criterion) {
 fn bench_abi_view_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("abi_view_access");
     let runtime_schema = abi_message_runtime_schema();
-    let runtime_options = runtime_inline_options();
+    let runtime_mode = runtime_inline_mode();
+    let runtime_config = runtime_config();
     const ROUTING_IDS: &[u32] = &[1, 2, 3, 4];
 
     for data in abi_message_workloads() {
@@ -664,7 +825,79 @@ fn bench_abi_view_access(c: &mut Criterion) {
                     let view = runtime_schema
                         .validate_value(
                             black_box(data.canon.as_canonical_ref()).root(),
-                            &runtime_options,
+                            runtime_mode,
+                        )
+                        .unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-validate-inline-noop-hook-concrete", data.name),
+            |b| {
+                b.iter(|| {
+                    let mut hook = sacp_cbor_abi::NoRuntimeValidationHooks;
+                    let view = runtime_schema
+                        .validate_value_with_hooks(
+                            black_box(data.canon.as_canonical_ref()).root(),
+                            runtime_mode,
+                            runtime_config,
+                            &mut hook,
+                        )
+                        .unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-validate-inline-field-hook-concrete", data.name),
+            |b| {
+                b.iter(|| {
+                    let mut hook = AbiRoutingFieldHook;
+                    let view = runtime_schema
+                        .validate_value_with_hooks(
+                            black_box(data.canon.as_canonical_ref()).root(),
+                            runtime_mode,
+                            runtime_config,
+                            &mut hook,
+                        )
+                        .unwrap();
+                    let mut out = [None; 4];
+                    view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
+                        .unwrap();
+                    black_box(out[0].unwrap().text().unwrap());
+                    black_box(out[1].unwrap().text().unwrap());
+                    black_box(out[2].unwrap().integer().unwrap().as_u128().unwrap());
+                    black_box(out[3].unwrap().text().unwrap());
+                })
+            },
+        );
+
+        group.bench_function(
+            BenchmarkId::new("abi-runtime-vec-sorted-unique-hook", data.name),
+            |b| {
+                b.iter(|| {
+                    let mut hook = AbiVecSortedUniqueHook::default();
+                    let view = runtime_schema
+                        .validate_value_with_hooks(
+                            black_box(data.canon.as_canonical_ref()).root(),
+                            runtime_mode,
+                            runtime_config,
+                            &mut hook,
                         )
                         .unwrap();
                     let mut out = [None; 4];
@@ -724,7 +957,7 @@ fn bench_abi_view_access(c: &mut Criterion) {
                     )
                     .unwrap();
                     let view = runtime_schema
-                        .validate_value(canon.root(), &runtime_options)
+                        .validate_value(canon.root(), runtime_mode)
                         .unwrap();
                     let mut out = [None; 4];
                     view.get_many_raw_sorted_into(ROUTING_IDS, &mut out)
@@ -900,6 +1133,54 @@ fn bench_abi_runtime_compile(c: &mut Criterion) {
             },
         );
     }
+
+    group.finish();
+}
+
+fn bench_abi_runtime_named(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_runtime_named");
+    let runtime_schema = abi_named_root_runtime_schema();
+    let data = abi_named_workload();
+    let bytes = data.canon.as_bytes();
+    let registry = AbiBenchRegistry {
+        schema: abi_named_child_runtime_schema(),
+    };
+    let resolve_mode = sacp_cbor_abi::RuntimeResolveNamed::new(&registry);
+    let runtime_config = runtime_config();
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+
+    group.bench_function(
+        BenchmarkId::new("abi-runtime-named-registry-compiled", data.name),
+        |b| {
+            b.iter(|| {
+                let view = runtime_schema
+                    .validate_value(
+                        black_box(data.canon.as_canonical_ref()).root(),
+                        resolve_mode,
+                    )
+                    .unwrap();
+                black_box(view.raw_fields());
+            })
+        },
+    );
+
+    group.bench_function(
+        BenchmarkId::new("abi-runtime-named-hook-accepted", data.name),
+        |b| {
+            b.iter(|| {
+                let mut hook = AbiAcceptNamedHook;
+                let view = runtime_schema
+                    .validate_value_with_hooks(
+                        black_box(data.canon.as_canonical_ref()).root(),
+                        sacp_cbor_abi::RuntimeRejectNamed,
+                        runtime_config,
+                        &mut hook,
+                    )
+                    .unwrap();
+                black_box(view.raw_fields());
+            })
+        },
+    );
 
     group.finish();
 }
@@ -1367,6 +1648,7 @@ criterion_group! {
         bench_abi_unknown_preserve,
         bench_abi_enum_access,
         bench_abi_runtime_compile,
+        bench_abi_runtime_named,
         bench_patch,
         bench_appendix_a,
         bench_micro_query,
