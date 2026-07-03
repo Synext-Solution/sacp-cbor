@@ -617,6 +617,10 @@ pub mod cbor {
 - Uses `Encoder` internally
 - Sorts map keys at compile time (no runtime buffering)
 - Map keys must be identifiers or string literals
+- Rust repeat byte-array expressions such as `[0u8; 32]` are encoded via
+  `CborEncode` as CBOR byte strings. Comma arrays such as `[1, 2, 3]` remain
+  CBOR array literals. Use parentheses to force an ordinary Rust expression,
+  e.g. `cbor_bytes!(([1u8, 2, 3]))`.
 
 Example (keys can be written in any order):
 

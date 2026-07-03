@@ -9,5 +9,5 @@ SHA256:
 ```
 
 ## Optional datasets
-You may add additional datasets under `benchmarks/datasets/` (e.g., COSE vectors) and the harness
-will auto-discover them if they follow the expected layout.
+You may add additional datasets under `benchmarks/datasets/` (e.g., COSE vectors), then wire them
+into the harness explicitly with a loader and Criterion scenario so report IDs stay stable.

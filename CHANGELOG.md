@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 0.17.4 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.17.4
+- `sacp-cbor-derive` 0.17.4
+- `sacp-cbor-abi` 0.6.1
+
+### `sacp-cbor`
+
+- Added the no-simple restriction mode (`ValidationOptions::no_simple` /
+  `forbid_simple`): rejects the simple values `false`, `true`, and `null`
+  anywhere in the item with the new `ErrorCode::SimpleForbidden` at the
+  simple-value header offset, in both the batch validator and the checked
+  decoder (typed, skip, and owned-constructor paths). Restriction-mode
+  semantics are unchanged: modes only reject more inputs, and trusted
+  re-traversal ignores them.
+- Added `cbor_bytes!` support for Rust repeat byte-array expressions such as
+  `[0u8; 32]`, encoded through the existing `[u8; N]` `CborEncode` fast path as
+  CBOR byte strings. Comma arrays such as `[1, 2, 3]` keep their existing CBOR
+  array-literal meaning.
+- Documented the `cbor_bytes!` bracket-expression boundary, including the
+  parenthesized Rust-expression escape for ordinary array literals.
+
+### `sacp-cbor-derive`
+
+- Updated `cbor_bytes!` parsing to treat only Rust repeat array expressions as
+  expression values, preserving the existing CBOR array-literal grammar for
+  comma arrays.
+- Reused the shared encoded-text-key helper for compile-time map key sorting in
+  `cbor_bytes!`, keeping derive and macro ordering logic aligned.
+
+### `sacp-cbor-abi`
+
+- Dependency-only patch release to track `sacp-cbor` 0.17.4.
+
 ## 0.6.0 `sacp-cbor-abi` release
 
 Published crates:

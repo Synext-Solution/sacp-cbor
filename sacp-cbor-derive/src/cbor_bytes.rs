@@ -7,6 +7,8 @@ use syn::{
     parse_quote, Expr, Ident, LitStr, Path, Result, Token,
 };
 
+use crate::schema::cbor_text_key_bytes;
+
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as MacroInput);
     if let Err(err) = validate_value(&input.value) {
@@ -112,6 +114,12 @@ struct MapEntry {
 impl Parse for Value {
     fn parse(input: ParseStream) -> Result<Self> {
         if input.peek(syn::token::Bracket) {
+            let fork = input.fork();
+            if let Ok(Expr::Repeat(_)) = fork.parse::<Expr>() {
+                let expr: Expr = input.parse()?;
+                return Ok(Value::Expr(expr));
+            }
+
             let content;
             bracketed!(content in input);
             let elems = content.parse_terminated(Value::parse, Token![,])?;
@@ -152,7 +160,7 @@ impl Parse for MapEntry {
 
         input.parse::<Token![:]>()?;
         let value: Value = input.parse()?;
-        let key_bytes = key.value().into_bytes();
+        let key_bytes = cbor_text_key_bytes(&key);
 
         Ok(Self {
             key,

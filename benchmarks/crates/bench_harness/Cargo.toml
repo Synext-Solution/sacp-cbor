@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[lib]
+bench = false
+
+[[bin]]
+name = "report"
+path = "src/bin/report.rs"
+bench = false
+
 [dependencies]
 base64 = "0.21"
 serde = { version = "1", features = ["derive"] }
