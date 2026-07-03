@@ -73,6 +73,14 @@ additional info 27) anywhere in the item with `FloatForbidden` at the float head
 exists for deployments whose durable data model excludes floating point and which want that rule
 enforced at the validation boundary rather than by schema convention.
 
+The **no-simple mode** (`ValidationOptions::no_simple`) rejects the simple values `false`, `true`,
+and `null` (major type 7, additional info 20..=22) anywhere in the item with `SimpleForbidden` at
+the simple-value header offset. It exists for deployments whose durable data model has no boolean
+or null term — expressing optionality by key omission and booleans as schema-constrained
+integers — and which want that rule enforced at the validation boundary rather than by schema
+convention. Modes compose: an item accepted under both no-float and no-simple contains no
+major-type-7 item.
+
 Modes are a property of a validation call, not of the validated bytes: the canonical witness types
 attest SACP-CBOR/1 canonicality only. Trusted re-traversal of already-validated bytes (queries,
 editing, trusted decode) ignores restriction modes; callers that require a restriction across an
@@ -164,7 +172,7 @@ constructors and unchecked UTF-8 conversion for already canonical data.
 
 ## Verification Status
 
-The crate verifies this profile with validation vectors (including no-float restriction-mode
+The crate verifies this profile with validation vectors (including no-float and no-simple restriction-mode
 vectors), derive compile-fail tests, feature-matrix builds, benchmark/fuzz target compilation, and
 a Miri smoke test for the unsafe feature.
 

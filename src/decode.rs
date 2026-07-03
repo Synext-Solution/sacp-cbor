@@ -517,8 +517,12 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             return Err(CborError::new(ErrorCode::ExpectedBool, off));
         }
         match ai {
-            20 => Ok(false),
-            21 => Ok(true),
+            20 | 21 => {
+                if CHECKED && self.options.forbid_simple {
+                    return Err(CborError::new(ErrorCode::SimpleForbidden, off));
+                }
+                Ok(ai == 21)
+            }
             22 | 27 => Err(CborError::new(ErrorCode::ExpectedBool, off)),
             _ => self.reject_unexpected_simple(ai, off, ErrorCode::ExpectedBool),
         }
@@ -535,7 +539,12 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             return Err(CborError::new(ErrorCode::ExpectedNull, off));
         }
         match ai {
-            22 => Ok(()),
+            22 => {
+                if CHECKED && self.options.forbid_simple {
+                    return Err(CborError::new(ErrorCode::SimpleForbidden, off));
+                }
+                Ok(())
+            }
             20 | 21 | 27 => Err(CborError::new(ErrorCode::ExpectedNull, off)),
             _ => self.reject_unexpected_simple(ai, off, ErrorCode::ExpectedNull),
         }

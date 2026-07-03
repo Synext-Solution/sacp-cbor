@@ -708,7 +708,11 @@ fn skip_primitive<const CHECKED: bool>(
         }
         7 => {
             match ai {
-                20..=22 => {}
+                20..=22 => {
+                    if CHECKED && policy.options.forbid_simple {
+                        return Err(CborError::new(ErrorCode::SimpleForbidden, off));
+                    }
+                }
                 27 => {
                     if CHECKED && policy.options.forbid_float {
                         return Err(CborError::new(ErrorCode::FloatForbidden, off));

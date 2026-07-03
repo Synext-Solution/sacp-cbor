@@ -138,6 +138,13 @@ pub struct ValidationOptions {
     /// values produce [`ErrorCode::FloatForbidden`] at the
     /// float header offset.
     pub forbid_float: bool,
+    /// Reject the simple values `false`, `true`, and `null` anywhere in the item.
+    ///
+    /// For deployments whose durable data model has no boolean or null term — expressing
+    /// optionality by key omission and booleans as schema-constrained integers — this enforces
+    /// the no-simple restriction at the validation boundary instead of by schema convention.
+    /// Rejected values produce [`ErrorCode::SimpleForbidden`] at the simple-value header offset.
+    pub forbid_simple: bool,
 }
 
 impl ValidationOptions {
@@ -146,6 +153,7 @@ impl ValidationOptions {
     pub const fn new() -> Self {
         Self {
             forbid_float: false,
+            forbid_simple: false,
         }
     }
 
@@ -153,6 +161,13 @@ impl ValidationOptions {
     #[must_use]
     pub const fn no_float(mut self) -> Self {
         self.forbid_float = true;
+        self
+    }
+
+    /// Return these options with the simple values `false`, `true`, and `null` forbidden.
+    #[must_use]
+    pub const fn no_simple(mut self) -> Self {
+        self.forbid_simple = true;
         self
     }
 }

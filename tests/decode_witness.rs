@@ -251,3 +251,50 @@ fn decode_value_with_caller_error_poisons() {
     }
     assert!(decoder.finish().is_err());
 }
+
+proptest! {
+    /// Acceptance equivalence under the no-simple restriction mode.
+    #[test]
+    fn decoder_pass_equivalent_to_validate_no_simple(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+        let limits = DecodeLimits::for_bytes(bytes.len());
+        let options = ValidationOptions::new().no_simple();
+        let reference = validate_canonical_with(&bytes, limits, options).is_ok();
+        let streamed = decoder_validates(&bytes, options).is_ok();
+        prop_assert_eq!(streamed, reference);
+    }
+}
+
+/// The no-simple restriction applies inside skipped subtrees (the decoder
+/// carries its options into `skip_value`).
+#[test]
+fn no_simple_rejects_inside_skipped_subtree() {
+    let doc = cbor_bytes!({ "x": [1, true, 2] }).unwrap();
+    let bytes = doc.as_bytes();
+    // Full grammar: the skip pass accepts.
+    decoder_validates(bytes, ValidationOptions::new()).unwrap();
+    // No-simple: the skip pass rejects at the simple-value header.
+    let err = decoder_validates(bytes, ValidationOptions::new().no_simple()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::SimpleForbidden);
+}
+
+/// The no-simple restriction applies to typed bool and null decodes.
+#[test]
+fn no_simple_rejects_typed_bool_and_null_decode() {
+    let no_simple = ValidationOptions::new().no_simple();
+
+    let doc = cbor_bytes!(true).unwrap();
+    let bytes = doc.as_bytes();
+    let mut decoder =
+        Decoder::<true>::new_checked_with(bytes, DecodeLimits::for_bytes(bytes.len()), no_simple)
+            .unwrap();
+    let err = <bool as sacp_cbor::CborDecode>::decode(&mut decoder).unwrap_err();
+    assert_eq!(err.code, ErrorCode::SimpleForbidden);
+
+    let doc = cbor_bytes!(null).unwrap();
+    let bytes = doc.as_bytes();
+    let mut decoder =
+        Decoder::<true>::new_checked_with(bytes, DecodeLimits::for_bytes(bytes.len()), no_simple)
+            .unwrap();
+    let err = <() as sacp_cbor::CborDecode>::decode(&mut decoder).unwrap_err();
+    assert_eq!(err.code, ErrorCode::SimpleForbidden);
+}

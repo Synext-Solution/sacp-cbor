@@ -64,7 +64,10 @@
 //! reject more inputs: every item accepted under a restriction mode is also a valid SACP-CBOR/1
 //! item. The **no-float mode** ([`ValidationOptions::no_float`]) rejects float64 values anywhere
 //! in the item with [`ErrorCode::FloatForbidden`], for deployments whose durable data model
-//! excludes floating point. Use [`validate_canonical_with`] to validate under explicit options;
+//! excludes floating point. The **no-simple mode** ([`ValidationOptions::no_simple`]) rejects the
+//! simple values `false`, `true`, and `null` anywhere in the item with
+//! [`ErrorCode::SimpleForbidden`], for deployments whose durable data model has no boolean or
+//! null term. Use [`validate_canonical_with`] to validate under explicit options;
 //! [`validate_canonical`] accepts the full grammar.
 //!
 //! **Text identity**

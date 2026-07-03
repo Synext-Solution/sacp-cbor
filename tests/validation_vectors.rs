@@ -733,3 +733,84 @@ fn owned_constructors_honor_validation_options() {
     CanonicalCbor::from_slice_with(&int_doc, limits, no_float).unwrap();
     CanonicalCbor::from_vec_with(int_doc.to_vec(), limits, no_float).unwrap();
 }
+
+#[test]
+fn no_simple_mode_rejects_root_simple_values() {
+    let no_simple = ValidationOptions::new().no_simple();
+    for byte in [0xf4u8, 0xf5, 0xf6] {
+        let bytes = [byte];
+        let limits = DecodeLimits::for_bytes(bytes.len());
+        validate_canonical(&bytes, limits).unwrap();
+        let offset = assert_invalid_with(&bytes, limits, no_simple, ErrorCode::SimpleForbidden);
+        assert_eq!(offset, 0);
+    }
+}
+
+#[test]
+fn no_simple_mode_rejects_nested_simple_values_at_header_offset() {
+    let no_simple = ValidationOptions::new().no_simple();
+
+    // [1, true]
+    let in_array = [0x82, 0x01, 0xf5];
+    let limits = DecodeLimits::for_bytes(in_array.len());
+    validate_canonical(&in_array, limits).unwrap();
+    let offset = assert_invalid_with(&in_array, limits, no_simple, ErrorCode::SimpleForbidden);
+    assert_eq!(offset, 2);
+
+    // {"a": null}
+    let in_map = [0xa1, 0x61, b'a', 0xf6];
+    let limits = DecodeLimits::for_bytes(in_map.len());
+    validate_canonical(&in_map, limits).unwrap();
+    let offset = assert_invalid_with(&in_map, limits, no_simple, ErrorCode::SimpleForbidden);
+    assert_eq!(offset, 3);
+}
+
+#[test]
+fn no_simple_mode_accepts_simple_free_items() {
+    let no_simple = ValidationOptions::new().no_simple();
+
+    // {"a":[1,"x",h'00'],"b":-5}
+    let bytes = [
+        0xa2, 0x61, b'a', 0x83, 0x01, 0x61, b'x', 0x41, 0x00, 0x61, b'b', 0x24,
+    ];
+    let limits = DecodeLimits::for_bytes(bytes.len());
+    let canon = validate_canonical_with(&bytes, limits, no_simple).unwrap();
+    assert_eq!(canon.as_bytes(), bytes);
+
+    // Floats are not simple values: no-simple alone admits them.
+    let float_doc = f64_encoded(1.5f64.to_bits());
+    let limits = DecodeLimits::for_bytes(float_doc.len());
+    validate_canonical_with(&float_doc, limits, no_simple).unwrap();
+
+    // Bignums are unaffected.
+    let bignum = [0xc2, 0x47, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let limits = DecodeLimits::for_bytes(bignum.len());
+    validate_canonical_with(&bignum, limits, no_simple).unwrap();
+}
+
+#[test]
+fn no_simple_and_no_float_modes_compose() {
+    let both = ValidationOptions::new().no_simple().no_float();
+
+    let float_doc = f64_encoded(1.5f64.to_bits());
+    let limits = DecodeLimits::for_bytes(float_doc.len());
+    assert_invalid_with(&float_doc, limits, both, ErrorCode::FloatForbidden);
+
+    let bool_doc = [0xf5];
+    let limits = DecodeLimits::for_bytes(bool_doc.len());
+    assert_invalid_with(&bool_doc, limits, both, ErrorCode::SimpleForbidden);
+
+    let int_doc = [0x01];
+    let limits = DecodeLimits::for_bytes(int_doc.len());
+    validate_canonical_with(&int_doc, limits, both).unwrap();
+}
+
+#[test]
+fn owned_constructors_honor_no_simple() {
+    let no_simple = ValidationOptions::new().no_simple();
+    let null_doc = [0xf6];
+    let limits = DecodeLimits::for_bytes(null_doc.len());
+    let err = CanonicalCbor::from_slice_with(&null_doc, limits, no_simple).unwrap_err();
+    assert_eq!(err.code, ErrorCode::SimpleForbidden);
+    CanonicalCbor::from_slice_with(&null_doc, limits, ValidationOptions::new()).unwrap();
+}
