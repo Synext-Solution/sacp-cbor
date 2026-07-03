@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 0.17.5 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.17.5
+- `sacp-cbor-schema` 0.1.0 (new)
+- `sacp-cbor-derive` 0.17.5
+- `sacp-cbor-abi` 0.6.2
+
+### `sacp-cbor-schema` (new crate)
+
+- Closed-record schema validation for canonical SACP-CBOR/1 values, `no_std` + `alloc`.
+  A compiled `RecordSchema` validates untrusted bytes in one checked-decoder traversal
+  (grammar, shape, and value constraints, returning the canonical witness), checks trusted
+  witnesses, and derives structural containment (compatibility directions) between schema
+  versions. Closed-key records with presence couplings; `Int`/`Bool`/`Float64`/`Bytes`/`Text`/
+  `Array`/`Set`/`Map`/`Union`/`Record`/`Any` types; `range`/`count`/`enum` constraints;
+  `Grammar`/`Shape`/`Constraint` fault taxonomy with offsets and field paths. Includes a
+  normative SPEC.md, differential and property tests, adversarial edge vectors, a fuzz
+  target, and a throughput benchmark suite.
+
+### `sacp-cbor`
+
+- Added a zero-copy streaming integer decode: `query::IntegerRef` now implements `CborDecode`,
+  consuming one integer-kind value (safe int or bignum) through the direct scalar funnel with
+  no subtree walk and no allocation.
+- Added kind-checked scalar consumption funnels: `ScalarKind`, `Decoder::skip_scalar`,
+  `ArrayDecoder::skip_scalars` (batch homogeneous consume), and `ArrayDecoder::next_scalar_span`
+  (per-element canonical byte range). One header read per value, direct funnels, no subtree
+  walk; wrong kinds report the kind's `Expected*` code at the header offset.
+- Added `ArrayDecoder::skip_sorted_scalars`: the sorted-set batch form with the strictly-ascending
+  memcmp order comparison inlined, reporting `DuplicateElement` / `NonAscendingElement` (new
+  `ErrorCode` variants) at the violating element's header offset.
+
+### `sacp-cbor-derive`
+
+- Dependency-only patch release to track `sacp-cbor` 0.17.5.
+
+### `sacp-cbor-abi`
+
+- Dependency-only patch release to track `sacp-cbor` 0.17.5.
 
 ## 0.17.4 workspace release
 

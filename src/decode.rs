@@ -12,7 +12,7 @@ use crate::bytes::BytesRef;
 use crate::canonical::CanonicalCborRef;
 use crate::codec::CborDecode;
 use crate::profile::{validate_f64_bits, MAX_SAFE_INTEGER};
-use crate::query::{peek_kind_at, CborKind, CborValueRef};
+use crate::query::{peek_kind_at, BigIntRef, CborKind, CborValueRef, IntegerRef};
 use crate::wire::{self, Cursor};
 use crate::{CborError, DecodeLimits, ErrorCode, ValidationOptions};
 
@@ -80,6 +80,27 @@ enum IntegerParts<'de> {
     SafePos(u64),
     SafeNeg(u64),
     Big { negative: bool, mag: &'de [u8] },
+}
+
+/// A scalar (leaf) kind of the canonical profile.
+///
+/// The scalar consumption funnels ([`Decoder::skip_scalar`],
+/// [`ArrayDecoder::skip_scalars`], [`ArrayDecoder::next_scalar_span`]) take
+/// this instead of [`CborKind`] so a container kind cannot be requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    /// Safe integer (major 0/1) or bignum (tag 2/3).
+    Integer,
+    /// Byte string (major 2).
+    Bytes,
+    /// Text string (major 3).
+    Text,
+    /// Boolean simple value.
+    Bool,
+    /// Null simple value.
+    Null,
+    /// Float64 value.
+    Float,
 }
 
 /// Text key metadata returned by [`MapDecoder::next_key_ref`].
@@ -401,6 +422,96 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             6 => {
                 let (negative, mag) = self.parse_bignum(off, ai)?;
                 Ok((IntegerParts::Big { negative, mag }, off))
+            }
+            _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
+        }
+    }
+
+    /// Consume one scalar value of the expected kind through the direct
+    /// scalar funnel: one header read, no subtree walk, no allocation.
+    ///
+    /// A value of a different kind is rejected with the kind's
+    /// `Expected*` error code at the header offset. All canonical-grammar
+    /// checks, decode limits, and restriction modes of this decoder apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the next value is not a scalar of `kind`, is
+    /// malformed, or violates limits or validation options.
+    pub fn skip_scalar(&mut self, kind: ScalarKind) -> Result<(), CborError> {
+        self.check_poison()?;
+        let result = self.consume_scalar_raw(kind);
+        self.seal_value(result)
+    }
+
+    #[inline]
+    fn consume_scalar_raw(&mut self, kind: ScalarKind) -> Result<(), CborError> {
+        match kind {
+            ScalarKind::Integer => self.parse_integer_ref_raw().map(|_| ()),
+            ScalarKind::Bytes => self.parse_bytes_raw().map(|_| ()),
+            ScalarKind::Text => self.consume_text_raw(),
+            ScalarKind::Bool => self.parse_bool_raw().map(|_| ()),
+            ScalarKind::Null => self.parse_null_raw(),
+            ScalarKind::Float => self.parse_float64_raw().map(|_| ()),
+        }
+    }
+
+    /// Consume one text value without materializing the `&str`.
+    ///
+    /// Mirrors the skip path: UTF-8 is validated on the checked decoder and
+    /// trusted on the trusted decoder, exactly like [`Decoder::skip_value`].
+    /// (`parse_text_raw` must produce a `&str`, so it validates in both
+    /// modes; a pure consume has no such obligation.)
+    #[inline]
+    fn consume_text_raw(&mut self) -> Result<(), CborError> {
+        let (major, ai, off) = self.read_header()?;
+        if major != 3 {
+            return Err(CborError::new(ErrorCode::ExpectedText, off));
+        }
+        let len = self.read_len(ai, off)?;
+        if len > self.limits.max_text_len {
+            return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
+        }
+        let bytes = self.cursor.read_exact(len)?;
+        if CHECKED {
+            crate::utf8::validate_utf8(bytes)
+                .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?;
+        }
+        Ok(())
+    }
+
+    fn parse_integer_ref(&mut self) -> Result<IntegerRef<'de>, CborError> {
+        let result = self.parse_integer_ref_raw();
+        self.seal_value(result)
+    }
+
+    /// Consume one integer-kind value as a zero-copy [`IntegerRef`]: the
+    /// direct scalar funnel, no subtree walk and no allocation.
+    #[inline]
+    fn parse_integer_ref_raw(&mut self) -> Result<IntegerRef<'de>, CborError> {
+        let (major, ai, off) = self.read_header()?;
+        match major {
+            0 => {
+                let v = self.read_uint_arg(ai, off)?;
+                if CHECKED && v > MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                let v = i64::try_from(v)
+                    .map_err(|_| CborError::new(ErrorCode::IntegerOutsideSafeRange, off))?;
+                Ok(IntegerRef::Safe(v))
+            }
+            1 => {
+                let n = self.read_uint_arg(ai, off)?;
+                if CHECKED && n >= MAX_SAFE_INTEGER {
+                    return Err(CborError::new(ErrorCode::IntegerOutsideSafeRange, off));
+                }
+                let n = i64::try_from(n)
+                    .map_err(|_| CborError::new(ErrorCode::IntegerOutsideSafeRange, off))?;
+                Ok(IntegerRef::Safe(-1 - n))
+            }
+            6 => {
+                let (negative, mag) = self.parse_bignum(off, ai)?;
+                Ok(IntegerRef::Big(BigIntRef::new(negative, mag)))
             }
             _ => Err(CborError::new(ErrorCode::ExpectedInteger, off)),
         }
@@ -783,6 +894,100 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         while self.remaining > 0 {
             self.decoder.skip_value()?;
             self.remaining -= 1;
+        }
+        Ok(())
+    }
+
+    /// Consume all remaining elements, requiring each to be a scalar of
+    /// `kind`.
+    ///
+    /// This is the batch form of [`Decoder::skip_scalar`]: one tight loop of
+    /// direct scalar funnels, with no per-element dispatch. All
+    /// canonical-grammar checks, decode limits, and restriction modes apply
+    /// to every element.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error at the first element that is not a scalar of `kind`
+    /// (the kind's `Expected*` code at that element's header offset), is
+    /// malformed, or violates limits or validation options.
+    pub fn skip_scalars(&mut self, kind: ScalarKind) -> Result<(), CborError> {
+        self.decoder.check_poison()?;
+        while self.remaining > 0 {
+            let result = self.decoder.consume_scalar_raw(kind);
+            self.decoder.seal_value(result)?;
+            self.remaining -= 1;
+        }
+        Ok(())
+    }
+
+    /// Consume the next element, requiring a scalar of `kind`, and return
+    /// the byte range of its canonical encoding inside the input.
+    ///
+    /// Returns `Ok(None)` when the array is exhausted. The returned range is
+    /// the element's complete encoding (header and payload), suitable for
+    /// canonical byte comparisons.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the next element is not a scalar of `kind`, is
+    /// malformed, or violates limits or validation options.
+    pub fn next_scalar_span(
+        &mut self,
+        kind: ScalarKind,
+    ) -> Result<Option<Range<usize>>, CborError> {
+        self.decoder.check_poison()?;
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let start = self.decoder.position();
+        let result = self.decoder.consume_scalar_raw(kind);
+        self.decoder.seal_value(result)?;
+        self.remaining -= 1;
+        Ok(Some(start..self.decoder.position()))
+    }
+
+    /// Consume all remaining elements, requiring each to be a scalar of
+    /// `kind` and the sequence to be strictly ascending by unsigned
+    /// lexicographic (memcmp) order of the elements' canonical encodings.
+    ///
+    /// This is the sorted-set form of [`skip_scalars`](Self::skip_scalars)
+    /// with the order comparison inlined into the batch loop. Canonical
+    /// encodings are self-delimiting — no element encoding is a proper
+    /// prefix of a different complete encoding — so memcmp order is total,
+    /// and equality of encodings is equality of values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::DuplicateElement`] when an element's encoding
+    /// equals its predecessor's and [`ErrorCode::NonAscendingElement`] when
+    /// it sorts below it, both at the element's header offset; otherwise as
+    /// [`skip_scalars`](Self::skip_scalars). Order failures poison the
+    /// decoder like any failed consuming operation.
+    pub fn skip_sorted_scalars(&mut self, kind: ScalarKind) -> Result<(), CborError> {
+        self.decoder.check_poison()?;
+        let data = self.decoder.cursor.data();
+        let mut prev: Option<Range<usize>> = None;
+        while self.remaining > 0 {
+            let start = self.decoder.position();
+            let result = self.decoder.consume_scalar_raw(kind);
+            self.decoder.seal_value(result)?;
+            self.remaining -= 1;
+            let end = self.decoder.position();
+            if let Some(prev_range) = prev {
+                let order = data[prev_range].cmp(&data[start..end]);
+                if order != core::cmp::Ordering::Less {
+                    let code = if order == core::cmp::Ordering::Equal {
+                        ErrorCode::DuplicateElement
+                    } else {
+                        ErrorCode::NonAscendingElement
+                    };
+                    let err = CborError::new(code, start);
+                    self.decoder.poison_err(err);
+                    return Err(err);
+                }
+            }
+            prev = Some(start..end);
         }
         Ok(())
     }
@@ -1227,6 +1432,12 @@ where
 {
     fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
         decoder.parse_bytes().map(BytesRef::new)
+    }
+}
+
+impl<'de> CborDecode<'de> for IntegerRef<'de> {
+    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+        decoder.parse_integer_ref()
     }
 }
 

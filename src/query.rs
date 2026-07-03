@@ -179,6 +179,13 @@ pub struct BigIntRef<'a> {
 }
 
 impl<'a> BigIntRef<'a> {
+    pub(crate) const fn new(negative: bool, magnitude: &'a [u8]) -> Self {
+        Self {
+            negative,
+            magnitude,
+        }
+    }
+
     /// Returns whether the bignum is negative (tag 3).
     #[must_use]
     pub const fn is_negative(self) -> bool {

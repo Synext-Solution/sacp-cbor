@@ -145,7 +145,9 @@ mod int;
 
 pub use crate::canonical::CanonicalCborRef;
 pub use crate::codec::CborDecode;
-pub use crate::decode::{decode, decode_canonical, ArrayDecoder, Decoder, MapDecoder, MapKey};
+pub use crate::decode::{
+    decode, decode_canonical, ArrayDecoder, Decoder, MapDecoder, MapKey, ScalarKind,
+};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{DecodeLimits, EncodeLimits, ValidationOptions};
 pub use crate::parse::{validate_canonical, validate_canonical_with};

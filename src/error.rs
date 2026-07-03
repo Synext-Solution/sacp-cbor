@@ -76,6 +76,11 @@ pub enum ErrorCode {
     /// Simple value (`false`, `true`, `null`) rejected by validation options (no-simple mode).
     SimpleForbidden,
 
+    /// Sorted-sequence element equals its predecessor.
+    DuplicateElement,
+    /// Sorted-sequence element sorts below its predecessor.
+    NonAscendingElement,
+
     /// Serde conversion failed.
     SerdeError,
 
@@ -179,6 +184,8 @@ impl fmt::Display for CborError {
             ErrorCode::NonCanonicalNaN => "non-canonical NaN encoding",
             ErrorCode::FloatForbidden => "float64 forbidden by validation options",
             ErrorCode::SimpleForbidden => "simple value forbidden by validation options",
+            ErrorCode::DuplicateElement => "duplicate sorted-sequence element",
+            ErrorCode::NonAscendingElement => "sorted-sequence element out of order",
             ErrorCode::SerdeError => "serde conversion failed",
 
             ErrorCode::ExpectedMap => "expected CBOR map",

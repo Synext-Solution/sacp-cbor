@@ -12,6 +12,7 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 
 - **Validate** that an input is a *single, canonical* CBOR item under a strict profile (`validate_canonical`).
 - Wrap validated bytes as `CanonicalCborRef<'a>` for **zero-copy querying** (`at`, `root`, `MapRef`, `ArrayRef`, `CborValueRef`).
+- **Stream-decode with validation** in one pass: the checked `Decoder` applies the full canonical grammar while decoding, and `finish()` returns the canonical witness — no second traversal.
 - Optionally **decode** into Rust types via `sacp_cbor::serde::from_slice` (`serde`).
 - **Encode canonical CBOR** directly (`Encoder`, `encode::MapEncoder`, `encode::ArrayEncoder`) (`alloc`).
 - Build canonical bytes with the **fallible** `cbor_bytes!` macro (`derive`).
@@ -22,17 +23,20 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 
 ### Published crates
 
-This repository publishes four crates with different responsibilities:
+This repository publishes five crates with different responsibilities:
 
 | Crate | Current line | Responsibility |
 |---|---:|---|
 | `sacp-cbor` | `0.17` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
 | `sacp-cbor-derive` | `0.17` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
+| `sacp-cbor-schema` | `0.1` | Closed-record schema validation over canonical values: single-pass grammar + shape + value-constraint checking, and structural containment between schema versions. |
 | `sacp-cbor-abi` | `0.6` | Stable public ABI schemas, numeric field/variant IDs, compatibility reports, runtime validation hooks, and zero-copy ABI views. |
 | `sacp-cbor-abi-derive` | `0.3` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
 
 Use `sacp-cbor` for canonical CBOR infrastructure and internal Rust-shape codecs. Use
-`sacp-cbor-abi` for public protocols that must remain stable across Rust refactors.
+`sacp-cbor-abi` for public protocols that must remain stable across Rust refactors. Use
+`sacp-cbor-schema` to admit data against a declared closed-record schema (field types, value
+constraints, presence couplings) in the same traversal that validates the canonical grammar.
 
 ### Design constraints (important)
 
@@ -60,8 +64,9 @@ Two profile semantics are fixed and documented in [`SPEC.md`](SPEC.md):
 - **Text identity:** no Unicode normalization; text equality is UTF-8 byte equality. Producers
   that require a normal form (such as NFC) must normalize before encoding.
 - **Validation modes:** `ValidationOptions` selects optional restriction modes that only reject
-  more inputs. The **no-float mode** (`ValidationOptions::new().no_float()`) rejects float64
-  anywhere in the item — for deployments whose durable data model excludes floating point.
+  more inputs. The **no-float mode** (`no_float()`) rejects float64 anywhere in the item; the
+  **no-simple mode** (`no_simple()`) rejects `false`, `true`, and `null` — for deployments whose
+  durable data model excludes floating point or has no boolean/null values.
 
 If you need tags beyond bignums, indefinite lengths, non-text map keys, half/float32 encodings, etc., this crate is the wrong tool.
 
@@ -1094,11 +1099,15 @@ pub struct CborError {
   - `IntegerOutsideSafeRange`, `ForbiddenOrMalformedTag`, `BignumNotCanonical`, `BignumMustBeOutsideSafeRange`
 - Floats:
 
-  - `NegativeZeroForbidden`, `NonCanonicalNaN`, `FloatForbidden` (no-float mode)
+  - `NegativeZeroForbidden`, `NonCanonicalNaN`, `FloatForbidden` (no-float mode),
+    `SimpleForbidden` (no-simple mode)
 - Type expectation errors (query/edit):
 
   - `ExpectedMap`, `ExpectedArray`, `ExpectedInteger`, `ExpectedText`, `ExpectedBytes`,
-    `ExpectedBool`, `ExpectedFloat`
+    `ExpectedBool`, `ExpectedNull`, `ExpectedFloat`
+- Sorted-sequence consumption (`ArrayDecoder::skip_sorted_scalars`):
+
+  - `DuplicateElement`, `NonAscendingElement`
 - Editing:
 
   - `PatchConflict`, `IndexOutOfBounds`, `InvalidQuery`, `MissingKey`
@@ -1245,6 +1254,9 @@ Common trait coverage for derive-driven models includes:
 
 - **You need to patch existing canonical bytes without decoding everything:**
   `CanonicalCborRef::edit` / `CanonicalCbor::edit`
+
+- **You need to admit records against a declared schema (types, constraints, couplings):**
+  `sacp-cbor-schema` — one fused pass validates grammar and schema and returns the witness
 
 - **You need serde:**
   `serde::to_vec` / `serde::from_slice`

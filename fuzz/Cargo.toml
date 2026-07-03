@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde = { version = "1", features = ["derive"] }
 sacp-cbor = { path = "..", default-features = false, features = ["std", "derive", "collections", "edit", "serde", "sha2"] }
+sacp-cbor-schema = { path = "../sacp-cbor-schema" }
 
 [[bin]]
 name = "validate_only"
@@ -45,6 +46,12 @@ doc = false
 [[bin]]
 name = "edit_noop"
 path = "fuzz_targets/edit_noop.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "schema_check"
+path = "fuzz_targets/schema_check.rs"
 test = false
 doc = false
 

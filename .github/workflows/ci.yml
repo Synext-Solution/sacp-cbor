@@ -246,6 +246,30 @@ jobs:
             exit 1
           fi
 
+          schema_meta="$(package_meta "sacp-cbor-schema/Cargo.toml")"
+          if [ "$schema_meta" = "MISSING" ] || [ -z "${schema_meta:-}" ]; then
+            echo "Failed to parse package name/version from sacp-cbor-schema/Cargo.toml" >&2
+            exit 1
+          fi
+          schema_crate="${schema_meta%% *}"
+          schema_version="${schema_meta#* }"
+          schema_dep_version="$(dependency_version "sacp-cbor-schema/Cargo.toml" "sacp-cbor")"
+          schema_release_line="${schema_version%.*}"
+          if [ "$schema_crate" != "sacp-cbor-schema" ]; then
+            echo "Unexpected schema crate name: ${schema_crate}" >&2
+            exit 1
+          fi
+          if [ "$schema_dep_version" != "$version" ]; then
+            echo "sacp-cbor-schema dependency on sacp-cbor (${schema_dep_version}) does not match root version (${version})." >&2
+            exit 1
+          fi
+
+          stale_schema_readme="$(grep -hoE 'sacp-cbor-schema = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-schema/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${schema_release_line}" || true)"
+          if [ -n "${stale_schema_readme}" ]; then
+            echo "README references stale sacp-cbor-schema version(s): ${stale_schema_readme} (current line ${schema_release_line})." >&2
+            exit 1
+          fi
+
           publish_crate() {
             local crate="$1"
             local version="$2"
@@ -273,6 +297,7 @@ jobs:
 
           publish_crate "sacp-cbor-derive" "$derive_version" "sacp-cbor-derive"
           publish_crate "$crate" "$version" "sacp-cbor"
+          publish_crate "$schema_crate" "$schema_version" "sacp-cbor-schema"
           publish_crate "$abi_derive_crate" "$abi_derive_version" "sacp-cbor-abi-derive"
           publish_crate "$abi_crate" "$abi_version" "sacp-cbor-abi"
 
