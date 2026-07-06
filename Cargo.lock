@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "sacp-cbor"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "proptest",
  "sacp-cbor-derive",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "sacp-cbor-abi"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "sacp-cbor",
  "sacp-cbor-abi-derive",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "sacp-cbor-derive"
-version = "0.17.5"
+version = "0.17.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "sacp-cbor-schema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "sacp-cbor",

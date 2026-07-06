@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde = { version = "1", features = ["derive"] }
-sacp-cbor = { path = "..", default-features = false, features = ["std", "derive", "collections", "edit", "serde", "sha2"] }
+sacp-cbor = { path = "..", default-features = false, features = ["std", "derive", "collections", "edit", "serde", "sha2", "cde"] }
 sacp-cbor-schema = { path = "../sacp-cbor-schema" }
 
 [[bin]]
@@ -52,6 +52,12 @@ doc = false
 [[bin]]
 name = "schema_check"
 path = "fuzz_targets/schema_check.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cde_bridge"
+path = "fuzz_targets/cde_bridge.rs"
 test = false
 doc = false
 

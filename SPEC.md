@@ -196,7 +196,7 @@ constructors and unchecked UTF-8 conversion for already canonical data.
 
 The crate verifies this profile with validation vectors (including no-float and no-simple restriction-mode
 vectors), derive compile-fail tests, feature-matrix builds, benchmark/fuzz target compilation, and
-a Miri smoke test for the unsafe feature.
+a Miri smoke test for the unsafe feature. The CDE bridge is verified with frozen cross-profile vectors, an exhaustive float16 sweep against an arithmetic widening oracle, property-based round-trip and acceptance-law tests, and a dedicated fuzz target.
 
 Bounded Kani proof harnesses, compiled only under `cfg(kani)`, cover these core obligations:
 

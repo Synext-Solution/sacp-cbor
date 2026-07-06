@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.17.6 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.17.6
+- `sacp-cbor-derive` 0.17.6 (dependency-only)
+- `sacp-cbor-schema` 0.1.1 (dependency-only)
+- `sacp-cbor-abi` 0.6.3 (dependency-only)
 
 ### `sacp-cbor`
 
