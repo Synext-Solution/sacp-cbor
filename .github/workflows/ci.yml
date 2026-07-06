@@ -49,6 +49,9 @@ jobs:
       - name: Build (no_std + alloc + edit)
         run: cargo build -p sacp-cbor --no-default-features --features edit
 
+      - name: Build (no_std + alloc + cde)
+        run: cargo build -p sacp-cbor --no-default-features --features cde
+
       - name: Build (no_std + alloc + serde)
         run: cargo build -p sacp-cbor --no-default-features --features serde
 

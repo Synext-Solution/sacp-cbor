@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### `sacp-cbor`
+
+- New `cde` feature: RFC 8949 Core Deterministic Encoding (CDE) bridge under
+  `sacp_cbor::cde`. `to_cde` converts a canonical SACP-CBOR/1 item to its CDE
+  image (total; rewrites only integer and float spellings, never grows the
+  item). `from_cde` validates untrusted CDE bytes, converts the two deviating
+  normal forms, and re-validates the image under the full SACP-CBOR/1 grammar
+  and the caller's limits, with typed rejections for CDE shapes outside the
+  profile. The two directions are mutually inverse on the shared subset.
+  Frozen cross-profile vectors live in `tests/fixtures/cde_vectors.txt`.
+
 ## 0.17.5 workspace release
 
 Published crates:

@@ -90,6 +90,7 @@
 //! - `derive` *(default)*: enables derive macros and `cbor_bytes!`.
 //! - `collections`: enables native collection impls and `collections::MapEntries`.
 //! - `edit`: enables canonical CBOR editing under `edit`.
+//! - `cde`: enables the RFC 8949 Core Deterministic Encoding bridge under `cde`.
 //! - `sha2`: enables SHA-256 hashing helpers for canonical bytes.
 //! - `serde`: enables serde integration under `serde`.
 //! - `simdutf8`: enables SIMD-accelerated UTF-8 validation where supported.
@@ -138,6 +139,9 @@ mod serde_impl;
 pub(crate) mod utf8;
 mod wire;
 
+#[cfg(feature = "cde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cde")))]
+pub mod cde;
 #[cfg(feature = "edit")]
 #[cfg_attr(docsrs, doc(cfg(feature = "edit")))]
 pub mod edit;

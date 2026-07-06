@@ -166,7 +166,7 @@ fn encode_major_len(sink: &mut VecSink, major: u8, len: usize) -> Result<(), Cbo
 // narrowing casts below cannot truncate.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
-fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
+pub(crate) fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
     debug_assert!(major <= 7);
     let ai = minimal_uint_ai(value);
     debug_assert!(uint_argument_payload_len(ai).is_some());

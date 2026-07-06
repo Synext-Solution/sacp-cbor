@@ -17,6 +17,7 @@ This crate is intentionally **not** a general-purpose CBOR implementation. It en
 - **Encode canonical CBOR** directly (`Encoder`, `encode::MapEncoder`, `encode::ArrayEncoder`) (`alloc`).
 - Build canonical bytes with the **fallible** `cbor_bytes!` macro (`derive`).
 - **Patch/edit** canonical bytes without decoding the whole structure (`edit::Editor`) (`edit`).
+- **Bridge to RFC 8949 CDE**: total `cde::to_cde` and validating `cde::from_cde`, mutually inverse on the shared subset (`cde`).
 - Optional:
   - **serde** conversion utilities (`serde`).
   - **SHA-256** helpers for canonical bytes / canonical-encoded values (`sha2`).
@@ -85,6 +86,7 @@ This crate supports `no_std` when default features are disabled. Default feature
 | `derive` | `#[derive(CborEncode, CborDecode)]` + `cbor_bytes!` | Requires `alloc`; enabled by default |
 | `collections` | Native collection impls + `collections::MapEntries` | Requires `alloc` |
 | `edit` | Structural patching under `sacp_cbor::edit` | Requires `alloc` |
+| `cde` | RFC 8949 CDE bridge under `sacp_cbor::cde` | Requires `alloc` |
 | `serde` | serde integration under `sacp_cbor::serde` | Requires `alloc` |
 | `sha2` | SHA-256 helpers | Uses `sha2` crate |
 | `simdutf8` | Faster UTF-8 validation | Optional SIMD validation, same semantics |

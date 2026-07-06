@@ -33,6 +33,9 @@ derive = ["alloc", "dep:sacp-cbor-derive"]
 # Enable canonical CBOR editing and patch application.
 edit = ["alloc"]
 
+# Enable the RFC 8949 Core Deterministic Encoding (CDE) interoperability bridge.
+cde = ["alloc"]
+
 # Enable SHA-256 hashing helpers for canonical CBOR bytes.
 sha2 = ["dep:sha2"]
 

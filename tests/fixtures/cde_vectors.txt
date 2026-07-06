@@ -1,0 +1,62 @@
+# CDE bridge conformance vectors.
+#
+# Each row: <flags> <sacp-cbor/1 hex> <cde hex>
+# The two columns are images of one value under the two deterministic
+# profiles; to_cde maps column 2 to column 3 and from_cde maps column 3 to
+# column 2. Flags: `k` marks rows inside the five-kind seam subset
+# (integer/bytes/text/array/text-keyed map; no floats, no simple values) —
+# consumers that implement only that subset assert exactly the `k` rows;
+# `-` marks full-grammar rows.
+#
+# A row is frozen only on byte-identical agreement of independently authored
+# implementations of the two profiles; a later disagreement is an
+# implementation defect, never a vector amendment.
+
+# integers: identical below the safe bound
+k 00 00
+k 17 17
+k 1818 1818
+k 18ff 18ff
+k 190100 190100
+k 1a00010000 1a00010000
+k 1b001fffffffffffff 1b001fffffffffffff
+# integers: deviation band [2^53, 2^64) — head form vs bignum
+k c24720000000000000 1b0020000000000000
+k c2481000000000000000 1b1000000000000000
+k c248ffffffffffffffff 1bffffffffffffffff
+# integers: identical at and beyond 2^64
+k c249010000000000000000 c249010000000000000000
+# negative integers
+k 20 20
+k 37 37
+k 3b001ffffffffffffe 3b001ffffffffffffe
+k c3471fffffffffffff 3b001fffffffffffff
+k c348ffffffffffffffff 3bffffffffffffffff
+k c349010000000000000000 c349010000000000000000
+# bytes and text
+k 40 40
+k 43010203 43010203
+k 60 60
+k 63616263 63616263
+# arrays and maps, including band integers in containers
+k 80 80
+k a0 a0
+k 8202c24720000000000000 82021b0020000000000000
+k 82c2472000000000000024 821b002000000000000024
+k a16161c24720000000000000 a161611b0020000000000000
+k a2616b8201c2481000000000000000617a40 a2616b82011b1000000000000000617a40
+# simple values: identical
+- f4 f4
+- f5 f5
+- f6 f6
+# floats: float64-only vs shortest form
+- fb0000000000000000 f90000
+- fb3e70000000000000 f90001
+- fb3ff0000000000000 f93c00
+- fb3ff8000000000000 f93e00
+- fb40effc0000000000 f97bff
+- fb7ff0000000000000 f97c00
+- fbfff0000000000000 f9fc00
+- fb7ff8000000000000 f97e00
+- fb40f86a0000000000 fa47c35000
+- fb3fb999999999999a fb3fb999999999999a

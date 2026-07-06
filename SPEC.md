@@ -160,6 +160,28 @@ array edits use `splice`. Missing nested maps are not created implicitly. Confli
 overlapping array splices, edits inside deleted array ranges, and map/array path kind mismatches are
 rejected.
 
+## CDE Interoperability Bridge
+
+The optional `cde` feature bridges SACP-CBOR/1 and RFC 8949 Core Deterministic
+Encoding (CDE). The two profiles encode the same data model and differ in
+exactly two normal forms: CDE head-encodes every integer whose argument fits an
+unsigned 64-bit head and uses tags 2/3 only beyond that, where SACP-CBOR/1
+head-encodes only the safe range; and CDE uses the shortest of
+float16/float32/float64 with `0xf97e00` as the preferred NaN, where SACP-CBOR/1
+uses float64 only. Everything else, including the text-key map order, coincides
+byte for byte.
+
+`cde::to_cde` maps a canonical item to its CDE image and is total: only integer
+and float spellings are rewritten, every other octet is copied verbatim, and the
+image is never longer than the input. `cde::from_cde` validates untrusted CDE
+bytes, converts the two deviating normal forms, and re-validates the converted
+image under the full SACP-CBOR/1 grammar and the caller's limits; CDE shapes the
+profile excludes (non-text map keys, foreign tags, extra simple values, negative
+zero, non-preferred NaNs) are rejected with their typed codes. On the shared
+subset the two functions are mutually inverse. Array order is preserved
+verbatim; a schema-level sorted-set convention over encoded element bytes is
+re-canonicalized by the schema layer, not by the bridge.
+
 ## Allocation and Safety
 
 Validation and borrowed query traversal are allocation-free. Owned decode paths use fallible
