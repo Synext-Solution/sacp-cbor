@@ -1,7 +1,8 @@
 pub mod codec {
     pub mod cbor {
         pub use private_cbor::{
-            CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder, ErrorCode,
+            ByteSink, CborDecode, CborEncode, CborError, DecodeLimits, Decoder, EncodeResult,
+            Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
         };
 
         pub mod query {

@@ -2,8 +2,10 @@
 
 #[cfg(feature = "alloc")]
 use alloc::string::String;
-#[cfg(feature = "collections")]
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+#[cfg(feature = "alloc")]
+use core::marker::PhantomData;
 use core::ops::Range;
 
 #[cfg(feature = "alloc")]
@@ -46,6 +48,12 @@ pub struct Decoder<'de, const CHECKED: bool> {
     items_seen: usize,
     /// Values fully consumed at depth 0 — exactly 1 for a witnessable pass.
     root_values: usize,
+    completed_values: usize,
+    active_traversal_id: Option<u64>,
+    active_traversal_slot: Option<u64>,
+    active_traversal_slot_depth: Option<usize>,
+    #[cfg(feature = "alloc")]
+    next_traversal_id: u64,
     poison: Option<CborError>,
     scratch: wire::SkipScratch,
 }
@@ -71,6 +79,334 @@ pub struct MapDecoder<'a, 'de, const CHECKED: bool> {
     entered: bool,
     pending_value: bool,
     prev_key_range: Option<(usize, usize)>,
+}
+
+#[derive(Debug)]
+#[cfg(feature = "alloc")]
+struct ArrayTraversal {
+    remaining: usize,
+    entered: bool,
+    id: u64,
+    parent_id: Option<u64>,
+    container_depth: usize,
+    pending_serial: Option<usize>,
+    parent_slot_claimed: bool,
+    parent_slot_depth: Option<usize>,
+}
+
+/// Non-borrowing state for an explicitly driven map traversal.
+///
+/// Keys are still consumed by [`Decoder::map_traversal_next_key`], so canonical text-key ordering
+/// remains enforced by the core decoder.
+#[derive(Debug)]
+#[cfg(feature = "alloc")]
+struct MapTraversal {
+    remaining: usize,
+    entered: bool,
+    pending_value: bool,
+    prev_key_range: Option<(usize, usize)>,
+    id: u64,
+    parent_id: Option<u64>,
+    container_depth: usize,
+    pending_serial: Option<usize>,
+    parent_slot_claimed: bool,
+    parent_slot_depth: Option<usize>,
+}
+
+#[derive(Debug)]
+#[cfg(feature = "alloc")]
+enum TraversalState {
+    Array(ArrayTraversal),
+    Map(MapTraversal),
+}
+
+#[cfg(feature = "alloc")]
+struct TraversalIdentity {
+    id: u64,
+    parent_id: Option<u64>,
+    container_depth: usize,
+    parent_slot_claimed: bool,
+    parent_slot_depth: Option<usize>,
+}
+
+/// Caller-owned storage for an explicitly driven, stack-safe decoder traversal.
+///
+/// Prepare the workspace for the largest permitted open-container depth before calling
+/// [`Decoder::with_traversal`]. Successful traversal then performs no allocation.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Default)]
+pub struct TraversalWorkspace {
+    states: Vec<TraversalState>,
+    prepared_capacity: usize,
+}
+
+#[cfg(feature = "alloc")]
+impl TraversalWorkspace {
+    /// Construct an empty traversal workspace.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            states: Vec::new(),
+            prepared_capacity: 0,
+        }
+    }
+
+    /// Fallibly prepare storage for `container_capacity` simultaneously open containers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::AllocationFailed`] when storage cannot be reserved.
+    pub fn prepare(&mut self, container_capacity: usize) -> Result<(), CborError> {
+        self.states.clear();
+        if self.states.capacity() < container_capacity {
+            self.states
+                .try_reserve_exact(container_capacity - self.states.len())
+                .map_err(|_| CborError::new(ErrorCode::AllocationFailed, 0))?;
+        }
+        self.prepared_capacity = container_capacity;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.states.clear();
+    }
+}
+
+/// A generatively branded traversal session.
+///
+/// The session is invariant in its fresh brand and cannot escape or be transferred to another
+/// decoder. Container state remains private inside its caller-owned workspace.
+#[cfg(feature = "alloc")]
+pub struct TraversalSession<'decoder, 'de, 'brand, const CHECKED: bool> {
+    decoder: &'decoder mut Decoder<'de, CHECKED>,
+    workspace: &'decoder mut TraversalWorkspace,
+    brand: PhantomData<fn(&'brand mut ()) -> &'brand mut ()>,
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, const CHECKED: bool> core::ops::Deref for TraversalSession<'_, 'de, '_, CHECKED> {
+    type Target = Decoder<'de, CHECKED>;
+
+    fn deref(&self) -> &Self::Target {
+        self.decoder
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<const CHECKED: bool> core::ops::DerefMut for TraversalSession<'_, '_, '_, CHECKED> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.decoder
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'de, const CHECKED: bool> TraversalSession<'_, 'de, '_, CHECKED> {
+    /// Enter an array in this branded session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar, limit, or protocol error.
+    pub fn begin_array(&mut self) -> Result<(), CborError> {
+        let traversal = self.decoder.begin_array_traversal()?;
+        self.push_state(TraversalState::Array(traversal))
+    }
+
+    /// Return the number of array elements not yet claimed from the active array.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when the active container is not an array.
+    pub fn array_remaining(&mut self) -> Result<usize, CborError> {
+        let Some(TraversalState::Array(traversal)) = self.workspace.states.last() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        Ok(traversal.remaining)
+    }
+
+    /// Claim the next array element slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when the prior child is incomplete.
+    pub fn array_next(&mut self) -> Result<bool, CborError> {
+        let Some(TraversalState::Array(traversal)) = self.workspace.states.last_mut() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        self.decoder.array_traversal_next(traversal)
+    }
+
+    /// Confirm completion of a claimed array child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when the child is incomplete or nested.
+    pub fn array_child_complete(&mut self) -> Result<(), CborError> {
+        let Some(TraversalState::Array(traversal)) = self.workspace.states.last_mut() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        self.decoder.array_traversal_child_complete(traversal)
+    }
+
+    /// Finish an array traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error unless every child completed.
+    pub fn finish_array(&mut self) -> Result<(), CborError> {
+        let Some(TraversalState::Array(_)) = self.workspace.states.last() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        let Some(TraversalState::Array(traversal)) = self.workspace.states.pop() else {
+            unreachable!();
+        };
+        self.decoder.finish_array_traversal(traversal)
+    }
+
+    /// Enter a map in this branded session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar, limit, or protocol error.
+    pub fn begin_map(&mut self) -> Result<(), CborError> {
+        let traversal = self.decoder.begin_map_traversal()?;
+        self.push_state(TraversalState::Map(traversal))
+    }
+
+    /// Return the number of map entries whose values have not yet been claimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when the active container is not a map.
+    pub fn map_remaining(&mut self) -> Result<usize, CborError> {
+        let Some(TraversalState::Map(traversal)) = self.workspace.states.last() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        Ok(traversal.remaining)
+    }
+
+    /// Consume the next canonical map key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar or protocol error.
+    pub fn map_next_key(&mut self) -> Result<Option<MapKey<'de>>, CborError> {
+        let Some(TraversalState::Map(traversal)) = self.workspace.states.last_mut() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        self.decoder.map_traversal_next_key(traversal)
+    }
+
+    /// Claim the pending map value slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when no key is pending.
+    pub fn map_value(&mut self) -> Result<(), CborError> {
+        let Some(TraversalState::Map(traversal)) = self.workspace.states.last_mut() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        self.decoder.map_traversal_value(traversal)
+    }
+
+    /// Confirm completion of a claimed map value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error when the value is incomplete or nested.
+    pub fn map_value_complete(&mut self) -> Result<(), CborError> {
+        let Some(TraversalState::Map(traversal)) = self.workspace.states.last_mut() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        self.decoder.map_traversal_value_complete(traversal)
+    }
+
+    /// Finish a map traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky protocol error unless every entry completed.
+    pub fn finish_map(&mut self) -> Result<(), CborError> {
+        let Some(TraversalState::Map(_)) = self.workspace.states.last() else {
+            return self.decoder.traversal_protocol_error();
+        };
+        let Some(TraversalState::Map(traversal)) = self.workspace.states.pop() else {
+            unreachable!();
+        };
+        self.decoder.finish_map_traversal(traversal)
+    }
+
+    /// Consume one arbitrary canonical value using only this session's prepared traversal stack.
+    ///
+    /// Unlike [`Decoder::skip_value`], this path cannot allocate an internal depth spill. It is
+    /// intended for owners that make traversal capacity explicit in a reusable workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first grammar, decode-limit, or traversal-workspace error and poisons the
+    /// decoder when bytes may have been consumed.
+    pub fn skip_value_prepared(&mut self) -> Result<(), CborError> {
+        let base = self.workspace.states.len();
+        let mut need_value = true;
+        loop {
+            if need_value {
+                match self.decoder.peek_kind()? {
+                    CborKind::Integer => self.decoder.skip_scalar(ScalarKind::Integer)?,
+                    CborKind::Bytes => self.decoder.skip_scalar(ScalarKind::Bytes)?,
+                    CborKind::Text => self.decoder.skip_scalar(ScalarKind::Text)?,
+                    CborKind::Bool => self.decoder.skip_scalar(ScalarKind::Bool)?,
+                    CborKind::Null => self.decoder.skip_scalar(ScalarKind::Null)?,
+                    CborKind::Float => self.decoder.skip_scalar(ScalarKind::Float)?,
+                    CborKind::Array => {
+                        self.begin_array()?;
+                        if self.array_next()? {
+                            continue;
+                        }
+                        self.finish_array()?;
+                    }
+                    CborKind::Map => {
+                        self.begin_map()?;
+                        if self.map_next_key()?.is_some() {
+                            self.map_value()?;
+                            continue;
+                        }
+                        self.finish_map()?;
+                    }
+                }
+                need_value = false;
+            }
+            if self.workspace.states.len() == base {
+                return Ok(());
+            }
+            match self.workspace.states.last() {
+                Some(TraversalState::Array(_)) => {
+                    self.array_child_complete()?;
+                    if self.array_next()? {
+                        need_value = true;
+                    } else {
+                        self.finish_array()?;
+                    }
+                }
+                Some(TraversalState::Map(_)) => {
+                    self.map_value_complete()?;
+                    if self.map_next_key()?.is_some() {
+                        self.map_value()?;
+                        need_value = true;
+                    } else {
+                        self.finish_map()?;
+                    }
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn push_state(&mut self, state: TraversalState) -> Result<(), CborError> {
+        if self.workspace.states.len() == self.workspace.prepared_capacity {
+            return self.decoder.traversal_protocol_error();
+        }
+        self.workspace.states.push(state);
+        Ok(())
+    }
 }
 
 /// Raw parts of one consumed integer-kind value (the single counted
@@ -195,6 +531,9 @@ impl<'de> Decoder<'de, true> {
         if self.root_values != 1 {
             return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
         }
+        if self.active_traversal_id.is_some() {
+            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
+        }
         Ok(CanonicalCborRef::new(data))
     }
 }
@@ -216,6 +555,51 @@ impl<'de> Decoder<'de, false> {
 }
 
 impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
+    /// Run an explicitly-driven traversal in a fresh generative brand.
+    ///
+    /// The branded session cannot escape `f` or be unified with a session for another decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closure error, or a sticky traversal-protocol error when the closure returns
+    /// successfully without finishing every opened container.
+    #[cfg(feature = "alloc")]
+    pub fn with_traversal<R, E, F>(
+        &mut self,
+        workspace: &mut TraversalWorkspace,
+        f: F,
+    ) -> Result<R, E>
+    where
+        F: for<'brand> FnOnce(&mut TraversalSession<'_, 'de, 'brand, CHECKED>) -> Result<R, E>,
+        E: From<CborError>,
+    {
+        workspace.reset();
+        let mut session = TraversalSession {
+            decoder: self,
+            workspace,
+            brand: PhantomData,
+        };
+        let result = f(&mut session);
+        match result {
+            Ok(value) if session.workspace.states.is_empty() => Ok(value),
+            Ok(_) => {
+                let error = session
+                    .decoder
+                    .traversal_protocol_error::<()>()
+                    .unwrap_err();
+                session.workspace.reset();
+                Err(E::from(error))
+            }
+            Err(error) => {
+                if !session.workspace.states.is_empty() {
+                    let _ = session.decoder.traversal_protocol_error::<()>();
+                }
+                session.workspace.reset();
+                Err(error)
+            }
+        }
+    }
+
     const fn new_with(
         bytes: &'de [u8],
         limits: DecodeLimits,
@@ -234,6 +618,12 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             depth: 0,
             items_seen: 0,
             root_values: 0,
+            completed_values: 0,
+            active_traversal_id: None,
+            active_traversal_slot: None,
+            active_traversal_slot_depth: None,
+            #[cfg(feature = "alloc")]
+            next_traversal_id: 0,
             poison: None,
             scratch: wire::SkipScratch::new(),
         })
@@ -248,8 +638,19 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// taken and predicts perfectly.
     #[inline]
     fn note_value_end(&mut self) {
+        let Some(value) = self.completed_values.checked_add(1) else {
+            self.poison(ErrorCode::LengthOverflow, self.position());
+            return;
+        };
+        self.completed_values = value;
         if CHECKED && self.depth == 0 {
             self.root_values += 1;
+        }
+        if self.active_traversal_slot == self.active_traversal_id
+            && self.active_traversal_slot_depth == Some(self.depth)
+        {
+            self.active_traversal_slot = None;
+            self.active_traversal_slot_depth = None;
         }
     }
 
@@ -266,6 +667,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     fn seal_value<T>(&mut self, result: Result<T, CborError>) -> Result<T, CborError> {
         match result {
             Ok(value) => {
+                if let Some(active) = self.active_traversal_id {
+                    if self.active_traversal_slot != Some(active) {
+                        return self.traversal_protocol_error();
+                    }
+                }
                 self.note_value_end();
                 Ok(value)
             }
@@ -279,7 +685,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// Poison a non-completing operation's failure (container entry, key
     /// reads): sticky, but no value completion on success.
     #[inline]
-    fn seal_step<T>(&mut self, result: Result<T, CborError>) -> Result<T, CborError> {
+    const fn seal_step<T>(&mut self, result: Result<T, CborError>) -> Result<T, CborError> {
         if let Err(err) = &result {
             self.poison_err(*err);
         }
@@ -287,7 +693,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     #[inline]
-    fn poison_err(&mut self, err: CborError) {
+    const fn poison_err(&mut self, err: CborError) {
         if self.poison.is_none() {
             self.poison = Some(err);
         }
@@ -366,7 +772,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 
     #[inline]
-    fn poison(&mut self, code: ErrorCode, offset: usize) {
+    const fn poison(&mut self, code: ErrorCode, offset: usize) {
         if self.poison.is_none() {
             self.poison = Some(CborError::new(code, offset));
         }
@@ -716,6 +1122,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns `ExpectedArray` if the next value is not an array, or a limit error.
     pub fn array(&mut self) -> Result<ArrayDecoder<'_, 'de, CHECKED>, CborError> {
+        self.require_claimed_traversal_slot()?;
         let entry = self.array_entry();
         let (len, entered) = self.seal_step(entry)?;
         if !entered {
@@ -749,6 +1156,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns `ExpectedMap` if the next value is not a map, or a limit error.
     pub fn map(&mut self) -> Result<MapDecoder<'_, 'de, CHECKED>, CborError> {
+        self.require_claimed_traversal_slot()?;
         let entry = self.map_entry();
         let (len, entered) = self.seal_step(entry)?;
         if !entered {
@@ -762,6 +1170,308 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             pending_value: false,
             prev_key_range: None,
         })
+    }
+
+    /// Enter an array without borrowing this decoder for the container lifetime.
+    ///
+    /// The returned state must be driven to completion with
+    /// [`Self::array_traversal_next`] and [`Self::finish_array_traversal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar, resource-limit, or traversal-protocol error.
+    #[cfg(feature = "alloc")]
+    fn begin_array_traversal(&mut self) -> Result<ArrayTraversal, CborError> {
+        self.require_claimed_traversal_slot()?;
+        let entry = self.array_entry();
+        let (remaining, entered) = self.seal_step(entry)?;
+        let identity = self.begin_traversal_identity()?;
+        if !entered {
+            self.note_value_end();
+        }
+        Ok(ArrayTraversal {
+            remaining,
+            entered,
+            id: identity.id,
+            parent_id: identity.parent_id,
+            container_depth: identity.container_depth,
+            pending_serial: None,
+            parent_slot_claimed: identity.parent_slot_claimed,
+            parent_slot_depth: identity.parent_slot_depth,
+        })
+    }
+
+    /// Return the next array element slot, consuming exactly one declared slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error when the prior child is incomplete or stale.
+    #[cfg(feature = "alloc")]
+    fn array_traversal_next(&mut self, traversal: &mut ArrayTraversal) -> Result<bool, CborError> {
+        self.sync_array_traversal(traversal)?;
+        if traversal.remaining == 0 {
+            return Ok(false);
+        }
+        traversal.remaining -= 1;
+        traversal.pending_serial = Some(self.completed_values);
+        self.active_traversal_slot = Some(traversal.id);
+        self.active_traversal_slot_depth = Some(traversal.container_depth);
+        Ok(true)
+    }
+
+    /// Confirm that the claimed array element completed and restore the traversal to its next
+    /// element phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error when the child is incomplete or nested.
+    #[cfg(feature = "alloc")]
+    fn array_traversal_child_complete(
+        &mut self,
+        traversal: &mut ArrayTraversal,
+    ) -> Result<(), CborError> {
+        self.sync_array_traversal(traversal)
+    }
+
+    /// Close a completed explicitly-driven array traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error unless every declared element completed.
+    #[cfg(feature = "alloc")]
+    fn finish_array_traversal(&mut self, mut traversal: ArrayTraversal) -> Result<(), CborError> {
+        self.sync_array_traversal(&mut traversal)?;
+        if traversal.remaining != 0 {
+            return self.traversal_protocol_error();
+        }
+        self.active_traversal_id = traversal.parent_id;
+        self.active_traversal_slot = traversal
+            .parent_id
+            .filter(|_| traversal.parent_slot_claimed);
+        self.active_traversal_slot_depth = traversal.parent_slot_depth;
+        if traversal.entered {
+            self.exit_container();
+            self.note_value_end();
+        }
+        Ok(())
+    }
+
+    /// Enter a map without borrowing this decoder for the container lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar, resource-limit, or traversal-protocol error.
+    #[cfg(feature = "alloc")]
+    fn begin_map_traversal(&mut self) -> Result<MapTraversal, CborError> {
+        self.require_claimed_traversal_slot()?;
+        let entry = self.map_entry();
+        let (remaining, entered) = self.seal_step(entry)?;
+        let identity = self.begin_traversal_identity()?;
+        if !entered {
+            self.note_value_end();
+        }
+        Ok(MapTraversal {
+            remaining,
+            entered,
+            pending_value: false,
+            prev_key_range: None,
+            id: identity.id,
+            parent_id: identity.parent_id,
+            container_depth: identity.container_depth,
+            pending_serial: None,
+            parent_slot_claimed: identity.parent_slot_claimed,
+            parent_slot_depth: identity.parent_slot_depth,
+        })
+    }
+
+    /// Consume the next canonical text key from an explicitly-driven map.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky grammar or traversal-protocol error.
+    #[cfg(feature = "alloc")]
+    fn map_traversal_next_key(
+        &mut self,
+        traversal: &mut MapTraversal,
+    ) -> Result<Option<MapKey<'de>>, CborError> {
+        self.sync_map_traversal(traversal)?;
+        if traversal.pending_value {
+            return self.traversal_protocol_error();
+        }
+        if traversal.remaining == 0 {
+            return Ok(None);
+        }
+        let result = (|| {
+            let key_start = self.position();
+            let (major, ai, off) = self.read_header()?;
+            if major != 3 {
+                return Err(CborError::new(ErrorCode::MapKeyMustBeText, off));
+            }
+            let key = self.parse_text_from_header(off, ai)?;
+            let key_end = self.position();
+            if CHECKED {
+                wire::check_map_key_order(
+                    self.data(),
+                    &mut traversal.prev_key_range,
+                    key_start,
+                    key_end,
+                )?;
+            }
+            Ok(Some(MapKey {
+                text: key,
+                offset: key_start,
+                encoded_range: key_start..key_end,
+            }))
+        })();
+        match result {
+            Ok(key) => {
+                traversal.pending_value = true;
+                Ok(key)
+            }
+            Err(error) => {
+                self.poison_err(error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Consume the pending value slot of an explicitly-driven map.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error when no key is pending.
+    #[cfg(feature = "alloc")]
+    fn map_traversal_value(&mut self, traversal: &mut MapTraversal) -> Result<(), CborError> {
+        self.sync_traversal_identity(traversal.id, traversal.container_depth)?;
+        if !traversal.pending_value {
+            return self.traversal_protocol_error();
+        }
+        traversal.pending_value = false;
+        traversal.remaining -= 1;
+        traversal.pending_serial = Some(self.completed_values);
+        self.active_traversal_slot = Some(traversal.id);
+        self.active_traversal_slot_depth = Some(traversal.container_depth);
+        Ok(())
+    }
+
+    /// Confirm that the pending map value completed before the next key is requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error when the value is incomplete or nested.
+    #[cfg(feature = "alloc")]
+    fn map_traversal_value_complete(
+        &mut self,
+        traversal: &mut MapTraversal,
+    ) -> Result<(), CborError> {
+        self.sync_map_traversal(traversal)
+    }
+
+    /// Close a completed explicitly-driven map traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sticky traversal-protocol error unless every entry completed.
+    #[cfg(feature = "alloc")]
+    fn finish_map_traversal(&mut self, mut traversal: MapTraversal) -> Result<(), CborError> {
+        self.sync_map_traversal(&mut traversal)?;
+        if traversal.remaining != 0 || traversal.pending_value {
+            return self.traversal_protocol_error();
+        }
+        self.active_traversal_id = traversal.parent_id;
+        self.active_traversal_slot = traversal
+            .parent_id
+            .filter(|_| traversal.parent_slot_claimed);
+        self.active_traversal_slot_depth = traversal.parent_slot_depth;
+        if traversal.entered {
+            self.exit_container();
+            self.note_value_end();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    fn begin_traversal_identity(&mut self) -> Result<TraversalIdentity, CborError> {
+        let id = self.next_traversal_id;
+        let Some(next) = id.checked_add(1) else {
+            let error = CborError::new(ErrorCode::LengthOverflow, self.position());
+            self.poison_err(error);
+            return Err(error);
+        };
+        self.next_traversal_id = next;
+        let parent_id = self.active_traversal_id;
+        let parent_slot_claimed =
+            parent_id.is_some_and(|parent| self.active_traversal_slot == Some(parent));
+        let parent_slot_depth = self.active_traversal_slot_depth;
+        self.active_traversal_id = Some(id);
+        self.active_traversal_slot = None;
+        self.active_traversal_slot_depth = None;
+        Ok(TraversalIdentity {
+            id,
+            parent_id,
+            container_depth: self.depth,
+            parent_slot_claimed,
+            parent_slot_depth,
+        })
+    }
+
+    fn require_claimed_traversal_slot(&mut self) -> Result<(), CborError> {
+        if let Some(active) = self.active_traversal_id {
+            if self.active_traversal_slot != Some(active) {
+                return self.traversal_protocol_error();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    fn sync_array_traversal(&mut self, traversal: &mut ArrayTraversal) -> Result<(), CborError> {
+        self.sync_traversal_identity(traversal.id, traversal.container_depth)?;
+        let had_pending = traversal.pending_serial.is_some();
+        self.sync_traversal_child(&mut traversal.pending_serial)?;
+        if had_pending {
+            self.active_traversal_slot = None;
+            self.active_traversal_slot_depth = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    fn sync_map_traversal(&mut self, traversal: &mut MapTraversal) -> Result<(), CborError> {
+        self.sync_traversal_identity(traversal.id, traversal.container_depth)?;
+        let had_pending = traversal.pending_serial.is_some();
+        self.sync_traversal_child(&mut traversal.pending_serial)?;
+        if had_pending {
+            self.active_traversal_slot = None;
+            self.active_traversal_slot_depth = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    fn sync_traversal_identity(&mut self, id: u64, depth: usize) -> Result<(), CborError> {
+        self.check_poison()?;
+        if self.active_traversal_id != Some(id) || self.depth != depth {
+            return self.traversal_protocol_error();
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    const fn sync_traversal_child(&mut self, serial: &mut Option<usize>) -> Result<(), CborError> {
+        if let Some(before) = *serial {
+            if self.completed_values <= before {
+                return self.traversal_protocol_error();
+            }
+            *serial = None;
+        }
+        Ok(())
+    }
+
+    const fn traversal_protocol_error<T>(&mut self) -> Result<T, CborError> {
+        let error = CborError::new(ErrorCode::MalformedCanonical, self.position());
+        self.poison_err(error);
+        Err(error)
     }
 
     fn map_entry(&mut self) -> Result<(usize, bool), CborError> {

@@ -289,7 +289,7 @@ fn array_iter_skips_deep_nested_values() {
     let depth = 40usize;
     let mut bytes = Vec::with_capacity(depth + 3);
     bytes.push(0x82);
-    bytes.extend(std::iter::repeat(0x81).take(depth));
+    bytes.extend(std::iter::repeat_n(0x81, depth));
     bytes.push(0xf6);
     bytes.push(0xf5);
 

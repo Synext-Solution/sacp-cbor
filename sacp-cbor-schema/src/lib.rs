@@ -15,22 +15,51 @@
 
 extern crate alloc;
 
-/// Maximum fields allowed in one record node.
-pub const MAX_FIELDS_PER_RECORD: usize = 64;
-/// Maximum value constraints allowed on one field.
-pub const MAX_CONSTRAINTS_PER_FIELD: usize = 16;
-/// Maximum enum members allowed in one enum constraint.
-pub const MAX_ENUM_MEMBERS: usize = 64;
-/// Maximum union alternatives allowed in one union type.
-pub const MAX_UNION_ALTERNATIVES: usize = 64;
-/// Maximum presence couplings allowed in one record node.
-pub const MAX_COUPLINGS_PER_RECORD: usize = 16;
 /// Minimum keys allowed in a multi-key coupling.
 pub const MIN_COUPLING_KEYS: usize = 2;
-/// Maximum keys allowed in a multi-key coupling.
-pub const MAX_COUPLING_KEYS: usize = 16;
-/// Maximum schema type nesting depth.
-pub const MAX_NESTING_DEPTH: usize = 32;
+
+/// Caller-owned limits for schema compilation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchemaCompileLimits {
+    /// Maximum fields in one record.
+    pub max_fields_per_record: usize,
+    /// Maximum constraints on one field.
+    pub max_constraints_per_field: usize,
+    /// Maximum alternatives in one union.
+    pub max_union_alternatives: usize,
+    /// Maximum couplings in one record.
+    pub max_couplings_per_record: usize,
+    /// Maximum nested schema depth.
+    pub max_schema_depth: usize,
+    /// Maximum total compiled nodes, including enum members and coupling keys.
+    pub max_total_nodes: usize,
+    /// Maximum total owned source bytes copied into the compiled schema.
+    pub max_total_owned_bytes: usize,
+}
+
+impl SchemaCompileLimits {
+    /// Construct explicit compile limits.
+    #[must_use]
+    pub const fn new(
+        max_fields_per_record: usize,
+        max_constraints_per_field: usize,
+        max_union_alternatives: usize,
+        max_couplings_per_record: usize,
+        max_schema_depth: usize,
+        max_total_nodes: usize,
+        max_total_owned_bytes: usize,
+    ) -> Self {
+        Self {
+            max_fields_per_record,
+            max_constraints_per_field,
+            max_union_alternatives,
+            max_couplings_per_record,
+            max_schema_depth,
+            max_total_nodes,
+            max_total_owned_bytes,
+        }
+    }
+}
 
 pub mod compat;
 pub mod compile;
@@ -40,7 +69,11 @@ pub mod ir;
 
 mod check;
 
-pub use crate::compat::{Containment, Direction, NonDerivation, NonDerivationReason};
+pub use crate::check::ValidationWorkspace;
+pub use crate::compat::{
+    Inclusion, InclusionLimits, InclusionProof, InclusionWorkspace, NonDerivation,
+    NonDerivationReason, WireCounterexample,
+};
 pub use crate::compile::RecordSchema;
 pub use crate::error::{ConstraintFault, Fault, RecordError, SchemaError, ShapeFault};
 pub use crate::int::Int;
@@ -51,24 +84,12 @@ pub use sacp_cbor::{CanonicalCborRef, CborError, DecodeLimits, ValidationOptions
 
 #[cfg(kani)]
 mod proofs {
-    use super::{compat, int::Int};
+    use super::int::Int;
 
     #[kani::proof]
     fn int_order_is_reflexive_for_small_values() {
         let v: i64 = kani::any();
         let a = Int::from(v);
         assert!(a == a);
-    }
-
-    #[kani::proof]
-    fn coupling_masks_classify_together() {
-        let mask: u64 = kani::any();
-        let present: u64 = kani::any();
-        let narrowed = mask & 0xffff;
-        let bits = present & narrowed;
-        assert_eq!(
-            compat::together_holds_for_mask(bits, narrowed),
-            bits == 0 || bits == narrowed
-        );
     }
 }

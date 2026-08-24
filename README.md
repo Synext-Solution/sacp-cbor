@@ -28,11 +28,11 @@ This repository publishes five crates with different responsibilities:
 
 | Crate | Current line | Responsibility |
 |---|---:|---|
-| `sacp-cbor` | `0.17` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
-| `sacp-cbor-derive` | `0.17` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
-| `sacp-cbor-schema` | `0.1` | Closed-record schema validation over canonical values: single-pass grammar + shape + value-constraint checking, and structural containment between schema versions. |
-| `sacp-cbor-abi` | `0.6` | Stable public ABI schemas, numeric field/variant IDs, compatibility reports, runtime validation hooks, and zero-copy ABI views. |
-| `sacp-cbor-abi-derive` | `0.3` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
+| `sacp-cbor` | `0.18` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
+| `sacp-cbor-derive` | `0.18` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
+| `sacp-cbor-schema` | `0.2` | Closed-record schema validation over canonical values, with explicit compile/validation limits and replayable inclusion results. |
+| `sacp-cbor-abi` | `0.7` | Stable public ABI schemas, numeric field/variant IDs, structural runtime admission, compatibility reports, and zero-copy ABI views. |
+| `sacp-cbor-abi-derive` | `0.4` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
 
 Use `sacp-cbor` for canonical CBOR infrastructure and internal Rust-shape codecs. Use
 `sacp-cbor-abi` for public protocols that must remain stable across Rust refactors. Use
@@ -97,22 +97,30 @@ This crate supports `no_std` when default features are disabled. Default feature
 **Default Rust (std + alloc):**
 ```toml
 [dependencies]
-sacp-cbor = "0.17"
+sacp-cbor = "0.18"
 ```
 
 **`no_std` + `alloc`:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.17", default-features = false, features = ["alloc"] }
+sacp-cbor = { version = "0.18", default-features = false, features = ["alloc"] }
 ```
 
 **`std` + serde + sha2:**
 ```toml
 [dependencies]
-sacp-cbor = { version = "0.17", default-features = false, features = ["std", "serde", "sha2"] }
+sacp-cbor = { version = "0.18", default-features = false, features = ["std", "serde", "sha2"] }
 ```
 
 > In Rust code the crate name is typically `sacp_cbor` (hyphen becomes underscore).
+
+### Minimum supported Rust versions
+
+- `sacp-cbor`, `sacp-cbor-abi`, and `sacp-cbor-schema`: Rust 1.85. The core and ABI
+  lines expose SHA-2 0.11, whose supported compiler floor is Rust 1.85; schema's normal
+  dependency closure includes the core crate.
+- `sacp-cbor-derive` and `sacp-cbor-abi-derive`: Rust 1.75. These proc-macro crates do
+  not depend on the runtime or SHA-2.
 
 ---
 
@@ -498,21 +506,35 @@ These wrappers live under `sacp_cbor::value` and `sacp_cbor::scalar`.
 
 ## Canonical encoding API (`alloc`)
 
-If you want to produce canonical CBOR bytes directly, use `Encoder`.
+`Encoder<S>` writes one canonical root value directly into any `ByteSink`.
+There is one state machine for vector, counting, digest, I/O, serde, derive,
+and custom-sink encoding. Native encoding and strict serde stream payloads
+without staging them in a temporary `Vec`; the explicitly selected serde
+`sorted_maps` mode buffers entries within the encoder's configured limits.
 
 ### `Encoder`
 
 Create:
 
 - `Encoder::new()`
+- `Encoder::with_sink(sink)`
+- `Encoder::with_sink_and_limits(sink, EncodeLimits)`
 - `Encoder::try_with_capacity(usize) -> Result<Encoder, CborError>`
 - `Encoder::with_limits(EncodeLimits) -> Result<Encoder, CborError>`
 - `Encoder::try_with_capacity_and_limits(usize, EncodeLimits) -> Result<Encoder, CborError>`
 
 Extract:
 
-- `finish() -> Result<CanonicalCbor, CborError>` (proves exactly one complete root value)
-- `as_bytes() -> &[u8]` (current buffer)
+- `finish() -> Result<S::Output, EncodeError<S::Error>>` (only succeeds for exactly one complete root value)
+- `as_bytes() -> &[u8]` on the vector-backed encoder (current buffer)
+- `encode_to_canonical(&value)` when an owned canonical witness is required
+
+Built-in sinks:
+
+- `VecSink` returns `Vec<u8>`
+- `CountingSink` returns the encoded byte count without retaining payload bytes
+- `DigestSink<D>` hashes bytes incrementally (`sha2` feature)
+- `IoSink<W>` writes with `std::io::Write` and returns the writer (`std` feature)
 
 Write scalars:
 
@@ -535,6 +557,15 @@ Raw splice:
 Limited encoders enforce output bytes, depth, item count, array/map length, and bytes/text length
 before accepting writes. Raw splices are scanned against those limits before copying.
 
+Every failure is sticky. The fallible encoding call that first fails returns
+the precise `EncodeError::Cbor` or owned `EncodeError::Sink`; every later
+fallible encoding or finish operation returns `EncodeError::Poisoned`.
+Read-only observations remain available. `len()` counts only whole chunks whose
+sink writes returned `Ok`, and `is_empty()` means that no such chunk was
+confirmed; neither claims that a failing sink accepted no partial bytes. A sink
+may accept part of a write before returning an error, so the generic encoder
+never promises rollback.
+
 **Key rule:** When emitting maps via `Encoder::map`, you must insert entries in **canonical key order** using `map.entry`. The encoder enforces this and will error if you violate it.
 
 **Complexity**
@@ -542,8 +573,10 @@ before accepting writes. Raw splices are scanned against those limits before cop
 - Encoding operations are proportional to the bytes written:
 
   - Time: `O(output_bytes)`
-  - Space: output buffer + small stack
-- `map` ordering checks compare encoded key bytes:
+  - Space: sink storage + `O(depth + active_previous_key_bytes)` encoder state;
+    each active map level retains one reusable previous-key string
+- `map` ordering checks compare source text keys by canonical encoded length
+  and UTF-8 bytes before emitting the next key:
 
   - Additional time: `O(total key bytes)` across all entries
 
@@ -552,9 +585,9 @@ before accepting writes. Raw splices are scanned against those limits before cop
 Signature:
 
 ```rust
-fn entry<F>(&mut self, key: &str, f: F) -> Result<(), CborError>
+fn entry<F>(&mut self, key: &str, f: F) -> EncodeResult<(), S>
 where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>;
+    F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>;
 ```
 
 Properties:
@@ -564,7 +597,9 @@ Properties:
 
   - **no duplicate keys**
   - **strict canonical order**
-- On any error inside the closure `f`, the partially-written entry is rolled back (buffer truncated).
+- A duplicate or descending key is rejected before any byte of that offending
+  key reaches the sink.
+- Errors poison the encoder; bytes already accepted by the sink are not rolled back.
 
 Errors you may see:
 
@@ -608,8 +643,8 @@ The path must name a module that exposes the derive runtime API:
 ```rust
 pub mod cbor {
     pub use sacp_cbor::{
-        CanonicalCbor, CborDecode, CborEncode, CborError, DecodeLimits, Decoder, Encoder,
-        ErrorCode,
+        ByteSink, CanonicalCbor, CborDecode, CborEncode, CborError, DecodeLimits, Decoder,
+        EncodeResult, Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
     };
 
     pub mod query {
@@ -1028,8 +1063,8 @@ use sacp_cbor::{serde::{from_slice, to_vec}, DecodeLimits};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct Msg {
-  typ: String,
   n: i64,
+  typ: String,
 }
 
 let msg = Msg { typ: "hi".into(), n: 5 };
@@ -1039,7 +1074,10 @@ let decoded: Msg = from_slice(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
 assert_eq!(decoded, msg);
 ```
 
-For map types whose iteration order is not already canonical, opt into sorted map encoding:
+Strict serde streams maps and structs exactly in the order supplied by `Serialize` and rejects
+duplicate or descending text keys before writing the offending key. Struct declarations must
+therefore place serialized field names in canonical key order. For map types or struct declarations
+whose order is not already canonical, explicitly opt into bounded sorted-map encoding:
 
 ```rust
 use sacp_cbor::serde::SerdeOptions;
@@ -1050,11 +1088,15 @@ let bytes = SerdeOptions::sorted_maps().to_vec(&msg)?;
 ### Serde limitations (important)
 
 - Map keys must serialize as **text** (`&str`/`String`/`char` etc). Non-string keys fail with `MapKeyMustBeText`.
+- `SerdeOptions::strict()` does not buffer payload values. `SerdeOptions::sorted_maps()` explicitly
+  buffers keys and encoded values, but preflights map length/items/depth/output and applies the
+  remaining cumulative encoder budgets to every buffered entry.
 - Serde `Option<T>` uses the same injective `{ "none": null }` / `{ "some": value }` shape as native `Option<T>`.
 - Integer support via serde is limited to what serde exposes:
 
   - Very large bignums (more than 128 bits) cannot be losslessly represented through serde numeric primitives.
-- Schema mismatches return `ErrorCode::SerdeError` (offset 0); structural parse errors preserve offsets when available.
+- Custom serde mismatches return `ErrorCode::SerdeError`; encoder profile errors
+  report the current output offset and structural parse errors preserve input offsets.
 
 ---
 
@@ -1160,7 +1202,8 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 - `decode_canonical(canon_ref, limits) -> Result<T, CborError>`
 - `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)
 - `encode_to_canonical(&value) -> Result<CanonicalCbor, CborError>` (`alloc`)
-- `CborEncode::encode_array_item` lets custom encoders use `ArrayEncoder` directly for array elements; the default path remains guarded.
+- `CborEncode::encode` receives a `ValueEncoder`, not the underlying encoder;
+  `Encoder::encode` owns slot accounting and makes every trait failure sticky.
 
 Common trait coverage for derive-driven models includes:
 
@@ -1211,10 +1254,11 @@ Common trait coverage for derive-driven models includes:
 
 ### Encoding (`alloc`)
 
-- `Encoder`
+- `Encoder<S: ByteSink>`
 
-  - streaming canonical CBOR output
+  - sink-generic streaming canonical CBOR output
   - maps require canonical key order; enforced
+  - first failure is returned precisely; later fallible encode/finish calls return `Poisoned`
 
 - `encode::ArrayEncoder`, `encode::MapEncoder`
 
@@ -1273,7 +1317,7 @@ Common trait coverage for derive-driven models includes:
 - The validator is intentionally strict and rejects many CBOR features by design.
 - All offset-bearing errors aim to point at the byte position where the violation is detected (serde conversions generally return offset 0).
 - Bounded Kani proof harnesses for integer minimality, checked primitive decoding, profile
-  classifiers, canonical key comparators, and encoder slot rollback are compiled under `cfg(kani)`.
+  classifiers, canonical key comparators, and sticky encoder slot accounting are compiled under `cfg(kani)`.
   Run `scripts/proof.sh` on a Kani-supported host after installing and setting up `cargo-kani`.
 
 ---

@@ -10,8 +10,8 @@ use core::fmt;
 
 use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::{
-    CanonicalCbor, CanonicalCborRef, CborDecode, CborEncode, CborError, DecodeLimits, Decoder,
-    Encoder, ErrorCode,
+    ByteSink, CanonicalCbor, CanonicalCborRef, CborDecode, CborEncode, CborError, DecodeLimits,
+    Decoder, EncodeResult, ErrorCode, ValueEncoder,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,12 +25,9 @@ mod proofs;
 
 pub use edit::{AbiDeleteMode, AbiFieldSetEditor, AbiPatchValue, AbiSetMode};
 pub use runtime::{
-    compile_runtime_schema, AbiSchemaRegistry, NoRuntimeValidationHooks, RuntimeAbiError,
-    RuntimeFieldContext, RuntimeFieldInfo, RuntimeFieldRef, RuntimeFieldSetSchema,
-    RuntimeFieldSetView, RuntimeHookOutcome, RuntimeInline, RuntimeNamedDecision,
-    RuntimeNamedResolution, RuntimeRejectNamed, RuntimeResolveNamed, RuntimeSchema,
-    RuntimeTypeContext, RuntimeTypeMode, RuntimeValidationConfig, RuntimeValidationHooks,
-    RuntimeVecItemContext,
+    compile_runtime_schema, AbiSchemaRegistry, NoNamedSchemas, RuntimeAbiError, RuntimeEnumSchema,
+    RuntimeEnumView, RuntimeFieldInfo, RuntimeFieldRef, RuntimeFieldSetSchema, RuntimeFieldSetView,
+    RuntimeSchema, RuntimeValidationLimits, RuntimeValidationWorkspace, RuntimeVariantInfo,
 };
 #[cfg(feature = "derive")]
 pub use sacp_cbor_abi_derive::CborAbi;
@@ -55,40 +52,40 @@ pub mod __private {
     }
 
     /// Encode one ABI field ID in a field-set array.
-    pub fn encode_field_id(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    pub fn encode_field_id<S: sacp_cbor::ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         id: u32,
-    ) -> Result<(), sacp_cbor::CborError> {
-        array.value_with(|enc| sacp_cbor::CborEncode::encode(&id, enc))
+    ) -> sacp_cbor::EncodeResult<(), S> {
+        array.value(&id)
     }
 
     /// Encode preserved unknown fields whose IDs are lower than `before_id`.
-    pub fn encode_unknown_fields_before(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    pub fn encode_unknown_fields_before<S: sacp_cbor::ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         unknown: &UnknownFields,
         cursor: &mut usize,
         before_id: u32,
-    ) -> Result<(), sacp_cbor::CborError> {
+    ) -> sacp_cbor::EncodeResult<(), S> {
         let fields = unknown.as_slice();
         while *cursor < fields.len() && fields[*cursor].id < before_id {
             encode_unknown_field(array, &fields[*cursor])?;
             *cursor += 1;
         }
         if *cursor < fields.len() && fields[*cursor].id == before_id {
-            return Err(sacp_cbor::CborError::new(
+            return Err(sacp_cbor::EncodeError::Cbor(sacp_cbor::CborError::new(
                 sacp_cbor::ErrorCode::DuplicateMapKey,
                 0,
-            ));
+            )));
         }
         Ok(())
     }
 
     /// Encode remaining preserved unknown fields.
-    pub fn encode_remaining_unknown_fields(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    pub fn encode_remaining_unknown_fields<S: sacp_cbor::ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         unknown: &UnknownFields,
         cursor: &mut usize,
-    ) -> Result<(), sacp_cbor::CborError> {
+    ) -> sacp_cbor::EncodeResult<(), S> {
         let fields = unknown.as_slice();
         while *cursor < fields.len() {
             encode_unknown_field(array, &fields[*cursor])?;
@@ -111,10 +108,10 @@ pub mod __private {
         Ok(())
     }
 
-    fn encode_unknown_field(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    fn encode_unknown_field<S: sacp_cbor::ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         field: &super::UnknownField,
-    ) -> Result<(), sacp_cbor::CborError> {
+    ) -> sacp_cbor::EncodeResult<(), S> {
         encode_field_id(array, field.id)?;
         array.raw_cbor(field.value.as_canonical_ref())
     }
@@ -123,7 +120,7 @@ pub mod __private {
 /// Encode a public ABI value.
 pub trait AbiEncode {
     /// Encode `self` into canonical SACP-CBOR bytes.
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError>;
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
 }
 
 /// Decode a public ABI value.
@@ -229,9 +226,7 @@ impl Schema {
 
     /// Canonical SACP-CBOR encoding of the selected schema normal form.
     pub fn canonical_bytes(&self, kind: SchemaHashKind) -> Result<CanonicalCbor, CborError> {
-        let mut enc = Encoder::new();
-        encode_schema(self, kind, &mut enc)?;
-        enc.finish()
+        sacp_cbor::encode_to_canonical(&SchemaNormalForm { schema: self, kind })
     }
 
     /// SHA-256 over the wire-significant schema normal form.
@@ -588,9 +583,13 @@ impl Directional {
 
 /// Encode an ABI value to owned canonical CBOR.
 pub fn encode_to_canonical<T: AbiEncode>(value: &T) -> Result<CanonicalCbor, CborError> {
-    let mut enc = Encoder::new();
-    value.abi_encode(&mut enc)?;
-    enc.finish()
+    struct AbiValue<'a, T: ?Sized>(&'a T);
+    impl<T: AbiEncode + ?Sized> CborEncode for AbiValue<'_, T> {
+        fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            self.0.abi_encode(enc)
+        }
+    }
+    sacp_cbor::encode_to_canonical(&AbiValue(value))
 }
 
 /// Encode an ABI value to a vector of canonical bytes.
@@ -971,33 +970,44 @@ fn compare_type_ref(
     }
 }
 
-fn encode_schema(
+struct SchemaNormalForm<'a> {
+    schema: &'a Schema,
+    kind: SchemaHashKind,
+}
+
+impl CborEncode for SchemaNormalForm<'_> {
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        encode_schema(self.schema, self.kind, enc)
+    }
+}
+
+fn encode_schema<S: ByteSink>(
     schema: &Schema,
     kind: SchemaHashKind,
-    enc: &mut Encoder,
-) -> Result<(), CborError> {
+    enc: &mut ValueEncoder<'_, S>,
+) -> EncodeResult<(), S> {
     match kind {
         SchemaHashKind::Wire => enc.array(3, |array| {
             encode_item(array, &schema.profile)?;
             encode_item(array, &schema.type_id)?;
-            array.value_with(|enc| encode_type_def(&schema.root, kind, enc))?;
+            array.encode_with(|enc| encode_type_def(&schema.root, kind, enc))?;
             Ok(())
         }),
         SchemaHashKind::Full => enc.array(4, |array| {
             encode_item(array, &schema.profile)?;
             encode_item(array, &schema.type_id)?;
             encode_item(array, &schema.version)?;
-            array.value_with(|enc| encode_type_def(&schema.root, kind, enc))?;
+            array.encode_with(|enc| encode_type_def(&schema.root, kind, enc))?;
             Ok(())
         }),
     }
 }
 
-fn encode_type_def(
+fn encode_type_def<S: ByteSink>(
     def: &TypeDef,
     kind: SchemaHashKind,
-    enc: &mut Encoder,
-) -> Result<(), CborError> {
+    enc: &mut ValueEncoder<'_, S>,
+) -> EncodeResult<(), S> {
     match def {
         TypeDef::Struct(field_set) => enc.array(3, |array| {
             encode_item(array, &"struct")?;
@@ -1009,12 +1019,12 @@ fn encode_type_def(
             encode_item(array, &"enum")?;
             encode_item(array, &enum_def.unknown_fields.as_str())?;
             encode_item(array, &enum_def.unknown_variants.as_str())?;
-            array.value_with(|enc| {
+            array.encode_with(|enc| {
                 let mut variants: Vec<&VariantDef> = enum_def.variants.iter().collect();
-                variants.sort_by_key(|variant| variant.id);
+                variants.sort_unstable_by_key(|variant| variant.id);
                 enc.array(variants.len(), |array| {
                     for variant in variants {
-                        array.value_with(|enc| encode_variant(variant, kind, enc))?;
+                        array.encode_with(|enc| encode_variant(variant, kind, enc))?;
                     }
                     Ok(())
                 })
@@ -1023,61 +1033,61 @@ fn encode_type_def(
         }),
         TypeDef::Transparent { inner } => enc.array(2, |array| {
             encode_item(array, &"transparent")?;
-            array.value_with(|enc| encode_type_ref(inner, enc))?;
+            array.encode_with(|enc| encode_type_ref(inner, enc))?;
             Ok(())
         }),
         TypeDef::Primitive { ty } => enc.array(2, |array| {
             encode_item(array, &"primitive")?;
-            array.value_with(|enc| encode_type_ref(ty, enc))?;
+            array.encode_with(|enc| encode_type_ref(ty, enc))?;
             Ok(())
         }),
     }
 }
 
-fn encode_fields(
-    array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+fn encode_fields<S: ByteSink>(
+    array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
     fields: &[FieldDef],
     kind: SchemaHashKind,
-) -> Result<(), CborError> {
-    array.value_with(|enc| {
+) -> EncodeResult<(), S> {
+    array.encode_with(|enc| {
         let mut fields: Vec<&FieldDef> = fields.iter().collect();
-        fields.sort_by_key(|field| field.id);
+        fields.sort_unstable_by_key(|field| field.id);
         enc.array(fields.len(), |array| {
             for field in fields {
-                array.value_with(|enc| encode_field(field, kind, enc))?;
+                array.encode_with(|enc| encode_field(field, kind, enc))?;
             }
             Ok(())
         })
     })
 }
 
-fn encode_field(
+fn encode_field<S: ByteSink>(
     field: &FieldDef,
     kind: SchemaHashKind,
-    enc: &mut Encoder,
-) -> Result<(), CborError> {
+    enc: &mut ValueEncoder<'_, S>,
+) -> EncodeResult<(), S> {
     match kind {
         SchemaHashKind::Wire => enc.array(3, |array| {
             encode_item(array, &field.id)?;
-            array.value_with(|enc| encode_type_ref(&field.ty, enc))?;
+            array.encode_with(|enc| encode_type_ref(&field.ty, enc))?;
             encode_item(array, &field.presence.as_str())?;
             Ok(())
         }),
         SchemaHashKind::Full => enc.array(4, |array| {
             encode_item(array, &field.id)?;
             encode_item(array, &field.name)?;
-            array.value_with(|enc| encode_type_ref(&field.ty, enc))?;
+            array.encode_with(|enc| encode_type_ref(&field.ty, enc))?;
             encode_item(array, &field.presence.as_str())?;
             Ok(())
         }),
     }
 }
 
-fn encode_variant(
+fn encode_variant<S: ByteSink>(
     variant: &VariantDef,
     kind: SchemaHashKind,
-    enc: &mut Encoder,
-) -> Result<(), CborError> {
+    enc: &mut ValueEncoder<'_, S>,
+) -> EncodeResult<(), S> {
     match kind {
         SchemaHashKind::Wire => enc.array(2, |array| {
             encode_item(array, &variant.id)?;
@@ -1093,7 +1103,10 @@ fn encode_variant(
     }
 }
 
-fn encode_type_ref(ty: &TypeRef, enc: &mut Encoder) -> Result<(), CborError> {
+fn encode_type_ref<S: ByteSink>(
+    ty: &TypeRef,
+    enc: &mut ValueEncoder<'_, S>,
+) -> EncodeResult<(), S> {
     match ty {
         TypeRef::Unit => enc.text("unit"),
         TypeRef::Bool => enc.text("bool"),
@@ -1115,7 +1128,7 @@ fn encode_type_ref(ty: &TypeRef, enc: &mut Encoder) -> Result<(), CborError> {
         }),
         TypeRef::Vec { item } => enc.array(2, |array| {
             encode_item(array, &"vec")?;
-            array.value_with(|enc| encode_type_ref(item, enc))?;
+            array.encode_with(|enc| encode_type_ref(item, enc))?;
             Ok(())
         }),
         TypeRef::Named { type_id, version } => enc.array(3, |array| {
@@ -1130,11 +1143,11 @@ fn encode_type_ref(ty: &TypeRef, enc: &mut Encoder) -> Result<(), CborError> {
     }
 }
 
-fn encode_item<T: CborEncode + ?Sized>(
-    array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+fn encode_item<S: ByteSink, T: CborEncode + ?Sized>(
+    array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
     value: &T,
-) -> Result<(), CborError> {
-    array.value_with(|enc| value.encode(enc))
+) -> EncodeResult<(), S> {
+    array.value(value)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -1149,7 +1162,10 @@ macro_rules! passthrough_abi {
     ($($ty:ty => $ref:expr),* $(,)?) => {
         $(
             impl AbiEncode for $ty {
-                fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+                fn abi_encode<S: ByteSink>(
+                    &self,
+                    enc: &mut ValueEncoder<'_, S>,
+                ) -> EncodeResult<(), S> {
                     CborEncode::encode(self, enc)
                 }
             }
@@ -1188,7 +1204,7 @@ passthrough_abi!(
 );
 
 impl AbiEncode for &str {
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         CborEncode::encode(self, enc)
     }
 }
@@ -1208,7 +1224,7 @@ impl AbiTypeRef for &str {
 }
 
 impl AbiEncode for BytesRef<'_> {
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         CborEncode::encode(self, enc)
     }
 }
@@ -1220,7 +1236,7 @@ impl AbiTypeRef for BytesRef<'_> {
 }
 
 impl AbiEncode for CanonicalCborRef<'_> {
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         CborEncode::encode(self, enc)
     }
 }
@@ -1240,7 +1256,7 @@ impl AbiTypeRef for CanonicalCborRef<'_> {
 }
 
 impl<const N: usize> AbiEncode for [u8; N] {
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         CborEncode::encode(self, enc)
     }
 }
@@ -1260,10 +1276,10 @@ impl<const N: usize> AbiTypeRef for [u8; N] {
 }
 
 impl<T: AbiEncode> AbiEncode for Vec<T> {
-    fn abi_encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         enc.array(self.len(), |array| {
             for value in self {
-                array.value_with(|enc| value.abi_encode(enc))?;
+                array.encode_with(|enc| value.abi_encode(enc))?;
             }
             Ok(())
         })

@@ -1,169 +1,231 @@
-//! Canonical encoder state machine for SACP-CBOR/1.
+//! Canonical, sink-generic encoder state machine for SACP-CBOR/1.
+//!
+//! Every fallible encoding operation returns the first profile, limit, or
+//! owned sink error. After that first error, the encoder is poisoned and every
+//! later fallible encoding or finish operation returns [`EncodeError::Poisoned`].
 
-use crate::alloc_util::try_reserve;
+#![allow(clippy::missing_errors_doc)]
+
+use crate::alloc_util::{try_reserve, try_reserve_exact_str};
+use crate::canonical::CanonicalCborRef;
 #[cfg(feature = "edit")]
 use crate::canonical::EncodedTextKey;
-use crate::canonical::{CanonicalCbor, CanonicalCborRef};
 use crate::codec::CborEncode;
 use crate::limits::EncodeLimits;
 use crate::profile::{
-    check_encoded_key_order, minimal_uint_ai, uint_argument_payload_len, validate_bignum_bytes,
+    cmp_text_keys_canonical, minimal_uint_ai, uint_argument_payload_len, validate_bignum_bytes,
     validate_int_safe_i64,
 };
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::wire::{self, Cursor};
 use crate::{CborError, ErrorCode};
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
+#[cfg(feature = "sha2")]
+use core::convert::Infallible;
+use core::fmt;
 
-struct VecSink {
-    buf: Vec<u8>,
-    max_len: usize,
+/// A destination for canonical CBOR bytes.
+///
+/// `write` may have side effects before returning an error. The encoder never
+/// assumes rollback and becomes poisoned after the first sink failure.
+pub trait ByteSink {
+    /// The owned sink error returned by a failed write or finish.
+    type Error;
+    /// The completed sink product.
+    type Output;
+
+    /// Write the complete byte slice or return the owned failure.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+
+    /// Complete the sink and return its product.
+    fn finish(self) -> Result<Self::Output, Self::Error>;
+}
+
+/// An encoding failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EncodeError<E> {
+    /// The requested value violates the SACP-CBOR profile or configured limits.
+    Cbor(CborError),
+    /// The first owned error returned by the sink.
+    Sink(E),
+    /// A prior failure may have left bytes in the sink.
+    Poisoned,
+}
+
+impl<E> From<CborError> for EncodeError<E> {
+    fn from(error: CborError) -> Self {
+        Self::Cbor(error)
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for EncodeError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cbor(error) => fmt::Display::fmt(error, formatter),
+            Self::Sink(error) => write!(formatter, "CBOR sink error: {error}"),
+            Self::Poisoned => formatter.write_str("CBOR encoder is poisoned"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E> std::error::Error for EncodeError<E> where E: std::error::Error + 'static {}
+
+/// Result returned by a sink-generic encoding operation.
+pub type EncodeResult<T, S> = Result<T, EncodeError<<S as ByteSink>::Error>>;
+
+/// Allocation-backed byte sink.
+#[derive(Debug, Default)]
+pub struct VecSink {
+    bytes: Vec<u8>,
 }
 
 impl VecSink {
-    const fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            max_len: usize::MAX,
-        }
+    /// Create an empty sink.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { bytes: Vec::new() }
     }
 
-    fn try_with_capacity(capacity: usize) -> Result<Self, CborError> {
-        Self::try_with_capacity_and_limit(capacity, usize::MAX)
+    /// Create an empty sink with fallibly reserved capacity.
+    pub fn try_with_capacity(capacity: usize) -> Result<Self, CborError> {
+        let mut bytes = Vec::new();
+        try_reserve(&mut bytes, capacity, 0)?;
+        Ok(Self { bytes })
     }
 
-    const fn with_limit(max_len: usize) -> Self {
-        Self {
-            buf: Vec::new(),
-            max_len,
-        }
-    }
-
-    fn try_with_capacity_and_limit(capacity: usize, max_len: usize) -> Result<Self, CborError> {
-        if capacity > max_len {
-            return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
-        }
-        let mut buf = Vec::new();
-        try_reserve(&mut buf, capacity, 0)?;
-        Ok(Self { buf, max_len })
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.buf
-    }
-
-    #[inline]
-    fn reserve(&mut self, additional: usize) -> Result<(), CborError> {
-        if self.max_len != usize::MAX {
-            self.ensure_additional(additional)?;
-        }
-        let available = self.buf.capacity().saturating_sub(self.buf.len());
-        if additional <= available {
-            return Ok(());
-        }
-        let offset = self.buf.len();
-        try_reserve(&mut self.buf, additional, offset)
-    }
-
-    #[inline]
-    fn ensure_additional(&self, additional: usize) -> Result<(), CborError> {
-        let end = self
-            .buf
-            .len()
-            .checked_add(additional)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.buf.len()))?;
-        if end > self.max_len {
-            return Err(CborError::new(
-                ErrorCode::MessageLenLimitExceeded,
-                self.buf.len(),
-            ));
-        }
-        Ok(())
+    /// Borrow bytes written so far.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
-impl VecSink {
-    fn write(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        self.reserve(bytes.len())?;
-        self.buf.extend_from_slice(bytes);
+impl ByteSink for VecSink {
+    type Error = CborError;
+    type Output = Vec<u8>;
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let offset = self.bytes.len();
+        try_reserve(&mut self.bytes, bytes.len(), offset)?;
+        self.bytes.extend_from_slice(bytes);
         Ok(())
     }
 
-    /// Writes `a` followed by `b` with a single reservation, so the buffer is
-    /// untouched if the combined length cannot be accommodated.
-    #[inline]
-    fn write2(&mut self, a: &[u8], b: &[u8]) -> Result<(), CborError> {
-        let total = a
-            .len()
-            .checked_add(b.len())
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.buf.len()))?;
-        self.reserve(total)?;
-        self.buf.extend_from_slice(a);
-        self.buf.extend_from_slice(b);
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        Ok(self.bytes)
+    }
+}
+
+/// Error returned if a counting sink's byte count overflows `usize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountOverflow;
+
+impl fmt::Display for CountOverflow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("encoded byte count overflow")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for CountOverflow {}
+
+/// Sink that counts encoded bytes without retaining the payload.
+#[derive(Debug, Default)]
+pub struct CountingSink {
+    count: usize,
+}
+
+impl CountingSink {
+    /// Create an empty counting sink.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { count: 0 }
+    }
+}
+
+impl ByteSink for CountingSink {
+    type Error = CountOverflow;
+    type Output = usize;
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.count = self.count.checked_add(bytes.len()).ok_or(CountOverflow)?;
         Ok(())
     }
 
-    fn write_u8(&mut self, byte: u8) -> Result<(), CborError> {
-        if self.buf.len() == self.buf.capacity() || self.buf.len() == self.max_len {
-            self.reserve(1)?;
-        }
-        self.buf.push(byte);
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        Ok(self.count)
+    }
+}
+
+/// Sink that hashes encoded bytes without retaining the payload.
+#[cfg(feature = "sha2")]
+pub struct DigestSink<D> {
+    digest: D,
+}
+
+#[cfg(feature = "sha2")]
+impl<D: sha2::Digest> DigestSink<D> {
+    /// Create a sink from a digest state.
+    #[must_use]
+    pub const fn new(digest: D) -> Self {
+        Self { digest }
+    }
+}
+
+#[cfg(feature = "sha2")]
+impl<D: sha2::Digest> ByteSink for DigestSink<D> {
+    type Error = Infallible;
+    type Output = sha2::digest::Output<D>;
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.digest.update(bytes);
         Ok(())
     }
 
-    fn position(&self) -> usize {
-        self.buf.len()
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        Ok(self.digest.finalize())
     }
 }
 
-fn err_at(sink: &VecSink, code: ErrorCode) -> CborError {
-    CborError::new(code, sink.position())
+/// Standard-library writer sink.
+#[cfg(feature = "std")]
+pub struct IoSink<W> {
+    writer: W,
 }
 
-fn encode_int(sink: &mut VecSink, v: i64) -> Result<(), CborError> {
-    if v >= 0 {
-        let u = u64::try_from(v).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-        encode_major_uint(sink, 0, u)
-    } else {
-        let n_i128 = -1_i128 - i128::from(v);
-        let n_u64 = u64::try_from(n_i128).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-        encode_major_uint(sink, 1, n_u64)
+#[cfg(feature = "std")]
+impl<W> IoSink<W> {
+    /// Wrap a writer.
+    #[must_use]
+    pub const fn new(writer: W) -> Self {
+        Self { writer }
     }
 }
 
-fn encode_bytes(sink: &mut VecSink, bytes: &[u8]) -> Result<(), CborError> {
-    let len_u64 =
-        u64::try_from(bytes.len()).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-    let (header, header_len) = major_uint_header(2, len_u64);
-    sink.write2(&header[..header_len], bytes)
+#[cfg(feature = "std")]
+impl<W: std::io::Write> ByteSink for IoSink<W> {
+    type Error = std::io::Error;
+    type Output = W;
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.writer.write_all(bytes)
+    }
+
+    fn finish(mut self) -> Result<Self::Output, Self::Error> {
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
 }
 
-fn encode_text(sink: &mut VecSink, s: &str) -> Result<(), CborError> {
-    // `str` guarantees valid UTF-8.
-    let b = s.as_bytes();
-    let len_u64 = u64::try_from(b.len()).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-    let (header, header_len) = major_uint_header(3, len_u64);
-    sink.write2(&header[..header_len], b)
+const fn format_error<E>(code: ErrorCode, offset: usize) -> EncodeError<E> {
+    EncodeError::Cbor(CborError::new(code, offset))
 }
 
-fn encode_float64(sink: &mut VecSink, bits: F64Bits) -> Result<(), CborError> {
-    let raw = bits.bits();
-    let mut buf = [0u8; 9];
-    buf[0] = 0xfb;
-    buf[1..9].copy_from_slice(&raw.to_be_bytes());
-    sink.write(&buf)
-}
-
-fn encode_major_len(sink: &mut VecSink, major: u8, len: usize) -> Result<(), CborError> {
-    let len_u64 = u64::try_from(len).map_err(|_| err_at(sink, ErrorCode::LengthOverflow))?;
-    encode_major_uint(sink, major, len_u64)
-}
-
-/// Builds the canonical header (initial byte plus minimal uint argument) for
-/// `major`/`value` into a fixed buffer, returning the buffer and its length.
-// `minimal_uint_ai` selects the narrowest width that holds `value`, so the
-// narrowing casts below cannot truncate.
+/// Builds the minimal canonical header for `major` and `value`.
 #[allow(clippy::cast_possible_truncation)]
 #[inline]
 pub(crate) fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
@@ -175,7 +237,6 @@ pub(crate) fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
     match ai {
         0..=23 => (buf, 1),
         24 => {
-            // `minimal_uint_ai` guarantees the value fits the selected width.
             buf[1] = value as u8;
             (buf, 2)
         }
@@ -194,12 +255,6 @@ pub(crate) fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
     }
 }
 
-fn encode_major_uint(sink: &mut VecSink, major: u8, value: u64) -> Result<(), CborError> {
-    let (header, header_len) = major_uint_header(major, value);
-    sink.write(&header[..header_len])
-}
-
-#[derive(Clone, Copy)]
 enum Frame {
     Array {
         remaining: usize,
@@ -207,1281 +262,1233 @@ enum Frame {
     Map {
         remaining_pairs: usize,
         pending_value: bool,
-        prev_key_range: Option<(usize, usize)>,
-        pending_key_range: Option<(usize, usize)>,
     },
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct EncoderCheckpoint {
-    buf_len: usize,
-    root_remaining: u8,
-    stack_len: usize,
-    parent_frame: Option<Frame>,
-    items_seen: usize,
-}
-
-#[derive(Clone, Copy)]
-enum ValueState {
-    Root {
-        remaining: u8,
-    },
+enum SlotState {
+    Root(u8),
     Array {
-        frame_index: usize,
+        index: usize,
         remaining: usize,
     },
     Map {
-        frame_index: usize,
-        frame: Frame,
+        index: usize,
+        remaining_pairs: usize,
+        pending_value: bool,
     },
 }
 
-#[derive(Clone, Copy)]
-struct ValueCheckpoint {
-    buf_len: usize,
-    items_seen: usize,
-    state: ValueState,
-}
-
-/// Streaming encoder that writes canonical CBOR directly into a `Vec<u8>`.
-///
-/// This supports splicing validated canonical bytes.
-pub struct Encoder {
-    sink: VecSink,
+/// Streaming canonical encoder over an arbitrary byte sink.
+pub struct Encoder<S: ByteSink = VecSink> {
+    sink: S,
+    written: usize,
     root_remaining: u8,
     stack: Vec<Frame>,
     limits: EncodeLimits,
     items_seen: usize,
+    poisoned: bool,
 }
 
-impl Encoder {
-    /// Create a new canonical encoder.
+impl Encoder<VecSink> {
+    /// Create a vector-backed encoder.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            sink: VecSink::new(),
-            root_remaining: 1,
-            stack: Vec::new(),
-            limits: EncodeLimits::unbounded(),
-            items_seen: 0,
-        }
+        Self::from_parts(VecSink::new(), EncodeLimits::unbounded())
     }
 
-    /// Create a canonical encoder with explicit resource limits.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidLimits` when the limit set cannot be enforced.
+    /// Create a vector-backed encoder with limits.
     pub fn with_limits(limits: EncodeLimits) -> Result<Self, CborError> {
         limits.validate()?;
-        Ok(Self {
-            sink: VecSink::with_limit(limits.max_output_bytes),
-            root_remaining: 1,
-            stack: Vec::new(),
-            limits,
-            items_seen: 0,
-        })
+        Ok(Self::from_parts(VecSink::new(), limits))
     }
 
-    /// Create a canonical encoder with fallibly pre-allocated byte capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AllocationFailed` if the requested capacity cannot be reserved.
+    /// Create a vector-backed encoder with fallibly reserved capacity.
     pub fn try_with_capacity(capacity: usize) -> Result<Self, CborError> {
-        Ok(Self {
-            sink: VecSink::try_with_capacity(capacity)?,
-            root_remaining: 1,
-            stack: Vec::new(),
-            limits: EncodeLimits::unbounded(),
-            items_seen: 0,
-        })
+        Ok(Self::from_parts(
+            VecSink::try_with_capacity(capacity)?,
+            EncodeLimits::unbounded(),
+        ))
     }
 
-    /// Create a limited canonical encoder with fallibly pre-allocated byte capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns `InvalidLimits`, `MessageLenLimitExceeded`, or `AllocationFailed`.
+    /// Create a limited vector-backed encoder with fallibly reserved capacity.
     pub fn try_with_capacity_and_limits(
         capacity: usize,
         limits: EncodeLimits,
     ) -> Result<Self, CborError> {
         limits.validate()?;
-        Ok(Self {
-            sink: VecSink::try_with_capacity_and_limit(capacity, limits.max_output_bytes)?,
-            root_remaining: 1,
-            stack: Vec::new(),
-            limits,
-            items_seen: 0,
-        })
-    }
-
-    /// Return the number of bytes written so far.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.sink.buf.len()
-    }
-
-    /// Returns `true` if no bytes have been written.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sink.buf.is_empty()
-    }
-
-    pub(crate) fn into_unchecked_vec(self) -> Vec<u8> {
-        self.sink.into_vec()
-    }
-
-    /// Consume and return canonical bytes as a `CanonicalCbor`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the buffer does not contain exactly one canonical CBOR item.
-    pub fn finish(self) -> Result<CanonicalCbor, CborError> {
-        if self.root_remaining != 0 || !self.stack.is_empty() {
-            return Err(CborError::new(ErrorCode::UnexpectedEof, 0));
+        if capacity > limits.max_output_bytes {
+            return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
         }
-        Ok(CanonicalCbor::new_unchecked(self.into_unchecked_vec()))
+        Ok(Self::from_parts(
+            VecSink::try_with_capacity(capacity)?,
+            limits,
+        ))
     }
 
-    /// Clear the encoder while retaining allocated capacity.
-    pub fn clear(&mut self) {
-        self.sink.buf.clear();
-        self.root_remaining = 1;
-        self.stack.clear();
-        self.items_seen = 0;
-    }
-
-    /// Borrow the bytes emitted so far.
+    /// Borrow bytes emitted so far.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.sink.buf
-    }
-
-    #[inline]
-    pub(crate) fn checkpoint(&self) -> EncoderCheckpoint {
-        EncoderCheckpoint {
-            buf_len: self.sink.buf.len(),
-            root_remaining: self.root_remaining,
-            stack_len: self.stack.len(),
-            parent_frame: self.stack.last().copied(),
-            items_seen: self.items_seen,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn restore(&mut self, checkpoint: EncoderCheckpoint) {
-        self.sink.buf.truncate(checkpoint.buf_len);
-        self.root_remaining = checkpoint.root_remaining;
-        self.stack.truncate(checkpoint.stack_len);
-        if let Some(frame) = checkpoint.parent_frame {
-            if let Some(parent) = self.stack.last_mut() {
-                *parent = frame;
-            }
-        }
-        self.items_seen = checkpoint.items_seen;
-    }
-
-    #[inline]
-    fn begin_value(&mut self) -> Result<ValueState, CborError> {
-        let frame_index = self.stack.len().saturating_sub(1);
-        match self.stack.last_mut() {
-            Some(Frame::Array { remaining }) => {
-                let before = *remaining;
-                if *remaining == 0 {
-                    return Err(CborError::new(
-                        ErrorCode::ArrayLenMismatch,
-                        self.sink.position(),
-                    ));
-                }
-                *remaining -= 1;
-                Ok(ValueState::Array {
-                    frame_index,
-                    remaining: before,
-                })
-            }
-            Some(frame @ Frame::Map { .. }) => {
-                let before = *frame;
-                let Frame::Map {
-                    remaining_pairs,
-                    pending_value,
-                    prev_key_range,
-                    pending_key_range,
-                } = frame
-                else {
-                    unreachable!();
-                };
-                if !*pending_value {
-                    return Err(CborError::new(
-                        ErrorCode::MapLenMismatch,
-                        self.sink.position(),
-                    ));
-                }
-                if *remaining_pairs == 0 {
-                    return Err(CborError::new(
-                        ErrorCode::MapLenMismatch,
-                        self.sink.position(),
-                    ));
-                }
-                *pending_value = false;
-                *remaining_pairs -= 1;
-                *prev_key_range = pending_key_range.take();
-                Ok(ValueState::Map {
-                    frame_index,
-                    frame: before,
-                })
-            }
-            None => {
-                let before = self.root_remaining;
-                if self.root_remaining == 0 {
-                    return Err(CborError::new(
-                        ErrorCode::TrailingBytes,
-                        self.sink.position(),
-                    ));
-                }
-                self.root_remaining = 0;
-                Ok(ValueState::Root { remaining: before })
-            }
-        }
-    }
-
-    #[inline]
-    fn restore_value_state(&mut self, state: ValueState) {
-        match state {
-            ValueState::Root { remaining } => self.root_remaining = remaining,
-            ValueState::Array {
-                frame_index,
-                remaining,
-            } => {
-                if let Some(Frame::Array { remaining: dst }) = self.stack.get_mut(frame_index) {
-                    *dst = remaining;
-                }
-            }
-            ValueState::Map { frame_index, frame } => {
-                if let Some(dst) = self.stack.get_mut(frame_index) {
-                    *dst = frame;
-                }
-            }
-        }
-    }
-
-    #[inline]
-    fn restore_value(&mut self, checkpoint: ValueCheckpoint) {
-        self.sink.buf.truncate(checkpoint.buf_len);
-        self.items_seen = checkpoint.items_seen;
-        self.restore_value_state(checkpoint.state);
-    }
-
-    #[inline]
-    fn emit_value<F>(&mut self, write: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut Self) -> Result<(), CborError>,
-    {
-        let state = self.begin_value()?;
-        let checkpoint = ValueCheckpoint {
-            buf_len: self.sink.buf.len(),
-            items_seen: self.items_seen,
-            state,
-        };
-        if let Err(err) = write(self) {
-            self.restore_value(checkpoint);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn emit_single_byte_value(&mut self, byte: u8) -> Result<(), CborError> {
-        let state = self.begin_value()?;
-        if let Err(err) = self.sink.write_u8(byte) {
-            self.restore_value_state(state);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn push_frame(&mut self, frame: Frame) -> Result<(), CborError> {
-        if self.stack.len() >= self.limits.max_depth {
-            return Err(CborError::new(
-                ErrorCode::DepthLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        try_reserve(&mut self.stack, 1, self.sink.position())?;
-        self.stack.push(frame);
-        Ok(())
-    }
-
-    #[inline]
-    fn account_items(&mut self, add: usize) -> Result<(), CborError> {
-        self.items_seen = self
-            .items_seen
-            .checked_add(add)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
-        if self.items_seen > self.limits.max_total_items {
-            return Err(CborError::new(
-                ErrorCode::TotalItemsLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn close_container(&mut self) -> Result<(), CborError> {
-        let code = match self.stack.last() {
-            Some(Frame::Array { remaining: 0 }) => None,
-            Some(Frame::Array { .. }) => Some(ErrorCode::ArrayLenMismatch),
-            Some(Frame::Map {
-                remaining_pairs,
-                pending_value,
-                ..
-            }) if *remaining_pairs == 0 && !*pending_value => None,
-            Some(Frame::Map { .. }) => Some(ErrorCode::MapLenMismatch),
-            None => Some(ErrorCode::MalformedCanonical),
-        };
-
-        if let Some(code) = code {
-            return Err(CborError::new(code, self.sink.position()));
-        }
-
-        let _ = self.stack.pop();
-        Ok(())
-    }
-
-    fn check_array_len(&self, len: usize) -> Result<(), CborError> {
-        if len > self.limits.max_array_len {
-            return Err(CborError::new(
-                ErrorCode::ArrayLenLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_map_len(&self, len: usize) -> Result<(), CborError> {
-        if len > self.limits.max_map_len {
-            return Err(CborError::new(
-                ErrorCode::MapLenLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_bytes_len(&self, len: usize) -> Result<(), CborError> {
-        if len > self.limits.max_bytes_len {
-            return Err(CborError::new(
-                ErrorCode::BytesLenLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_text_len(&self, len: usize) -> Result<(), CborError> {
-        if len > self.limits.max_text_len {
-            return Err(CborError::new(
-                ErrorCode::TextLenLimitExceeded,
-                self.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "edit")]
-    fn check_encoded_text_key_len(&self, bytes: &[u8]) -> Result<(), CborError> {
-        let mut cursor = Cursor::with_pos(bytes, 0);
-        let off = cursor.position();
-        let initial = cursor.read_u8()?;
-        if initial >> 5 != 3 {
-            return Err(CborError::new(ErrorCode::MapKeyMustBeText, off));
-        }
-        let len = wire::read_len::<true>(&mut cursor, initial & 0x1f, off)?;
-        if cursor
-            .position()
-            .checked_add(len)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?
-            != bytes.len()
-        {
-            return Err(CborError::new(ErrorCode::MalformedCanonical, off));
-        }
-        self.check_text_len(len)
-    }
-
-    fn account_canonical_value(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        let limits = self.limits.to_decode_limits(bytes.len());
-        let mut cursor = Cursor::with_pos(bytes, 0);
-        let mut items_seen = self.items_seen;
-        wire::skip_one_value::<false>(
-            &mut cursor,
-            wire::WalkPolicy::new(Some(&limits), crate::ValidationOptions::new()),
-            &mut items_seen,
-            self.stack.len(),
-        )?;
-        if cursor.position() != bytes.len() {
-            return Err(CborError::new(ErrorCode::TrailingBytes, cursor.position()));
-        }
-        self.items_seen = items_seen;
-        Ok(())
-    }
-
-    #[inline]
-    fn array_remaining_at(&self, frame_index: usize) -> Result<usize, CborError> {
-        match self.stack.get(frame_index) {
-            Some(Frame::Array { remaining }) => Ok(*remaining),
-            _ => Err(CborError::new(
-                ErrorCode::MalformedCanonical,
-                self.sink.position(),
-            )),
-        }
-    }
-
-    #[inline]
-    fn set_array_remaining_at(
-        &mut self,
-        frame_index: usize,
-        value: usize,
-    ) -> Result<(), CborError> {
-        match self.stack.get_mut(frame_index) {
-            Some(Frame::Array { remaining }) => {
-                *remaining = value;
-                Ok(())
-            }
-            _ => Err(CborError::new(
-                ErrorCode::MalformedCanonical,
-                self.sink.position(),
-            )),
-        }
-    }
-
-    #[inline]
-    fn map_remaining_at(&self, frame_index: usize) -> Result<(usize, bool), CborError> {
-        match self.stack.get(frame_index) {
-            Some(Frame::Map {
-                remaining_pairs,
-                pending_value,
-                ..
-            }) => Ok((*remaining_pairs, *pending_value)),
-            _ => Err(CborError::new(
-                ErrorCode::MalformedCanonical,
-                self.sink.position(),
-            )),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn begin_map_key(&self) -> Result<usize, CborError> {
-        match self.stack.last() {
-            Some(Frame::Map {
-                remaining_pairs,
-                pending_value,
-                ..
-            }) if *remaining_pairs > 0 && !*pending_value => Ok(self.sink.position()),
-            Some(Frame::Map { .. }) => Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.sink.position(),
-            )),
-            _ => Err(CborError::new(
-                ErrorCode::MapKeyMustBeText,
-                self.sink.position(),
-            )),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn finish_map_key(
-        &mut self,
-        key_start: usize,
-        key_end: usize,
-    ) -> Result<(), CborError> {
-        match self.stack.last_mut() {
-            Some(Frame::Map {
-                pending_value,
-                prev_key_range,
-                pending_key_range,
-                ..
-            }) if !*pending_value => {
-                if let Some((ps, pe)) = *prev_key_range {
-                    let prev = &self.sink.buf[ps..pe];
-                    let curr = &self.sink.buf[key_start..key_end];
-                    if let Err(code) = check_encoded_key_order(prev, curr) {
-                        return Err(CborError::new(code, key_start));
-                    }
-                }
-                *pending_key_range = Some((key_start, key_end));
-                *pending_value = true;
-                Ok(())
-            }
-            Some(Frame::Map { .. }) => Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.sink.position(),
-            )),
-            _ => Err(CborError::new(
-                ErrorCode::MapKeyMustBeText,
-                self.sink.position(),
-            )),
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[inline]
-    pub(crate) fn finish_container(&mut self) -> Result<(), CborError> {
-        self.close_container()
-    }
-
-    #[inline]
-    fn write_int(&mut self, v: i64) -> Result<(), CborError> {
-        validate_int_safe_i64(v).map_err(|code| CborError::new(code, self.sink.position()))?;
-        encode_int(&mut self.sink, v)
-    }
-
-    #[inline]
-    fn write_int_u128(&mut self, v: u128) -> Result<(), CborError> {
-        let safe_max = u128::from(crate::profile::MAX_SAFE_INTEGER);
-        if v <= safe_max {
-            let i = i64::try_from(v)
-                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
-            return self.write_int(i);
-        }
-
-        let magnitude = crate::int::magnitude_from_u128(v)
-            .map_err(|code| CborError::new(code, self.sink.position()))?;
-        self.write_bignum(false, &magnitude)
-    }
-
-    #[inline]
-    fn write_int_i128(&mut self, v: i128) -> Result<(), CborError> {
-        let min = i128::from(crate::profile::MIN_SAFE_INTEGER);
-        let max = i128::from(crate::profile::MAX_SAFE_INTEGER_I64);
-
-        if v >= min && v <= max {
-            let i = i64::try_from(v)
-                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
-            return self.write_int(i);
-        }
-
-        let negative = v < 0;
-        let n_u128 = if negative {
-            let n_i128 = -1_i128 - v;
-            u128::try_from(n_i128)
-                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
-        } else {
-            u128::try_from(v)
-                .map_err(|_| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?
-        };
-
-        let magnitude = crate::int::magnitude_from_u128(n_u128)
-            .map_err(|code| CborError::new(code, self.sink.position()))?;
-        self.write_bignum(negative, &magnitude)
-    }
-
-    #[inline]
-    fn write_bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
-        self.check_bytes_len(magnitude.len())?;
-        validate_bignum_bytes(negative, magnitude)
-            .map_err(|code| CborError::new(code, self.sink.position()))?;
-        let tag = if negative { 3u64 } else { 2u64 };
-        encode_major_uint(&mut self.sink, 6, tag)?;
-        encode_bytes(&mut self.sink, magnitude)
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
-        self.check_bytes_len(b.len())?;
-        encode_bytes(&mut self.sink, b)
-    }
-
-    #[inline]
-    #[cfg(feature = "serde")]
-    pub(crate) fn write_text_key(&mut self, s: &str) -> Result<(), CborError> {
-        self.check_text_len(s.len())?;
-        encode_text(&mut self.sink, s)
-    }
-
-    #[inline]
-    fn write_text(&mut self, s: &str) -> Result<(), CborError> {
-        self.check_text_len(s.len())?;
-        encode_text(&mut self.sink, s)
-    }
-
-    #[inline]
-    fn write_float(&mut self, bits: F64Bits) -> Result<(), CborError> {
-        encode_float64(&mut self.sink, bits)
-    }
-
-    #[inline]
-    fn write_raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
-        self.account_canonical_value(v.as_bytes())?;
-        self.sink.write(v.as_bytes())
-    }
-
-    #[inline]
-    fn write_raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        self.account_canonical_value(v.as_bytes())?;
-        self.sink.write(v.as_bytes())
-    }
-
-    #[cfg(feature = "serde")]
-    #[inline]
-    fn write_trusted_canonical_bytes(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        self.account_canonical_value(bytes)?;
-        self.sink.write(bytes)
-    }
-
-    #[cfg(feature = "serde")]
-    #[inline]
-    pub(crate) fn raw_trusted_canonical_bytes(&mut self, bytes: &[u8]) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_trusted_canonical_bytes(bytes))
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn buf_len(&self) -> usize {
-        self.sink.buf.len()
-    }
-
-    /// Encode CBOR null.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing to the underlying buffer fails.
-    pub fn null(&mut self) -> Result<(), CborError> {
-        self.emit_single_byte_value(0xf6)
-    }
-
-    /// Encode a CBOR boolean.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing to the underlying buffer fails.
-    pub fn bool(&mut self, v: bool) -> Result<(), CborError> {
-        self.emit_single_byte_value(if v { 0xf5 } else { 0xf4 })
-    }
-
-    /// Encode a safe-range integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the integer is outside the safe range or if encoding fails.
-    pub fn int(&mut self, v: i64) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_int(v))
-    }
-
-    /// Encode an unsigned integer, using a bignum when outside the safe range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails or allocation for the bignum magnitude fails.
-    pub fn int_u128(&mut self, v: u128) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_int_u128(v))
-    }
-
-    /// Encode a signed integer, using a bignum when outside the safe range.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails or allocation for the bignum magnitude fails.
-    pub fn int_i128(&mut self, v: i128) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_int_i128(v))
-    }
-
-    /// Encode a CBOR bignum (tag 2/3 + byte string magnitude).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the magnitude is not canonical or if encoding fails.
-    pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_bignum(negative, magnitude))
-    }
-
-    /// Encode a byte string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
-    pub fn bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_bytes(b))
-    }
-
-    /// Encode a text string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
-    pub fn text(&mut self, s: &str) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_text(s))
-    }
-
-    /// Encode a float64 bit pattern.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
-    pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_float(bits))
-    }
-
-    /// Splice already validated canonical CBOR bytes as the next value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing to the underlying buffer fails.
-    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_raw_cbor(v))
-    }
-
-    /// Splice a canonical sub-value reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing to the underlying buffer fails.
-    pub fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        self.emit_value(|enc| enc.write_raw_value_ref(v))
-    }
-
-    /// Encode a definite-length array and fill it via the provided builder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails or if the builder emits a different number of items.
-    pub fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
-    {
-        let checkpoint = self.checkpoint();
-        self.begin_value()?;
-        if let Err(err) = encode_major_len(&mut self.sink, 4, len)
-            .and_then(|()| self.reserve_min_array_items(len))
-            .and_then(|()| {
-                self.push_frame(Frame::Array { remaining: len })?;
-                Ok(())
-            })
-        {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        let frame_index = self.stack.len() - 1;
-        let (res, remaining) = {
-            let mut a = ArrayEncoder {
-                enc: self,
-                frame_index,
-                remaining: len,
-            };
-            let res = f(&mut a);
-            let remaining = a.remaining;
-            (res, remaining)
-        };
-        if let Err(err) = res
-            .and_then(|()| self.set_array_remaining_at(frame_index, remaining))
-            .and_then(|()| self.close_container())
-        {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn array_header(&mut self, len: usize) -> Result<(), CborError> {
-        let checkpoint = self.checkpoint();
-        if let Err(err) = self
-            .begin_value()
-            .and_then(|_| encode_major_len(&mut self.sink, 4, len))
-            .and_then(|()| self.reserve_min_array_items(len))
-            .and_then(|()| self.push_frame(Frame::Array { remaining: len }))
-        {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    /// Encode a definite-length map and fill it via the provided builder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails or if the builder emits a different number of entries.
-    pub fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
-    {
-        let checkpoint = self.checkpoint();
-        self.begin_value()?;
-        if let Err(err) = encode_major_len(&mut self.sink, 5, len)
-            .and_then(|()| self.reserve_min_map_items(len))
-            .and_then(|()| {
-                self.push_frame(Frame::Map {
-                    remaining_pairs: len,
-                    pending_value: false,
-                    prev_key_range: None,
-                    pending_key_range: None,
-                })?;
-                Ok(())
-            })
-        {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        let frame_index = self.stack.len() - 1;
-        let res = {
-            let mut m = MapEncoder {
-                enc: self,
-                frame_index,
-            };
-            f(&mut m)
-        };
-        if let Err(err) = res.and_then(|()| self.close_container()) {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "serde")]
-    pub(crate) fn map_header(&mut self, len: usize) -> Result<(), CborError> {
-        let checkpoint = self.checkpoint();
-        if let Err(err) = self
-            .begin_value()
-            .and_then(|_| encode_major_len(&mut self.sink, 5, len))
-            .and_then(|()| self.reserve_min_map_items(len))
-            .and_then(|()| {
-                self.push_frame(Frame::Map {
-                    remaining_pairs: len,
-                    pending_value: false,
-                    prev_key_range: None,
-                    pending_key_range: None,
-                })
-            })
-        {
-            self.restore(checkpoint);
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    fn reserve_min_array_items(&mut self, len: usize) -> Result<(), CborError> {
-        self.check_array_len(len)?;
-        self.account_items(len)?;
-        if len == 0 {
-            return Ok(());
-        }
-        self.sink.reserve(len)
-    }
-
-    fn reserve_min_map_items(&mut self, len: usize) -> Result<(), CborError> {
-        self.check_map_len(len)?;
-        let items = len
-            .checked_mul(2)
-            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, self.sink.position()))?;
-        self.account_items(items)?;
-        if len == 0 {
-            return Ok(());
-        }
-        self.sink.reserve(items)
+        self.sink.as_bytes()
     }
 }
 
-impl Default for Encoder {
+impl Default for Encoder<VecSink> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Builder for writing array elements into a canonical CBOR stream.
-pub struct ArrayEncoder<'a> {
-    enc: &'a mut Encoder,
-    frame_index: usize,
-    remaining: usize,
-}
-
-impl ArrayEncoder<'_> {
-    #[cfg(feature = "collections")]
-    pub(crate) fn encoded_len(&self) -> usize {
-        self.enc.len()
+impl<S: ByteSink> Encoder<S> {
+    const fn from_parts(sink: S, limits: EncodeLimits) -> Self {
+        Self {
+            sink,
+            written: 0,
+            root_remaining: 1,
+            stack: Vec::new(),
+            limits,
+            items_seen: 0,
+            poisoned: false,
+        }
     }
 
-    #[inline]
-    fn sync_to_stack(&mut self) -> Result<(), CborError> {
-        self.enc
-            .set_array_remaining_at(self.frame_index, self.remaining)
+    /// Create an encoder over `sink` with unbounded encoding limits.
+    #[must_use]
+    pub const fn with_sink(sink: S) -> Self {
+        Self::from_parts(sink, EncodeLimits::unbounded())
     }
 
-    #[inline]
-    fn sync_from_stack(&mut self) -> Result<(), CborError> {
-        self.remaining = self.enc.array_remaining_at(self.frame_index)?;
+    /// Create an encoder over `sink` with explicit limits.
+    pub fn with_sink_and_limits(sink: S, limits: EncodeLimits) -> Result<Self, CborError> {
+        limits.validate()?;
+        Ok(Self::from_parts(sink, limits))
+    }
+
+    /// Return the number of bytes in chunks whose writes completed successfully.
+    ///
+    /// A failing sink may physically accept part of a chunk before returning an
+    /// error; those unconfirmed bytes are not included in this logical count.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.written
+    }
+
+    /// Return whether no complete chunk write has been confirmed by the sink.
+    ///
+    /// This does not assert that a failing sink has no partial physical side
+    /// effects.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.written == 0
+    }
+
+    /// Complete exactly one root item and return the sink product.
+    pub fn finish(self) -> EncodeResult<S::Output, S> {
+        if self.poisoned {
+            return Err(EncodeError::Poisoned);
+        }
+        if self.root_remaining != 0 || !self.stack.is_empty() {
+            return Err(format_error(ErrorCode::UnexpectedEof, self.written));
+        }
+        self.sink.finish().map_err(EncodeError::Sink)
+    }
+
+    pub(crate) const fn ensure_healthy(&self) -> EncodeResult<(), S> {
+        if self.poisoned {
+            Err(EncodeError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn attempt<T, F>(&mut self, operation: F) -> EncodeResult<T, S>
+    where
+        F: FnOnce(&mut Self) -> EncodeResult<T, S>,
+    {
+        self.ensure_healthy()?;
+        match operation(self) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) const fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn guarded_value<E, F>(&mut self, operation: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        self.ensure_healthy().map_err(E::from)?;
+        let before = self.slot_state();
+        match operation(self) {
+            Ok(()) => {
+                self.ensure_healthy().map_err(E::from)?;
+                if self.consumed_exactly_one(before) {
+                    Ok(())
+                } else {
+                    self.poisoned = true;
+                    Err(E::from(format_error(
+                        ErrorCode::MalformedCanonical,
+                        self.written,
+                    )))
+                }
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn write_chunks(&mut self, chunks: &[&[u8]]) -> EncodeResult<(), S> {
+        self.ensure_healthy()?;
+        self.check_output_chunks(chunks)?;
+        for chunk in chunks {
+            if let Err(error) = self.sink.write(chunk) {
+                self.poisoned = true;
+                return Err(EncodeError::Sink(error));
+            }
+            self.written += chunk.len();
+        }
         Ok(())
     }
 
-    #[inline]
-    fn consume_one(&mut self) -> Result<(), CborError> {
-        if self.remaining == 0 {
-            return Err(CborError::new(
-                ErrorCode::ArrayLenMismatch,
-                self.enc.sink.position(),
+    fn check_output_chunks(&self, chunks: &[&[u8]]) -> EncodeResult<(), S> {
+        let mut total = 0usize;
+        for chunk in chunks {
+            total = total
+                .checked_add(chunk.len())
+                .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        }
+        let end = self
+            .written
+            .checked_add(total)
+            .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        if end > self.limits.max_output_bytes {
+            return Err(format_error(
+                ErrorCode::MessageLenLimitExceeded,
+                self.written,
             ));
         }
-        self.remaining -= 1;
         Ok(())
     }
 
-    #[inline]
-    fn restore_one(&mut self) {
-        self.remaining = self.remaining.saturating_add(1);
+    fn check_text_output(&self, text: &str) -> EncodeResult<(), S> {
+        let length = u64::try_from(text.len())
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(3, length);
+        self.check_output_chunks(&[&header[..header_len], text.as_bytes()])
     }
 
-    #[inline]
-    fn write_single_byte_item(&mut self, byte: u8) -> Result<(), CborError> {
-        self.consume_one()?;
-        if let Err(err) = self.enc.sink.write_u8(byte) {
-            self.restore_one();
-            return Err(err);
+    fn begin_value(&mut self) -> EncodeResult<(), S> {
+        self.ensure_healthy()?;
+        match self.stack.last_mut() {
+            Some(Frame::Array { remaining }) => {
+                if *remaining == 0 {
+                    return Err(format_error(ErrorCode::ArrayLenMismatch, self.written));
+                }
+                *remaining -= 1;
+            }
+            Some(Frame::Map {
+                remaining_pairs,
+                pending_value,
+                ..
+            }) => {
+                if !*pending_value || *remaining_pairs == 0 {
+                    return Err(format_error(ErrorCode::MapLenMismatch, self.written));
+                }
+                *pending_value = false;
+                *remaining_pairs -= 1;
+            }
+            None => {
+                if self.root_remaining == 0 {
+                    return Err(format_error(ErrorCode::TrailingBytes, self.written));
+                }
+                self.root_remaining = 0;
+            }
         }
         Ok(())
     }
 
-    #[inline]
-    fn write_item<F>(&mut self, write: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
-    {
-        let buf_len = self.enc.sink.buf.len();
-        self.consume_one()?;
-        if let Err(err) = write(self.enc) {
-            self.enc.sink.buf.truncate(buf_len);
-            self.restore_one();
-            return Err(err);
+    fn check_value_slot(&self) -> EncodeResult<(), S> {
+        self.ensure_healthy()?;
+        match self.stack.last() {
+            Some(Frame::Array { remaining }) if *remaining > 0 => Ok(()),
+            Some(Frame::Array { .. }) => {
+                Err(format_error(ErrorCode::ArrayLenMismatch, self.written))
+            }
+            Some(Frame::Map {
+                remaining_pairs,
+                pending_value,
+            }) if *remaining_pairs > 0 && *pending_value => Ok(()),
+            Some(Frame::Map { .. }) => Err(format_error(ErrorCode::MapLenMismatch, self.written)),
+            None if self.root_remaining != 0 => Ok(()),
+            None => Err(format_error(ErrorCode::TrailingBytes, self.written)),
+        }
+    }
+
+    fn slot_state(&self) -> SlotState {
+        match self.stack.last() {
+            Some(Frame::Array { remaining }) => SlotState::Array {
+                index: self.stack.len() - 1,
+                remaining: *remaining,
+            },
+            Some(Frame::Map {
+                remaining_pairs,
+                pending_value,
+            }) => SlotState::Map {
+                index: self.stack.len() - 1,
+                remaining_pairs: *remaining_pairs,
+                pending_value: *pending_value,
+            },
+            None => SlotState::Root(self.root_remaining),
+        }
+    }
+
+    fn consumed_exactly_one(&self, before: SlotState) -> bool {
+        match before {
+            SlotState::Root(1) => self.stack.is_empty() && self.root_remaining == 0,
+            SlotState::Array { index, remaining } if remaining > 0 => matches!(
+                self.stack.get(index),
+                Some(Frame::Array { remaining: after }) if after.checked_add(1) == Some(remaining)
+            ),
+            SlotState::Map {
+                index,
+                remaining_pairs,
+                pending_value: true,
+            } if remaining_pairs > 0 => matches!(
+                self.stack.get(index),
+                Some(Frame::Map {
+                    remaining_pairs: after,
+                    pending_value: false,
+                }) if after.checked_add(1) == Some(remaining_pairs)
+            ),
+            _ => false,
+        }
+    }
+
+    fn write_scalar(&mut self, chunks: &[&[u8]]) -> EncodeResult<(), S> {
+        self.check_output_chunks(chunks)?;
+        self.begin_value()?;
+        self.write_chunks(chunks)
+    }
+
+    const fn check_array_len(&self, len: usize) -> EncodeResult<(), S> {
+        if len > self.limits.max_array_len {
+            return Err(format_error(ErrorCode::ArrayLenLimitExceeded, self.written));
         }
         Ok(())
     }
 
-    #[inline]
-    fn delegate<F>(&mut self, f: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
-    {
-        self.sync_to_stack()?;
-        let res = f(self.enc);
-        let sync = self.sync_from_stack();
-        match (res, sync) {
-            (Err(err), _) | (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
+    const fn check_map_len(&self, len: usize) -> EncodeResult<(), S> {
+        if len > self.limits.max_map_len {
+            return Err(format_error(ErrorCode::MapLenLimitExceeded, self.written));
         }
+        Ok(())
+    }
+
+    const fn check_bytes_len(&self, len: usize) -> EncodeResult<(), S> {
+        if len > self.limits.max_bytes_len {
+            return Err(format_error(ErrorCode::BytesLenLimitExceeded, self.written));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn check_text_len(&self, len: usize) -> EncodeResult<(), S> {
+        if len > self.limits.max_text_len {
+            return Err(format_error(ErrorCode::TextLenLimitExceeded, self.written));
+        }
+        Ok(())
+    }
+
+    fn checked_items(&self, add: usize) -> EncodeResult<usize, S> {
+        let total = self
+            .items_seen
+            .checked_add(add)
+            .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        if total > self.limits.max_total_items {
+            return Err(format_error(
+                ErrorCode::TotalItemsLimitExceeded,
+                self.written,
+            ));
+        }
+        Ok(total)
+    }
+
+    fn prepare_frame(&mut self) -> EncodeResult<(), S> {
+        if self.stack.len() >= self.limits.max_depth {
+            return Err(format_error(ErrorCode::DepthLimitExceeded, self.written));
+        }
+        try_reserve(&mut self.stack, 1, self.written).map_err(EncodeError::Cbor)
+    }
+
+    fn preflight_map(&self, len: usize) -> EncodeResult<(usize, [u8; 9], usize), S> {
+        self.ensure_healthy()?;
+        self.check_map_len(len)?;
+        let item_count = len
+            .checked_mul(2)
+            .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let items = self.checked_items(item_count)?;
+        if self.stack.len() >= self.limits.max_depth {
+            return Err(format_error(ErrorCode::DepthLimitExceeded, self.written));
+        }
+        self.check_value_slot()?;
+        let length = u64::try_from(len)
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(5, length);
+        let minimum_output = self
+            .written
+            .checked_add(header_len)
+            .and_then(|value| value.checked_add(item_count))
+            .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        if minimum_output > self.limits.max_output_bytes {
+            return Err(format_error(
+                ErrorCode::MessageLenLimitExceeded,
+                self.written,
+            ));
+        }
+        Ok((items, header, header_len))
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn preflight_buffered_map(&self, len: usize) -> EncodeResult<(usize, usize), S> {
+        let (items, _, header_len) = self.preflight_map(len)?;
+        Ok((header_len, items))
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) const fn encode_limits(&self) -> EncodeLimits {
+        self.limits
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) const fn items_seen(&self) -> usize {
+        self.items_seen
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn container_depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn close_container(&mut self) -> EncodeResult<(), S> {
+        let valid = matches!(
+            self.stack.last(),
+            Some(
+                Frame::Array { remaining: 0 }
+                    | Frame::Map {
+                        remaining_pairs: 0,
+                        pending_value: false,
+                        ..
+                    },
+            )
+        );
+        if !valid {
+            let code = match self.stack.last() {
+                Some(Frame::Array { .. }) => ErrorCode::ArrayLenMismatch,
+                Some(Frame::Map { .. }) => ErrorCode::MapLenMismatch,
+                None => ErrorCode::MalformedCanonical,
+            };
+            return Err(format_error(code, self.written));
+        }
+        let _ = self.stack.pop();
+        Ok(())
+    }
+
+    fn write_major_value(&mut self, major: u8, value: u64) -> EncodeResult<(), S> {
+        let (header, len) = major_uint_header(major, value);
+        self.write_scalar(&[&header[..len]])
+    }
+
+    fn write_int_value(&mut self, value: i64) -> EncodeResult<(), S> {
+        validate_int_safe_i64(value).map_err(|code| format_error(code, self.written))?;
+        let (major, argument) = if value >= 0 {
+            (
+                0,
+                u64::try_from(value)
+                    .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?,
+            )
+        } else {
+            let argument = -1_i128 - i128::from(value);
+            (
+                1,
+                u64::try_from(argument)
+                    .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?,
+            )
+        };
+        self.write_major_value(major, argument)
+    }
+
+    fn write_bignum_value(&mut self, negative: bool, magnitude: &[u8]) -> EncodeResult<(), S> {
+        self.check_bytes_len(magnitude.len())?;
+        validate_bignum_bytes(negative, magnitude)
+            .map_err(|code| format_error(code, self.written))?;
+        let (tag, tag_len) = major_uint_header(6, if negative { 3 } else { 2 });
+        let length = u64::try_from(magnitude.len())
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(2, length);
+        self.write_scalar(&[&tag[..tag_len], &header[..header_len], magnitude])
+    }
+
+    fn write_bytes_value(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.check_bytes_len(bytes.len())?;
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(2, length);
+        self.write_scalar(&[&header[..header_len], bytes])
+    }
+
+    fn write_text_value(&mut self, text: &str) -> EncodeResult<(), S> {
+        self.check_text_len(text.len())?;
+        let length = u64::try_from(text.len())
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(3, length);
+        self.write_scalar(&[&header[..header_len], text.as_bytes()])
+    }
+
+    fn account_canonical_value(&self, bytes: &[u8]) -> EncodeResult<usize, S> {
+        let limits = self.limits.to_decode_limits(bytes.len());
+        let mut cursor = Cursor::with_pos(bytes, 0);
+        let mut items = self.items_seen;
+        wire::skip_one_value::<false>(
+            &mut cursor,
+            wire::WalkPolicy::new(Some(&limits), crate::ValidationOptions::new()),
+            &mut items,
+            self.stack.len(),
+        )
+        .map_err(EncodeError::Cbor)?;
+        if cursor.position() != bytes.len() {
+            return Err(format_error(ErrorCode::TrailingBytes, cursor.position()));
+        }
+        Ok(items)
+    }
+
+    fn write_raw_value(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.check_output_chunks(&[bytes])?;
+        self.check_value_slot()?;
+        let items = self.account_canonical_value(bytes)?;
+        self.begin_value()?;
+        self.write_chunks(&[bytes])?;
+        self.items_seen = items;
+        Ok(())
+    }
+
+    fn write_map_key_bytes(&mut self, text: &str) -> EncodeResult<(), S> {
+        self.ensure_healthy()?;
+        match self.stack.last() {
+            Some(Frame::Map {
+                remaining_pairs,
+                pending_value,
+            }) if *remaining_pairs > 0 && !*pending_value => {}
+            Some(Frame::Map { .. }) => {
+                return Err(format_error(ErrorCode::MapLenMismatch, self.written))
+            }
+            _ => return Err(format_error(ErrorCode::MapKeyMustBeText, self.written)),
+        }
+        self.check_text_len(text.len())?;
+        let length = u64::try_from(text.len())
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(3, length);
+        self.write_chunks(&[&header[..header_len], text.as_bytes()])?;
+        let Some(Frame::Map { pending_value, .. }) = self.stack.last_mut() else {
+            unreachable!();
+        };
+        *pending_value = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "edit")]
+    fn encoded_text_key_source<'a>(&self, key: &'a [u8]) -> EncodeResult<&'a str, S> {
+        let mut cursor = Cursor::with_pos(key, 0);
+        let offset = cursor.position();
+        let initial = cursor.read_u8().map_err(EncodeError::Cbor)?;
+        if initial >> 5 != 3 {
+            return Err(format_error(ErrorCode::MapKeyMustBeText, offset));
+        }
+        let len = wire::read_len::<true>(&mut cursor, initial & 0x1f, offset)
+            .map_err(EncodeError::Cbor)?;
+        if cursor.position().checked_add(len) != Some(key.len()) {
+            return Err(format_error(ErrorCode::MalformedCanonical, offset));
+        }
+        self.check_text_len(len)?;
+        core::str::from_utf8(&key[cursor.position()..])
+            .map_err(|_| format_error(ErrorCode::Utf8Invalid, offset))
     }
 
     /// Encode CBOR null.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn null(&mut self) -> Result<(), CborError> {
-        self.write_single_byte_item(0xf6)
+    pub fn null(&mut self) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_scalar(&[&[0xf6]]))
     }
 
     /// Encode a CBOR boolean.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn bool(&mut self, v: bool) -> Result<(), CborError> {
-        self.write_single_byte_item(if v { 0xf5 } else { 0xf4 })
+    pub fn bool(&mut self, value: bool) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_scalar(&[&[if value { 0xf5 } else { 0xf4 }]]))
     }
 
     /// Encode a safe-range integer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn int(&mut self, v: i64) -> Result<(), CborError> {
-        self.write_item(|enc| enc.write_int(v))
+    pub fn int(&mut self, value: i64) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_int_value(value))
     }
 
-    /// Encode a CBOR bignum (tag 2/3 + byte string magnitude).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> Result<(), CborError> {
-        self.write_item(|enc| enc.write_bignum(negative, magnitude))
+    /// Encode an unsigned integer, using a bignum outside the safe range.
+    pub fn int_u128(&mut self, value: u128) -> EncodeResult<(), S> {
+        self.attempt(|encoder| {
+            let safe_max = u128::from(crate::profile::MAX_SAFE_INTEGER);
+            if value <= safe_max {
+                return encoder.write_int_value(
+                    i64::try_from(value)
+                        .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?,
+                );
+            }
+            let magnitude = crate::int::magnitude_from_u128(value)
+                .map_err(|code| format_error(code, encoder.written))?;
+            encoder.write_bignum_value(false, &magnitude)
+        })
+    }
+
+    /// Encode a signed integer, using a bignum outside the safe range.
+    pub fn int_i128(&mut self, value: i128) -> EncodeResult<(), S> {
+        self.attempt(|encoder| {
+            let min = i128::from(crate::profile::MIN_SAFE_INTEGER);
+            let max = i128::from(crate::profile::MAX_SAFE_INTEGER_I64);
+            if value >= min && value <= max {
+                return encoder.write_int_value(
+                    i64::try_from(value)
+                        .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?,
+                );
+            }
+            let negative = value < 0;
+            let magnitude_value = if negative {
+                u128::try_from(-1_i128 - value)
+                    .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?
+            } else {
+                u128::try_from(value)
+                    .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?
+            };
+            let magnitude = crate::int::magnitude_from_u128(magnitude_value)
+                .map_err(|code| format_error(code, encoder.written))?;
+            encoder.write_bignum_value(negative, &magnitude)
+        })
+    }
+
+    /// Encode a canonical CBOR bignum.
+    pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_bignum_value(negative, magnitude))
     }
 
     /// Encode a byte string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn bytes(&mut self, b: &[u8]) -> Result<(), CborError> {
-        self.write_item(|enc| enc.write_bytes(b))
+    pub fn bytes(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_bytes_value(bytes))
     }
 
     /// Encode a text string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn text(&mut self, s: &str) -> Result<(), CborError> {
-        self.write_item(|enc| enc.write_text(s))
+    pub fn text(&mut self, text: &str) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_text_value(text))
     }
 
-    /// Encode a float64 bit pattern.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn float(&mut self, bits: F64Bits) -> Result<(), CborError> {
-        self.write_item(|enc| enc.write_float(bits))
+    /// Encode a canonical float64 bit pattern.
+    pub fn float(&mut self, bits: F64Bits) -> EncodeResult<(), S> {
+        self.attempt(|encoder| {
+            let mut encoded = [0u8; 9];
+            encoded[0] = 0xfb;
+            encoded[1..].copy_from_slice(&bits.bits().to_be_bytes());
+            encoder.write_scalar(&[&encoded])
+        })
     }
 
-    /// Splice canonical CBOR bytes as the next array element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
-        self.delegate(|enc| enc.raw_cbor(v))
+    /// Splice one validated canonical CBOR value.
+    pub fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_raw_value(value.as_bytes()))
     }
 
-    /// Splice a canonical sub-value reference as the next array element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        self.delegate(|enc| enc.raw_value_ref(v))
+    /// Splice one validated canonical CBOR sub-value.
+    pub fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_raw_value(value.as_bytes()))
     }
 
-    /// Encode a value using a custom encoder callback as the next array element.
+    /// Encode one native value through the controlled trait adapter.
+    pub fn encode<T: CborEncode + ?Sized>(&mut self, value: &T) -> EncodeResult<(), S> {
+        self.encode_with(|encoder| value.encode(encoder))
+    }
+
+    /// Encode one value through a controlled adapter.
     ///
-    /// The callback must emit exactly one complete CBOR value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded, the callback fails, or the callback emits
-    /// zero or multiple values.
-    pub fn value_with<F>(&mut self, f: F) -> Result<(), CborError>
+    /// This is the integration point for encoding traits layered on top of
+    /// SACP-CBOR. The closure cannot obtain the underlying encoder directly,
+    /// and every returned failure is made sticky by this method.
+    pub fn encode_with<F>(&mut self, encode: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+        F: FnOnce(&mut ValueEncoder<'_, S>) -> EncodeResult<(), S>,
     {
-        let before = self.remaining;
+        self.attempt(|encoder| {
+            let before = encoder.slot_state();
+            {
+                let mut value_encoder = ValueEncoder { encoder };
+                encode(&mut value_encoder)?;
+            }
+            encoder.ensure_healthy()?;
+            if !encoder.consumed_exactly_one(before) {
+                return Err(format_error(ErrorCode::MalformedCanonical, encoder.written));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn raw_trusted_canonical_bytes(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_raw_value(bytes))
+    }
+
+    /// Encode a definite-length array.
+    pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.attempt(|encoder| encoder.array_inner(len, build))
+    }
+
+    fn array_inner<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.ensure_healthy()?;
+        self.check_array_len(len)?;
+        let items = self.checked_items(len)?;
+        self.prepare_frame()?;
+        let length = u64::try_from(len)
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(4, length);
+        self.check_output_chunks(&[&header[..header_len]])?;
+        self.begin_value()?;
+        self.write_chunks(&[&header[..header_len]])?;
+        self.items_seen = items;
+        self.stack.push(Frame::Array { remaining: len });
+        let frame_index = self.stack.len() - 1;
+        let result = {
+            let mut array = ArrayEncoder {
+                enc: self,
+                frame_index,
+            };
+            build(&mut array)
+        };
+        result?;
+        self.ensure_healthy()?;
+        self.close_container()
+    }
+
+    /// Encode a definite-length text-keyed map.
+    pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.attempt(|encoder| encoder.map_inner(len, build))
+    }
+
+    fn map_inner<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        let (items, header, header_len) = self.preflight_map(len)?;
+        self.prepare_frame()?;
+        self.begin_value()?;
+        self.write_chunks(&[&header[..header_len]])?;
+        self.items_seen = items;
+        self.stack.push(Frame::Map {
+            remaining_pairs: len,
+            pending_value: false,
+        });
+        let frame_index = self.stack.len() - 1;
+        let result = {
+            let mut map = MapEncoder {
+                enc: self,
+                frame_index,
+                previous_key: String::new(),
+                has_previous_key: false,
+            };
+            build(&mut map)
+        };
+        result?;
+        self.ensure_healthy()?;
+        self.close_container()
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn array_header(&mut self, len: usize) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.array_header_inner(len))
+    }
+
+    #[cfg(feature = "serde")]
+    fn array_header_inner(&mut self, len: usize) -> EncodeResult<(), S> {
+        self.check_array_len(len)?;
+        let items = self.checked_items(len)?;
+        self.prepare_frame()?;
+        let length = u64::try_from(len)
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(4, length);
+        self.check_output_chunks(&[&header[..header_len]])?;
+        self.begin_value()?;
+        self.write_chunks(&[&header[..header_len]])?;
+        self.items_seen = items;
+        self.stack.push(Frame::Array { remaining: len });
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn map_header(&mut self, len: usize) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.map_header_inner(len))
+    }
+
+    #[cfg(feature = "serde")]
+    fn map_header_inner(&mut self, len: usize) -> EncodeResult<(), S> {
+        let (items, header, header_len) = self.preflight_map(len)?;
+        self.prepare_frame()?;
+        self.begin_value()?;
+        self.write_chunks(&[&header[..header_len]])?;
+        self.items_seen = items;
+        self.stack.push(Frame::Map {
+            remaining_pairs: len,
+            pending_value: false,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn finish_container(&mut self) -> EncodeResult<(), S> {
+        self.attempt(Self::close_container)
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn write_map_key(&mut self, key: &str) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.write_map_key_bytes(key))
+    }
+}
+
+/// Controlled single-value adapter passed to [`CborEncode`].
+///
+/// Values cannot construct this adapter or access the underlying encoder, so
+/// every trait failure is observed by [`Encoder::encode`] and becomes sticky.
+pub struct ValueEncoder<'a, S: ByteSink> {
+    encoder: &'a mut Encoder<S>,
+}
+
+impl<S: ByteSink> ValueEncoder<'_, S> {
+    /// Encode null.
+    pub fn null(&mut self) -> EncodeResult<(), S> {
+        self.encoder.null()
+    }
+
+    /// Encode a boolean.
+    pub fn bool(&mut self, value: bool) -> EncodeResult<(), S> {
+        self.encoder.bool(value)
+    }
+
+    /// Encode a safe-range integer.
+    pub fn int(&mut self, value: i64) -> EncodeResult<(), S> {
+        self.encoder.int(value)
+    }
+
+    /// Encode a signed integer, using a bignum when required.
+    pub fn int_i128(&mut self, value: i128) -> EncodeResult<(), S> {
+        self.encoder.int_i128(value)
+    }
+
+    /// Encode an unsigned integer, using a bignum when required.
+    pub fn int_u128(&mut self, value: u128) -> EncodeResult<(), S> {
+        self.encoder.int_u128(value)
+    }
+
+    /// Encode a bignum.
+    pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> EncodeResult<(), S> {
+        self.encoder.bignum(negative, magnitude)
+    }
+
+    /// Encode bytes.
+    pub fn bytes(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.encoder.bytes(bytes)
+    }
+
+    /// Encode text.
+    pub fn text(&mut self, text: &str) -> EncodeResult<(), S> {
+        self.encoder.text(text)
+    }
+
+    /// Encode a float.
+    pub fn float(&mut self, bits: F64Bits) -> EncodeResult<(), S> {
+        self.encoder.float(bits)
+    }
+
+    /// Splice canonical bytes.
+    pub fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> EncodeResult<(), S> {
+        self.encoder.raw_cbor(value)
+    }
+
+    /// Splice a canonical sub-value.
+    pub fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> EncodeResult<(), S> {
+        self.encoder.raw_value_ref(value)
+    }
+
+    /// Encode a nested native value.
+    pub fn value<T: CborEncode + ?Sized>(&mut self, value: &T) -> EncodeResult<(), S> {
+        self.encoder.encode(value)
+    }
+
+    /// Encode an array.
+    pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.encoder.array(len, build)
+    }
+
+    /// Encode a map.
+    pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.encoder.map(len, build)
+    }
+}
+
+/// Builder for array elements.
+pub struct ArrayEncoder<'a, S: ByteSink = VecSink> {
+    enc: &'a mut Encoder<S>,
+    frame_index: usize,
+}
+
+impl<S: ByteSink> ArrayEncoder<'_, S> {
+    fn remaining(&self) -> EncodeResult<usize, S> {
+        match self.enc.stack.get(self.frame_index) {
+            Some(Frame::Array { remaining }) => Ok(*remaining),
+            _ => Err(format_error(
+                ErrorCode::MalformedCanonical,
+                self.enc.written,
+            )),
+        }
+    }
+
+    fn delegate<F>(&mut self, emit: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+    {
+        emit(self.enc)
+    }
+
+    /// Encode null as the next item.
+    pub fn null(&mut self) -> EncodeResult<(), S> {
+        self.delegate(Encoder::null)
+    }
+
+    /// Encode a boolean as the next item.
+    pub fn bool(&mut self, value: bool) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.bool(value))
+    }
+
+    /// Encode an integer as the next item.
+    pub fn int(&mut self, value: i64) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.int(value))
+    }
+
+    /// Encode a bignum as the next item.
+    pub fn bignum(&mut self, negative: bool, magnitude: &[u8]) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.bignum(negative, magnitude))
+    }
+
+    /// Encode bytes as the next item.
+    pub fn bytes(&mut self, bytes: &[u8]) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.bytes(bytes))
+    }
+
+    /// Encode text as the next item.
+    pub fn text(&mut self, text: &str) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.text(text))
+    }
+
+    /// Encode a float as the next item.
+    pub fn float(&mut self, bits: F64Bits) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.float(bits))
+    }
+
+    /// Splice canonical bytes as the next item.
+    pub fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.raw_cbor(value))
+    }
+
+    /// Splice a canonical sub-value as the next item.
+    pub fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> EncodeResult<(), S> {
+        self.delegate(|encoder| encoder.raw_value_ref(value))
+    }
+
+    /// Emit exactly one item through a callback.
+    pub fn value_with<F>(&mut self, emit: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+    {
+        self.enc.ensure_healthy()?;
+        let before = match self.remaining() {
+            Ok(value) => value,
+            Err(error) => {
+                self.enc.poison();
+                return Err(error);
+            }
+        };
         if before == 0 {
-            return Err(CborError::new(
-                ErrorCode::ArrayLenMismatch,
-                self.enc.sink.position(),
-            ));
+            self.enc.poison();
+            return Err(format_error(ErrorCode::ArrayLenMismatch, self.enc.written));
         }
-        self.sync_to_stack()?;
-        let checkpoint = self.enc.checkpoint();
-        if let Err(err) = f(self.enc) {
-            self.enc.restore(checkpoint);
-            self.remaining = before;
-            return Err(err);
+        let result = emit(self.enc);
+        if let Err(error) = result {
+            self.enc.poison();
+            return Err(error);
         }
-        self.sync_from_stack()?;
-        if self.remaining + 1 != before {
-            self.enc.restore(checkpoint);
-            self.remaining = before;
-            return Err(CborError::new(
-                ErrorCode::ArrayLenMismatch,
-                self.enc.sink.position(),
-            ));
+        self.enc.ensure_healthy()?;
+        let after = match self.remaining() {
+            Ok(value) => value,
+            Err(error) => {
+                self.enc.poison();
+                return Err(error);
+            }
+        };
+        if after.checked_add(1) != Some(before) {
+            self.enc.poison();
+            return Err(format_error(ErrorCode::ArrayLenMismatch, self.enc.written));
         }
         Ok(())
     }
 
-    /// Encode a value using the native `CborEncode` trait.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn value<T: CborEncode + ?Sized>(&mut self, value: &T) -> Result<(), CborError> {
-        value.encode_array_item(self)
+    /// Encode a native value as the next item.
+    pub fn value<T: CborEncode + ?Sized>(&mut self, value: &T) -> EncodeResult<(), S> {
+        self.enc.encode(value)
+    }
+
+    /// Encode the next item through a controlled adapter.
+    pub fn encode_with<F>(&mut self, emit: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut ValueEncoder<'_, S>) -> EncodeResult<(), S>,
+    {
+        self.enc.encode_with(emit)
     }
 
     /// Encode a nested array.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
     {
-        self.delegate(|enc| enc.array(len, f))
+        self.delegate(|encoder| encoder.array(len, build))
     }
 
     /// Encode a nested map.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the array length is exceeded or if encoding fails.
-    pub fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
+        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
     {
-        self.delegate(|enc| enc.map(len, f))
+        self.delegate(|encoder| encoder.map(len, build))
+    }
+}
+
+/// Builder for canonical text-keyed map entries.
+pub struct MapEncoder<'a, S: ByteSink = VecSink> {
+    enc: &'a mut Encoder<S>,
+    frame_index: usize,
+    previous_key: String,
+    has_previous_key: bool,
+}
+
+impl<S: ByteSink> MapEncoder<'_, S> {
+    #[cfg(feature = "collections")]
+    pub(crate) const fn offset(&self) -> usize {
+        self.enc.written
+    }
+
+    fn remaining(&self) -> EncodeResult<(usize, bool), S> {
+        match self.enc.stack.get(self.frame_index) {
+            Some(Frame::Map {
+                remaining_pairs,
+                pending_value,
+                ..
+            }) => Ok((*remaining_pairs, *pending_value)),
+            _ => Err(format_error(
+                ErrorCode::MalformedCanonical,
+                self.enc.written,
+            )),
+        }
+    }
+
+    fn write_entry<F>(&mut self, key: &str, value: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+    {
+        let (before, pending) = self.remaining()?;
+        if before == 0 || pending {
+            return Err(format_error(ErrorCode::MapLenMismatch, self.enc.written));
+        }
+        self.enc.check_text_len(key.len())?;
+        if self.has_previous_key {
+            match cmp_text_keys_canonical(&self.previous_key, key) {
+                Ordering::Less => {}
+                Ordering::Equal => {
+                    self.enc.poison();
+                    return Err(format_error(ErrorCode::DuplicateMapKey, self.enc.written));
+                }
+                Ordering::Greater => {
+                    self.enc.poison();
+                    return Err(format_error(
+                        ErrorCode::NonCanonicalMapOrder,
+                        self.enc.written,
+                    ));
+                }
+            }
+        }
+        self.enc.check_text_output(key)?;
+        self.previous_key.clear();
+        try_reserve_exact_str(&mut self.previous_key, key.len(), self.enc.written)
+            .map_err(EncodeError::Cbor)?;
+        self.enc.write_map_key_bytes(key)?;
+        self.previous_key.push_str(key);
+        self.has_previous_key = true;
+        let start = self.enc.written;
+        if let Err(error) = value(self.enc) {
+            self.enc.poison();
+            return Err(error);
+        }
+        self.enc.ensure_healthy()?;
+        let (after, pending) = self.remaining()?;
+        if pending || after.checked_add(1) != Some(before) {
+            self.enc.poison();
+            return Err(format_error(ErrorCode::MapLenMismatch, start));
+        }
+        Ok(())
+    }
+
+    /// Insert one entry. Keys must already arrive in canonical order.
+    pub fn entry<F>(&mut self, key: &str, value: F) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+    {
+        self.enc.ensure_healthy()?;
+        let result = self.write_entry(key, value);
+        if result.is_err() {
+            self.enc.poison();
+        }
+        result
+    }
+
+    /// Insert an entry using a validated, pre-encoded text key.
+    #[cfg(feature = "edit")]
+    pub(crate) fn entry_raw_key<F>(
+        &mut self,
+        key: EncodedTextKey<'_>,
+        value: F,
+    ) -> EncodeResult<(), S>
+    where
+        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+    {
+        self.enc.ensure_healthy()?;
+        let result = self
+            .enc
+            .encoded_text_key_source(key.as_bytes())
+            .and_then(|text| self.write_entry(text, value));
+        if result.is_err() {
+            self.enc.poison();
+        }
+        result
+    }
+}
+
+#[cfg(feature = "edit")]
+impl MapEncoder<'_, VecSink> {
+    pub(crate) fn entry_cbor<F>(&mut self, key: &str, value: F) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        self.entry(key, |encoder| value(encoder).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
+    }
+
+    pub(crate) fn entry_raw_key_cbor<F>(
+        &mut self,
+        key: EncodedTextKey<'_>,
+        value: F,
+    ) -> Result<(), CborError>
+    where
+        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+    {
+        self.entry_raw_key(key, |encoder| value(encoder).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
+    }
+}
+
+#[cfg(feature = "edit")]
+#[allow(clippy::needless_pass_by_value)]
+const fn collapse_vec_error(error: EncodeError<CborError>) -> CborError {
+    match error {
+        EncodeError::Cbor(error) | EncodeError::Sink(error) => error,
+        EncodeError::Poisoned => CborError::new(ErrorCode::EncoderPoisoned, 0),
     }
 }
 
 #[cfg(feature = "edit")]
 pub(crate) trait EmitValue {
-    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError>;
-    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError>;
-    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> Result<(), CborError>;
+    fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> Result<(), CborError>;
+    fn map<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>;
-    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn array<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>;
 }
 
 #[cfg(feature = "edit")]
-impl EmitValue for Encoder {
-    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        Self::raw_value_ref(self, v)
+impl EmitValue for Encoder<VecSink> {
+    fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> Result<(), CborError> {
+        Self::raw_value_ref(self, value).map_err(collapse_vec_error)
     }
-
-    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
-        Self::raw_cbor(self, v)
+    fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> Result<(), CborError> {
+        Self::raw_cbor(self, value).map_err(collapse_vec_error)
     }
-
-    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn map<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
     {
-        Self::map(self, len, f)
+        Self::map(self, len, |map| build(map).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
     }
-
-    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn array<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
     {
-        Self::array(self, len, f)
+        Self::array(self, len, |array| build(array).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
     }
 }
 
 #[cfg(feature = "edit")]
 impl EmitValue for ArrayEncoder<'_> {
-    fn raw_value_ref(&mut self, v: CborValueRef<'_>) -> Result<(), CborError> {
-        ArrayEncoder::raw_value_ref(self, v)
+    fn raw_value_ref(&mut self, value: CborValueRef<'_>) -> Result<(), CborError> {
+        ArrayEncoder::raw_value_ref(self, value).map_err(collapse_vec_error)
     }
-
-    fn raw_cbor(&mut self, v: CanonicalCborRef<'_>) -> Result<(), CborError> {
-        ArrayEncoder::raw_cbor(self, v)
+    fn raw_cbor(&mut self, value: CanonicalCborRef<'_>) -> Result<(), CborError> {
+        ArrayEncoder::raw_cbor(self, value).map_err(collapse_vec_error)
     }
-
-    fn map<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn map<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut MapEncoder<'_>) -> Result<(), CborError>,
     {
-        ArrayEncoder::map(self, len, f)
+        ArrayEncoder::map(self, len, |map| build(map).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
     }
-
-    fn array<F>(&mut self, len: usize, f: F) -> Result<(), CborError>
+    fn array<F>(&mut self, len: usize, build: F) -> Result<(), CborError>
     where
         F: FnOnce(&mut ArrayEncoder<'_>) -> Result<(), CborError>,
     {
-        ArrayEncoder::array(self, len, f)
-    }
-}
-
-/// Builder for writing map entries into a canonical CBOR stream.
-pub struct MapEncoder<'a> {
-    enc: &'a mut Encoder,
-    frame_index: usize,
-}
-
-impl MapEncoder<'_> {
-    #[inline]
-    fn write_entry<K, F>(&mut self, write_key: K, f: F) -> Result<(), CborError>
-    where
-        K: FnOnce(&mut VecSink) -> Result<(), CborError>,
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
-    {
-        let (before, pending) = self.enc.map_remaining_at(self.frame_index)?;
-        if before == 0 || pending {
-            return Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.enc.sink.position(),
-            ));
-        }
-
-        let checkpoint = self.enc.checkpoint();
-        let entry_start = self.enc.begin_map_key()?;
-        let (key_start, key_end) = self.write_key(entry_start, write_key)?;
-        if let Err(err) = self.enc.finish_map_key(key_start, key_end) {
-            self.enc.restore(checkpoint);
-            return Err(err);
-        }
-        let res = f(self.enc);
-        self.finish_entry(checkpoint, before, res)
-    }
-
-    #[inline]
-    fn finish_entry(
-        &mut self,
-        checkpoint: EncoderCheckpoint,
-        before: usize,
-        res: Result<(), CborError>,
-    ) -> Result<(), CborError> {
-        if let Err(err) = res {
-            self.enc.restore(checkpoint);
-            return Err(err);
-        }
-        let (after, pending) = self.enc.map_remaining_at(self.frame_index)?;
-        if pending || after + 1 != before {
-            self.enc.restore(checkpoint);
-            return Err(CborError::new(
-                ErrorCode::MapLenMismatch,
-                self.enc.sink.position(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn write_key<F>(&mut self, entry_start: usize, write: F) -> Result<(usize, usize), CborError>
-    where
-        F: FnOnce(&mut VecSink) -> Result<(), CborError>,
-    {
-        if let Err(err) = write(&mut self.enc.sink) {
-            self.enc.sink.buf.truncate(entry_start);
-            return Err(err);
-        }
-        Ok((entry_start, self.enc.sink.buf.len()))
-    }
-
-    /// Insert a map entry. Keys must be in canonical order; duplicates are rejected.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails, if keys are out of order, or if duplicates are found.
-    pub fn entry<F>(&mut self, key: &str, f: F) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
-    {
-        self.enc.check_text_len(key.len())?;
-        self.write_entry(|sink| encode_text(sink, key), f)
-    }
-
-    /// Insert a map entry using a pre-encoded canonical text key.
-    ///
-    /// This avoids re-encoding keys when splicing from validated canonical bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails, if keys are out of order, or if duplicates are found.
-    #[cfg(feature = "edit")]
-    pub(crate) fn entry_raw_key<F>(
-        &mut self,
-        key: EncodedTextKey<'_>,
-        f: F,
-    ) -> Result<(), CborError>
-    where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
-    {
-        let key_bytes = key.as_bytes();
-        self.enc.check_encoded_text_key_len(key_bytes)?;
-        self.write_entry(|sink| sink.write(key_bytes), f)
+        ArrayEncoder::array(self, len, |array| build(array).map_err(EncodeError::Cbor))
+            .map_err(collapse_vec_error)
     }
 }

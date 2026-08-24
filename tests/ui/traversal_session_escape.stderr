@@ -1,0 +1,34 @@
+error: lifetime may not live long enough
+  --> tests/ui/traversal_session_escape.rs:10:51
+   |
+10 |         .with_traversal(&mut workspace, |session| Ok::<_, CborError>(session))
+   |                                          -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+   |                                          |      |
+   |                                          |      return type of closure is Result<&'2 mut TraversalSession<'_, '_, '_, true>, CborError>
+   |                                          has type `&'1 mut TraversalSession<'_, '_, '_, true>`
+
+error: lifetime may not live long enough
+  --> tests/ui/traversal_session_escape.rs:10:51
+   |
+10 |         .with_traversal(&mut workspace, |session| Ok::<_, CborError>(session))
+   |                                          -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'4`
+   |                                          |      |
+   |                                          |      return type of closure is Result<&mut TraversalSession<'4, '_, '_, true>, CborError>
+   |                                          has type `&mut TraversalSession<'3, '_, '_, true>`
+   |
+   = note: requirement occurs because of a mutable reference to `TraversalSession<'_, '_, '_, true>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error: lifetime may not live long enough
+  --> tests/ui/traversal_session_escape.rs:10:51
+   |
+10 |         .with_traversal(&mut workspace, |session| Ok::<_, CborError>(session))
+   |                                          -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'5` must outlive `'6`
+   |                                          |      |
+   |                                          |      return type of closure is Result<&mut TraversalSession<'_, '_, '6, true>, CborError>
+   |                                          has type `&mut TraversalSession<'_, '_, '5, true>`
+   |
+   = note: requirement occurs because of a mutable reference to `TraversalSession<'_, '_, '_, true>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

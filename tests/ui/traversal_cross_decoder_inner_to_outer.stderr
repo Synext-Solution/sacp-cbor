@@ -1,0 +1,28 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/ui/traversal_cross_decoder_inner_to_outer.rs:20:17
+   |
+18 |         .with_traversal(&mut outer_workspace, |outer| -> Result<(), sacp_cbor::CborError> {
+   |                                                ----- `outer` declared here, outside of the closure body
+19 |             inner_decoder.with_traversal(&mut inner_workspace, |inner| -> Result<(), sacp_cbor::CborError> {
+   |                                                                 ----- `inner` is a reference that is only valid in the closure body
+20 |                 require_same_brand(inner, outer);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `inner` escapes the closure body here
+   |
+   = note: requirement occurs because of a mutable reference to `TraversalSession<'_, '_, '_, true>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/ui/traversal_cross_decoder_inner_to_outer.rs:20:17
+   |
+18 |         .with_traversal(&mut outer_workspace, |outer| -> Result<(), sacp_cbor::CborError> {
+   |                                                -----
+   |                                                |
+   |                                                `outer` is a reference that is only valid in the closure body
+   |                                                has type `&mut TraversalSession<'_, '_, '1, true>`
+19 |             inner_decoder.with_traversal(&mut inner_workspace, |inner| -> Result<(), sacp_cbor::CborError> {
+20 |                 require_same_brand(inner, outer);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                 |
+   |                 `outer` escapes the closure body here
+   |                 argument requires that `'1` must outlive `'static`

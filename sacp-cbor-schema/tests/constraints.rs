@@ -5,7 +5,7 @@ use sacp_cbor_schema::{
 };
 
 mod common;
-use common::{field, one_field, schema, validate};
+use common::{field, limits, one_field, schema, validate};
 
 #[test]
 fn range_supports_safe_and_bignum_bounds() {
@@ -79,7 +79,7 @@ fn count_constraints_check_elements_and_octets() {
         m.entry("t", |e| e.text("é"))
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     validate(&s, &bytes).expect("counts on boundaries");
 
     let short = one_field("t", |e| e.text("a"));
@@ -175,7 +175,7 @@ fn couplings_are_checked_from_optional_presence_bits() {
         m.entry("c", |e| e.int(1))
     })
     .expect("encode");
-    validate(&s, &ok.finish().expect("finish").into_bytes()).expect("couplings satisfied");
+    validate(&s, &ok.finish().expect("finish")).expect("couplings satisfied");
 
     let bad = one_field("a", |e| e.int(1));
     let err = s
@@ -216,87 +216,111 @@ fn compile_errors_cover_model_rejections() {
         .map(|i| field(&format!("k{i:02}"), FieldType::Int, false, vec![]))
         .collect();
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: too_many_fields,
-            couplings: vec![],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: too_many_fields,
+                couplings: vec![],
+            },
+            sacp_cbor_schema::SchemaCompileLimits {
+                max_fields_per_record: 64,
+                ..limits()
+            }
+        ),
         Err(SchemaError::FieldCapExceeded { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![
-                field("a", FieldType::Int, false, vec![]),
-                field("a", FieldType::Text, false, vec![]),
-            ],
-            couplings: vec![],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![
+                    field("a", FieldType::Int, false, vec![]),
+                    field("a", FieldType::Text, false, vec![]),
+                ],
+                couplings: vec![],
+            },
+            limits()
+        ),
         Err(SchemaError::DuplicateFieldKey { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![field(
-                "a",
-                FieldType::Text,
-                false,
-                vec![Constraint::Range {
-                    min: None,
-                    max: None,
-                }],
-            )],
-            couplings: vec![],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![field(
+                    "a",
+                    FieldType::Text,
+                    false,
+                    vec![Constraint::Range {
+                        min: None,
+                        max: None,
+                    }],
+                )],
+                couplings: vec![],
+            },
+            limits()
+        ),
         Err(SchemaError::ConstraintWrongKind { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![field("a", FieldType::Union(vec![]), false, vec![],)],
-            couplings: vec![],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![field("a", FieldType::Union(vec![]), false, vec![],)],
+                couplings: vec![],
+            },
+            limits()
+        ),
         Err(SchemaError::EmptyUnion { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![field(
-                "a",
-                FieldType::Union(vec![
-                    sacp_cbor_schema::UnionAlt {
-                        code: 1,
-                        payload: None
-                    },
-                    sacp_cbor_schema::UnionAlt {
-                        code: 1,
-                        payload: None
-                    },
-                ]),
-                false,
-                vec![],
-            )],
-            couplings: vec![],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![field(
+                    "a",
+                    FieldType::Union(vec![
+                        sacp_cbor_schema::UnionAlt {
+                            code: 1,
+                            payload: None
+                        },
+                        sacp_cbor_schema::UnionAlt {
+                            code: 1,
+                            payload: None
+                        },
+                    ]),
+                    false,
+                    vec![],
+                )],
+                couplings: vec![],
+            },
+            limits()
+        ),
         Err(SchemaError::DuplicateUnionCode { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![field("a", FieldType::Int, true, vec![])],
-            couplings: vec![Coupling::Requires {
-                if_present: "a".to_owned(),
-                then_present: "missing".to_owned(),
-            }],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![field("a", FieldType::Int, true, vec![])],
+                couplings: vec![Coupling::Requires {
+                    if_present: "a".to_owned(),
+                    then_present: "missing".to_owned(),
+                }],
+            },
+            limits()
+        ),
         Err(SchemaError::CouplingNonOptionalField { .. })
             | Err(SchemaError::CouplingUnknownField { .. })
     ));
 
     assert!(matches!(
-        RecordSchema::compile(&RecordDef {
-            fields: vec![field("a", FieldType::Int, false, vec![])],
-            couplings: vec![Coupling::Together(vec!["a".to_owned(), "a".to_owned()])],
-        }),
+        RecordSchema::compile(
+            &RecordDef {
+                fields: vec![field("a", FieldType::Int, false, vec![])],
+                couplings: vec![Coupling::Together(vec!["a".to_owned(), "a".to_owned()])],
+            },
+            limits()
+        ),
         Err(SchemaError::CouplingDuplicateKey { .. })
     ));
 
@@ -304,4 +328,176 @@ fn compile_errors_cover_model_rejections() {
         Int::from_sign_magnitude(true, &[]),
         Err(SchemaError::NonNormalizedInt)
     ));
+}
+
+#[test]
+fn nested_preflight_caps_report_the_full_named_path_and_rule() {
+    let nested_record = |leaf: FieldType, couplings: Vec<Coupling>| RecordDef {
+        fields: vec![field("inner", leaf, false, vec![])],
+        couplings,
+    };
+
+    let field_cap = RecordDef {
+        fields: vec![field(
+            "outer",
+            FieldType::Array(Box::new(FieldType::Record(Box::new(RecordDef {
+                fields: vec![
+                    field("a", FieldType::Int, false, vec![]),
+                    field("b", FieldType::Int, false, vec![]),
+                ],
+                couplings: vec![],
+            })))),
+            false,
+            vec![],
+        )],
+        couplings: vec![],
+    };
+    let mut cap = limits();
+    cap.max_fields_per_record = 1;
+    assert_eq!(
+        RecordSchema::compile(&field_cap, cap).unwrap_err(),
+        SchemaError::FieldCapExceeded {
+            path: "outer".into(),
+            count: 2,
+        },
+        "nested field-cap path rule"
+    );
+
+    let constraint_cap = RecordDef {
+        fields: vec![field(
+            "outer",
+            FieldType::Record(Box::new(RecordDef {
+                fields: vec![FieldDef {
+                    key: "inner".into(),
+                    ty: FieldType::Int,
+                    required: false,
+                    constraints: vec![
+                        Constraint::Count {
+                            unit: CountUnit::Octets,
+                            min: None,
+                            max: None,
+                        },
+                        Constraint::Count {
+                            unit: CountUnit::Elements,
+                            min: None,
+                            max: None,
+                        },
+                    ],
+                }],
+                couplings: vec![],
+            })),
+            false,
+            vec![],
+        )],
+        couplings: vec![],
+    };
+    let mut cap = limits();
+    cap.max_constraints_per_field = 1;
+    assert_eq!(
+        RecordSchema::compile(&constraint_cap, cap).unwrap_err(),
+        SchemaError::ConstraintCapExceeded {
+            field: "outer.inner".into(),
+            count: 2,
+        },
+        "nested constraint-cap path rule"
+    );
+
+    let union_cap = RecordDef {
+        fields: vec![field(
+            "outer",
+            FieldType::Record(Box::new(nested_record(
+                FieldType::Union(vec![
+                    sacp_cbor_schema::UnionAlt {
+                        code: 1,
+                        payload: None,
+                    },
+                    sacp_cbor_schema::UnionAlt {
+                        code: 2,
+                        payload: None,
+                    },
+                ]),
+                vec![],
+            ))),
+            false,
+            vec![],
+        )],
+        couplings: vec![],
+    };
+    let mut cap = limits();
+    cap.max_union_alternatives = 1;
+    assert_eq!(
+        RecordSchema::compile(&union_cap, cap).unwrap_err(),
+        SchemaError::UnionAltCapExceeded {
+            path: "outer.inner".into(),
+            count: 2,
+        },
+        "nested union-cap path rule"
+    );
+
+    let coupling_cap = RecordDef {
+        fields: vec![field(
+            "outer",
+            FieldType::Record(Box::new(nested_record(
+                FieldType::Int,
+                vec![
+                    Coupling::Together(vec!["inner".into(), "missing".into()]),
+                    Coupling::ExactlyOne(vec!["inner".into(), "missing".into()]),
+                ],
+            ))),
+            false,
+            vec![],
+        )],
+        couplings: vec![],
+    };
+    let mut cap = limits();
+    cap.max_couplings_per_record = 1;
+    assert_eq!(
+        RecordSchema::compile(&coupling_cap, cap).unwrap_err(),
+        SchemaError::CouplingCapExceeded {
+            path: "outer".into(),
+            count: 2,
+        },
+        "nested coupling-cap path rule"
+    );
+}
+
+#[test]
+fn permissive_depth_limit_does_not_allocate_to_the_limit() {
+    let mut compile_limits = limits();
+    compile_limits.max_schema_depth = usize::MAX;
+    RecordSchema::compile(
+        &RecordDef {
+            fields: vec![field("a", FieldType::Int, true, vec![])],
+            couplings: vec![],
+        },
+        compile_limits,
+    )
+    .expect("tiny schema uses actual path depth, not the caller's permissive limit");
+}
+
+#[test]
+fn duplicate_constraints_use_canonical_semantics_without_pairwise_scans() {
+    let definition = RecordDef {
+        fields: vec![field(
+            "a",
+            FieldType::Text,
+            true,
+            vec![
+                Constraint::Enum(vec![
+                    EnumMember::Text("a".into()),
+                    EnumMember::Text("b".into()),
+                ]),
+                Constraint::Enum(vec![
+                    EnumMember::Text("b".into()),
+                    EnumMember::Text("a".into()),
+                ]),
+            ],
+        )],
+        couplings: vec![],
+    };
+    assert_eq!(
+        RecordSchema::compile(&definition, limits()).unwrap_err(),
+        SchemaError::DuplicateConstraint { field: "a".into() },
+        "constraint canonical-set duplicate rule"
+    );
 }

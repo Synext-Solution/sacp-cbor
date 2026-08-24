@@ -20,7 +20,7 @@ use std::time::Instant;
 use sacp_cbor::{validate_canonical_with, DecodeLimits, Encoder, ValidationOptions};
 use sacp_cbor_schema::{
     Constraint, CountUnit, Coupling, EnumMember, FieldDef, FieldType, Int, RecordDef, RecordSchema,
-    UnionAlt,
+    SchemaCompileLimits, UnionAlt,
 };
 
 fn field(key: &str, ty: FieldType, required: bool, constraints: Vec<Constraint>) -> FieldDef {
@@ -40,7 +40,11 @@ struct Dataset {
 
 impl Dataset {
     fn new(name: &'static str, def: &RecordDef, bytes: Vec<u8>) -> Self {
-        let schema = RecordSchema::compile(def).expect("compile");
+        let schema = RecordSchema::compile(
+            def,
+            SchemaCompileLimits::new(4096, 4096, 4096, 4096, 4096, 1_000_000, 16_000_000),
+        )
+        .expect("compile");
         // Every dataset must be valid under its schema.
         schema
             .validate(
@@ -132,7 +136,7 @@ fn flat_scalars(constrained: bool) -> Dataset {
             "flat_scalars_plain"
         },
         &def,
-        enc.finish().expect("finish").into_bytes(),
+        enc.finish().expect("finish"),
     )
 }
 
@@ -156,7 +160,7 @@ fn text_heavy(name: &'static str, len: usize) -> Dataset {
         m.entry("body", |e| e.text(&body))
     })
     .expect("encode");
-    Dataset::new(name, &def, enc.finish().expect("finish").into_bytes())
+    Dataset::new(name, &def, enc.finish().expect("finish"))
 }
 
 /// A long homogeneous integer array.
@@ -182,11 +186,7 @@ fn array_int_1000() -> Dataset {
         })
     })
     .expect("encode");
-    Dataset::new(
-        "array_int_1000",
-        &def,
-        enc.finish().expect("finish").into_bytes(),
-    )
+    Dataset::new("array_int_1000", &def, enc.finish().expect("finish"))
 }
 
 /// A sorted set of 32-byte references (content-address shape).
@@ -225,11 +225,7 @@ fn set_ref32_100() -> Dataset {
         })
     })
     .expect("encode");
-    Dataset::new(
-        "set_ref32_100",
-        &def,
-        enc.finish().expect("finish").into_bytes(),
-    )
+    Dataset::new("set_ref32_100", &def, enc.finish().expect("finish"))
 }
 
 /// A list of coded unions with mixed alternatives.
@@ -278,11 +274,7 @@ fn union_list_200() -> Dataset {
         })
     })
     .expect("encode");
-    Dataset::new(
-        "union_list_200",
-        &def,
-        enc.finish().expect("finish").into_bytes(),
-    )
+    Dataset::new("union_list_200", &def, enc.finish().expect("finish"))
 }
 
 /// Nested records four levels deep, eight leaves per level.
@@ -305,7 +297,10 @@ fn nested_depth4() -> Dataset {
             couplings: vec![],
         }
     }
-    fn encode_level(e: &mut Encoder, depth: usize) -> Result<(), sacp_cbor::CborError> {
+    fn encode_level(
+        e: &mut Encoder,
+        depth: usize,
+    ) -> sacp_cbor::EncodeResult<(), sacp_cbor::VecSink> {
         let n = if depth > 0 { 3 } else { 2 };
         e.map(n, |m| {
             m.entry("k0", |e| e.int(depth as i64))?;
@@ -319,11 +314,7 @@ fn nested_depth4() -> Dataset {
     let def = level(4);
     let mut enc = Encoder::new();
     encode_level(&mut enc, 4).expect("encode");
-    Dataset::new(
-        "nested_depth4",
-        &def,
-        enc.finish().expect("finish").into_bytes(),
-    )
+    Dataset::new("nested_depth4", &def, enc.finish().expect("finish"))
 }
 
 /// Sixteen optional fields under eight couplings, all present.
@@ -346,11 +337,7 @@ fn couplings_16() -> Dataset {
         Ok(())
     })
     .expect("encode");
-    Dataset::new(
-        "couplings_16",
-        &def,
-        enc.finish().expect("finish").into_bytes(),
-    )
+    Dataset::new("couplings_16", &def, enc.finish().expect("finish"))
 }
 
 /// Minimum ns/op over `SAMPLES` batches, each batch sized to ~`BATCH_MS`.
@@ -429,10 +416,10 @@ fn main() {
         let two_pass = measure(|| {
             let w =
                 validate_canonical_with(black_box(bytes), limits, options).expect("two-pass core");
-            black_box(d.schema.check(w)).expect("two-pass check");
+            black_box(d.schema.check(w, limits)).expect("two-pass check");
         });
         let check = measure(|| {
-            black_box(d.schema.check(black_box(witness))).expect("check");
+            black_box(d.schema.check(black_box(witness), limits)).expect("check");
         });
 
         println!(

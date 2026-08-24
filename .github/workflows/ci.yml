@@ -11,6 +11,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust 1.85.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
+        with:
+          toolchain: "1.85.0"
+
+      - name: Install Rust 1.75.0 for proc-macro MSRV verification
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
+        with:
+          toolchain: "1.75.0"
+
+      - name: Check every published package at its runtime MSRV
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo +1.85.0 check --locked -p sacp-cbor --no-default-features
+          cargo +1.85.0 check --locked -p sacp-cbor --no-default-features --features sha2
+          cargo +1.85.0 check --locked -p sacp-cbor --no-default-features --features alloc
+          cargo +1.85.0 check --locked -p sacp-cbor --all-features
+          cargo +1.75.0 check --locked -p sacp-cbor-derive
+          cargo +1.85.0 check --locked -p sacp-cbor-abi --no-default-features
+          cargo +1.85.0 check --locked -p sacp-cbor-abi
+          cargo +1.75.0 check --locked -p sacp-cbor-abi-derive
+          cargo +1.85.0 check --locked -p sacp-cbor-schema --no-default-features
+          cargo +1.85.0 check --locked -p sacp-cbor-schema
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -67,6 +97,9 @@ jobs:
 
       - name: Build (no_std + alloc + sha2)
         run: cargo build -p sacp-cbor --no-default-features --features alloc,sha2
+
+      - name: Build (no_std + sha2 helpers only)
+        run: cargo build -p sacp-cbor --no-default-features --features sha2
 
       - name: Build ABI (no default features)
         run: cargo build -p sacp-cbor-abi --no-default-features

@@ -7,12 +7,12 @@ use proptest::prelude::*;
 use sacp_cbor::query::{CborKind, CborValueRef};
 use sacp_cbor::{validate_canonical_with, DecodeLimits, Encoder, ValidationOptions};
 use sacp_cbor_schema::{
-    Constraint, CountUnit, Coupling, Direction, EnumMember, FieldType, Int, RecordDef,
+    Constraint, CountUnit, Coupling, EnumMember, FieldType, InclusionProof, Int, RecordDef,
     RecordSchema, UnionAlt,
 };
 
 mod common;
-use common::field;
+use common::{field, inclusion_limits, limits};
 
 #[derive(Clone, Copy, Debug)]
 enum Class {
@@ -258,7 +258,7 @@ fn enum_bytes(member: &EnumMember) -> Vec<u8> {
         }
         EnumMember::Text(value) => enc.text(value).expect("encode text"),
     }
-    enc.finish().expect("finish").into_bytes()
+    enc.finish().expect("finish")
 }
 
 fn int_to_i128(value: &Int) -> Option<i128> {
@@ -318,7 +318,7 @@ fn encode_simple(
         Ok(())
     })
     .expect("encode");
-    enc.finish().expect("finish").into_bytes()
+    enc.finish().expect("finish")
 }
 
 prop_compose! {
@@ -342,7 +342,7 @@ proptest! {
         bools in prop::collection::vec(any::<bool>(), 3),
     ) {
         let def = simple_def(&kinds);
-        let schema = RecordSchema::compile(&def).expect("compile");
+        let schema = RecordSchema::compile(&def, limits()).expect("compile");
         let bytes = encode_simple(&def, &present, &ints, &texts, &bools);
         let schema_ok = schema.validate(
             &bytes,
@@ -364,7 +364,7 @@ proptest! {
             ],
             couplings: vec![],
         };
-        let schema = RecordSchema::compile(&def).expect("compile");
+        let schema = RecordSchema::compile(&def, limits()).expect("compile");
         let schema_ok = schema.validate(
             &bytes,
             DecodeLimits::for_bytes(bytes.len()),
@@ -382,12 +382,12 @@ proptest! {
             fields: vec![field("a", FieldType::Int, true, vec![])],
             couplings: vec![],
         };
-        let schema = RecordSchema::compile(&def).expect("compile");
+        let schema = RecordSchema::compile(&def, limits()).expect("compile");
         let bytes = encode_simple(&def, &[true], &[v, 0, 0], &["".to_owned(), "".to_owned(), "".to_owned()], &[false; 3]);
         let limits = DecodeLimits::for_bytes(bytes.len());
         let witness = schema.validate(&bytes, limits, ValidationOptions::new()).expect("validate");
         prop_assert!(validate_canonical_with(&bytes, limits, ValidationOptions::new()).is_ok());
-        prop_assert!(schema.check(witness).is_ok());
+        prop_assert!(schema.check(witness, limits).is_ok());
     }
 
     #[test]
@@ -398,15 +398,15 @@ proptest! {
                 max: Some(Int::from(10_i64)),
             }])],
             couplings: vec![],
-        }).expect("compile old");
+        }, limits()).expect("compile old");
         let new = RecordSchema::compile(&RecordDef {
             fields: vec![field("a", FieldType::Int, true, vec![Constraint::Range {
                 min: Some(Int::from(0_i64)),
                 max: Some(Int::from(20_i64)),
             }])],
             couplings: vec![],
-        }).expect("compile new");
-        prop_assert!(matches!(old.containment(&new).forward, Direction::Holds));
+        }, limits()).expect("compile new");
+        prop_assert!(matches!(old.inclusion(&new, inclusion_limits()).forward, InclusionProof::Proven));
         let def = RecordDef {
             fields: vec![field("a", FieldType::Int, true, vec![])],
             couplings: vec![],
@@ -447,7 +447,7 @@ fn reference_checker_covers_union_set_map_and_record() {
         ],
         couplings: vec![],
     };
-    let schema = RecordSchema::compile(&def).expect("compile");
+    let schema = RecordSchema::compile(&def, limits()).expect("compile");
     let mut enc = Encoder::new();
     enc.map(4, |m| {
         m.entry("m", |e| e.map(1, |m| m.entry("k", |e| e.text("v"))))?;
@@ -466,7 +466,7 @@ fn reference_checker_covers_union_set_map_and_record() {
         })
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     assert!(schema
         .validate(
             &bytes,
@@ -492,7 +492,7 @@ fn throughput_smoke_fused_vs_two_pass() {
         ],
         couplings: vec![],
     };
-    let schema = RecordSchema::compile(&def).expect("compile");
+    let schema = RecordSchema::compile(&def, limits()).expect("compile");
     let mut enc = Encoder::new();
     enc.map(2, |m| {
         m.entry("a", |e| {
@@ -506,7 +506,7 @@ fn throughput_smoke_fused_vs_two_pass() {
         m.entry("b", |e| e.text(&"x".repeat(800)))
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     let limits = DecodeLimits::for_bytes(bytes.len());
     let rounds = 1_000u32;
 
@@ -522,7 +522,7 @@ fn throughput_smoke_fused_vs_two_pass() {
     for _ in 0..rounds {
         let witness =
             validate_canonical_with(&bytes, limits, ValidationOptions::new()).expect("core");
-        schema.check(witness).expect("check");
+        schema.check(witness, limits).expect("check");
     }
     let two_pass = start.elapsed() / rounds;
 

@@ -8,7 +8,7 @@
 use proptest::prelude::*;
 use sacp_cbor::cde::{from_cde, to_cde};
 use sacp_cbor::scalar::F64Bits;
-use sacp_cbor::{CborError, DecodeLimits, Encoder};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, EncodeResult, Encoder, VecSink};
 
 #[derive(Clone, Debug)]
 enum Value {
@@ -84,7 +84,7 @@ fn value() -> impl Strategy<Value = Value> {
     })
 }
 
-fn encode_value(enc: &mut Encoder, value: &Value) -> Result<(), CborError> {
+fn encode_value(enc: &mut Encoder, value: &Value) -> EncodeResult<(), VecSink> {
     match value {
         Value::Int(v) => enc.int_i128(*v),
         Value::Bignum {
@@ -118,7 +118,9 @@ proptest! {
     fn bridge_round_trips_arbitrary_canonical_items(v in value()) {
         let mut enc = Encoder::new();
         encode_value(&mut enc, &v).expect("generated value encodes");
-        let canonical = enc.finish().expect("one complete root value");
+        let bytes = enc.finish().expect("one complete root value");
+        let canonical = CanonicalCbor::from_vec(bytes, DecodeLimits::for_bytes(1 << 20))
+            .expect("encoder output is canonical");
         let sacp = canonical.as_bytes();
 
         let image = to_cde(canonical.as_canonical_ref()).expect("to_cde is total");

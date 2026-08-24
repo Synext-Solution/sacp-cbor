@@ -1,7 +1,8 @@
 [package]
 name = "sacp-cbor-derive"
-version = "0.17.6"
+version = "0.18.0"
 edition = "2021"
+rust-version = "1.75"
 license = "MIT"
 description = "Derive macros for sacp-cbor native encode/decode"
 repository = "https://github.com/Synext-Solution/sacp-cbor"

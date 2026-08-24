@@ -14,6 +14,14 @@ use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::query::{CborValueRef, PathElem};
 use crate::{CborError, ErrorCode};
 
+#[allow(clippy::needless_pass_by_value)]
+const fn encoder_error(error: crate::EncodeError<CborError>) -> CborError {
+    match error {
+        crate::EncodeError::Cbor(error) | crate::EncodeError::Sink(error) => error,
+        crate::EncodeError::Poisoned => err(ErrorCode::EncoderPoisoned, 0),
+    }
+}
+
 const fn err(code: ErrorCode, offset: usize) -> CborError {
     CborError::new(code, offset)
 }
@@ -196,7 +204,9 @@ impl<'a> Editor<'a> {
     pub fn apply(self) -> Result<CanonicalCbor, CborError> {
         let mut enc = Encoder::try_with_capacity(self.root.byte_len())?;
         emit_value(&mut enc, self.root, &self.ops)?;
-        enc.finish()
+        Ok(CanonicalCbor::new_unchecked(
+            enc.finish().map_err(encoder_error)?,
+        ))
     }
 }
 
@@ -818,7 +828,9 @@ fn emit_map_entries<'a>(
                 match cmp_text_keys_canonical(key, mod_key.as_ref()) {
                     Ordering::Less => {
                         let value_ref = value;
-                        menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
+                        menc.entry_raw_key_cbor(key_bytes, |venc| {
+                            EmitValue::raw_value_ref(venc, value_ref)
+                        })?;
                         entry = next_map_entry_encoded(&mut iter)?;
                     }
                     Ordering::Equal => {
@@ -831,11 +843,13 @@ fn emit_map_entries<'a>(
                                 return Err(err(ErrorCode::InvalidQuery, map_off));
                             }
                             Some(Terminal::Set { value, .. }) => {
-                                menc.entry_raw_key(key_bytes, |venc| write_new_value(venc, value))?;
+                                menc.entry_raw_key_cbor(key_bytes, |venc| {
+                                    write_new_value(venc, value)
+                                })?;
                             }
                             None => {
                                 let value_ref = value;
-                                menc.entry_raw_key(key_bytes, |venc| {
+                                menc.entry_raw_key_cbor(key_bytes, |venc| {
                                     emit_value(venc, value_ref, mod_node)
                                 })?;
                             }
@@ -851,7 +865,9 @@ fn emit_map_entries<'a>(
             }
             (Some((_key, key_bytes, value)), None) => {
                 let value_ref = value;
-                menc.entry_raw_key(key_bytes, |venc| venc.raw_value_ref(value_ref))?;
+                menc.entry_raw_key_cbor(key_bytes, |venc| {
+                    EmitValue::raw_value_ref(venc, value_ref)
+                })?;
                 entry = next_map_entry_encoded(&mut iter)?;
             }
             (None, Some((mod_key, mod_node))) => {
@@ -886,7 +902,7 @@ fn emit_missing_map_entry(
         )
         | None => Err(missing_key(map_off)),
         Some(Terminal::Set { value, .. }) => {
-            menc.entry(mod_key, |venc| write_new_value(venc, value))
+            menc.entry_cbor(mod_key, |venc| write_new_value(venc, value))
         }
     }
 }

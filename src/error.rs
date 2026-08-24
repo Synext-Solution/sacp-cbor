@@ -23,6 +23,8 @@ pub enum ErrorCode {
     ArrayLenMismatch,
     /// Map builder length mismatch (encoder).
     MapLenMismatch,
+    /// An earlier encoding failure may have left sink side effects.
+    EncoderPoisoned,
 
     /// Nesting depth limit exceeded.
     DepthLimitExceeded,
@@ -153,6 +155,7 @@ impl fmt::Display for CborError {
             ErrorCode::AllocationFailed => "allocation failed",
             ErrorCode::ArrayLenMismatch => "array length mismatch",
             ErrorCode::MapLenMismatch => "map length mismatch",
+            ErrorCode::EncoderPoisoned => "encoder poisoned by an earlier failure",
 
             ErrorCode::DepthLimitExceeded => "nesting depth limit exceeded",
             ErrorCode::TotalItemsLimitExceeded => "total items limit exceeded",

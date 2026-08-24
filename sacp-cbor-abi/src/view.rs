@@ -4,7 +4,7 @@ use core::convert::{TryFrom, TryInto};
 use core::marker::PhantomData;
 
 use sacp_cbor::bytes::{Bytes, BytesRef};
-use sacp_cbor::query::CborValueRef;
+use sacp_cbor::query::{ArrayIter, CborValueRef};
 use sacp_cbor::{CanonicalCbor, CanonicalCborRef, CborError, ErrorCode};
 
 use crate::edit::AbiFieldSetEditor;
@@ -46,6 +46,35 @@ pub struct AbiFieldEntryRef<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbiFieldSetRef<'a> {
     raw: CborValueRef<'a>,
+}
+
+pub(crate) struct AbiFieldSetIter<'a> {
+    items: ArrayIter<'a>,
+    pending_id: Option<(u32, usize)>,
+}
+
+impl<'a> Iterator for AbiFieldSetIter<'a> {
+    type Item = Result<AbiFieldEntryRef<'a>, CborError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = match self.items.next()? {
+                Ok(item) => item,
+                Err(err) => return Some(Err(err)),
+            };
+            if let Some((id, id_offset)) = self.pending_id.take() {
+                return Some(Ok(AbiFieldEntryRef {
+                    id,
+                    id_offset,
+                    value: item,
+                }));
+            }
+            match abi_field_id(item) {
+                Ok(id) => self.pending_id = Some((id, item.offset())),
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
 }
 
 /// Borrowed unknown field.
@@ -203,32 +232,20 @@ impl<'a> AbiFieldSetRef<'a> {
 
     /// Iterate over validated ABI field entries in field-ID order.
     #[inline]
+    pub(crate) fn iter_internal(self) -> Result<AbiFieldSetIter<'a>, CborError> {
+        let array = self.raw.array()?;
+        Ok(AbiFieldSetIter {
+            items: array.iter(),
+            pending_id: None,
+        })
+    }
+
+    /// Iterate over validated ABI field entries in field-ID order.
+    #[inline]
     pub fn iter(
         self,
     ) -> Result<impl Iterator<Item = Result<AbiFieldEntryRef<'a>, CborError>> + 'a, CborError> {
-        let array = self.raw.array()?;
-        let mut pending_id = None;
-        Ok(array.iter().filter_map(move |item| {
-            let item = match item {
-                Ok(item) => item,
-                Err(err) => return Some(Err(err)),
-            };
-            if let Some((id, id_offset)) = pending_id.take() {
-                Some(Ok(AbiFieldEntryRef {
-                    id,
-                    id_offset,
-                    value: item,
-                }))
-            } else {
-                match abi_field_id(item) {
-                    Ok(id) => {
-                        pending_id = Some((id, item.offset()));
-                        None
-                    }
-                    Err(err) => Some(Err(err)),
-                }
-            }
-        }))
+        self.iter_internal()
     }
 
     /// Return one field by numeric ID.

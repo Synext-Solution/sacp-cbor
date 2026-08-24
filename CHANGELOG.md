@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.18.0 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.18.0
+- `sacp-cbor-derive` 0.18.0
+- `sacp-cbor-schema` 0.2.0
+- `sacp-cbor-abi` 0.7.0
+- `sacp-cbor-abi-derive` 0.4.0
+
+### `sacp-cbor`
+
+- **Breaking:** canonical encoding now has one sink-generic path through
+  `Encoder<S: ByteSink>`; vector, byte-count, digest, standard I/O, serde,
+  derives, and custom sinks share the same state machine and limits.
+- Sink and profile failures are sticky. The first call returns its owned
+  `EncodeError`; every later fallible encoding or finish operation is rejected
+  as `Poisoned` because a generic sink cannot promise rollback after partial
+  side effects. Read-only state observation remains available.
+- Map keys are checked from their source text before any offending key byte is
+  written. The encoder rejects duplicate or descending keys and never sorts or
+  repairs input.
+- Added `VecSink`, `CountingSink`, optional `DigestSink<D>`, and `IoSink<W>`;
+  upgraded the optional SHA-2 integration to 0.11.
+- The published runtime crates now require Rust 1.85, matching SHA-2 0.11's
+  compiler floor; the two proc-macro-only crates retain Rust 1.75.
+
+### `sacp-cbor-derive`
+
+- **Breaking:** generated `CborEncode` implementations target the controlled,
+  sink-generic value adapter so custom errors cannot bypass sticky encoder
+  state.
+
+### `sacp-cbor-schema`
+
+- **Breaking:** schema compilation and validation use explicit caller-selected
+  limits and fallibly prepared reusable workspaces instead of fixed field and
+  recursion caps.
+- **Breaking:** structural containment is replaced by bounded inclusion with
+  distinct `Proven`, replayable `Refuted`, and operational `Unknown` outcomes.
+  Deep validation and inclusion use explicit machines rather than the native
+  call stack.
+
+### `sacp-cbor-abi`
+
+- **Breaking:** runtime semantic hooks and named-value acceptance bypasses are
+  removed. Runtime admission is structural, covers struct, enum, transparent,
+  primitive, vector, fixed-byte, and named schemas, and resolves named schemas
+  only through the caller's registry.
+- Runtime admission uses explicit work limits and caller-prepared reusable
+  frame storage, so deep validation is stack-safe and allocation-free after
+  preparation.
+
+### `sacp-cbor-abi-derive`
+
+- **Breaking:** generated ABI encoders target the sink-generic 0.7 runtime
+  facade and preserve the encoder's sticky-failure contract.
+
 ## 0.17.6 workspace release
 
 Published crates:

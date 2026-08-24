@@ -1,8 +1,7 @@
 use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::collections::MapEntries;
-use sacp_cbor::encode::ArrayEncoder;
 use sacp_cbor::query::CborKind;
-use sacp_cbor::{CborDecode, CborEncode, CborError, Decoder, Encoder};
+use sacp_cbor::{ByteSink, CborDecode, CborEncode, CborError, Decoder, EncodeResult, ValueEncoder};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
@@ -210,7 +209,7 @@ pub enum BenchValueBorrowed<'a> {
 }
 
 impl CborEncode for BenchValueNative {
-    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         match self {
             Self::Null => enc.null(),
             Self::Bool(v) => enc.bool(*v),
@@ -225,29 +224,7 @@ impl CborEncode for BenchValueNative {
             }),
             Self::Map(entries) => enc.map(entries.0.len(), |map| {
                 for (key, value) in &entries.0 {
-                    map.entry(key, |enc| value.encode(enc))?;
-                }
-                Ok(())
-            }),
-        }
-    }
-
-    fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-        match self {
-            Self::Null => array.null(),
-            Self::Bool(v) => array.bool(*v),
-            Self::Int(v) => array.int(*v),
-            Self::Bytes(v) => array.bytes(v),
-            Self::Text(v) => array.text(v),
-            Self::Array(items) => array.array(items.len(), |arr| {
-                for item in items {
-                    arr.value(item)?;
-                }
-                Ok(())
-            }),
-            Self::Map(entries) => array.map(entries.0.len(), |map| {
-                for (key, value) in &entries.0 {
-                    map.entry(key, |enc| value.encode(enc))?;
+                    map.entry(key, |enc| enc.encode(value))?;
                 }
                 Ok(())
             }),
@@ -280,7 +257,7 @@ impl<'de> CborDecode<'de> for BenchValueNative {
 }
 
 impl CborEncode for BenchValueBorrowed<'_> {
-    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
         match self {
             Self::Null => enc.null(),
             Self::Bool(v) => enc.bool(*v),
@@ -295,29 +272,7 @@ impl CborEncode for BenchValueBorrowed<'_> {
             }),
             Self::Map(entries) => enc.map(entries.0.len(), |map| {
                 for (key, value) in &entries.0 {
-                    map.entry(key, |enc| value.encode(enc))?;
-                }
-                Ok(())
-            }),
-        }
-    }
-
-    fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-        match self {
-            Self::Null => array.null(),
-            Self::Bool(v) => array.bool(*v),
-            Self::Int(v) => array.int(*v),
-            Self::Bytes(v) => array.bytes(v),
-            Self::Text(v) => array.text(v),
-            Self::Array(items) => array.array(items.len(), |arr| {
-                for item in items {
-                    arr.value(item)?;
-                }
-                Ok(())
-            }),
-            Self::Map(entries) => array.map(entries.0.len(), |map| {
-                for (key, value) in &entries.0 {
-                    map.entry(key, |enc| value.encode(enc))?;
+                    map.entry(key, |enc| enc.encode(value))?;
                 }
                 Ok(())
             }),

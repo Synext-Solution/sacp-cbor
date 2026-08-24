@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use sacp_cbor::serde::{from_slice, to_vec};
+use sacp_cbor::serde::{from_slice, SerdeOptions};
 use sacp_cbor::{
     cbor_bytes, decode, encode_to_vec, CborDecode, CborEncode, DecodeLimits, ErrorCode,
 };
@@ -41,7 +41,7 @@ fn assert_derive_matches_serde_as<T>(
     assert_eq!(serde_json_value, expected_serde_json);
 
     let derive_bytes = encode_to_vec(&value).unwrap();
-    let serde_bytes = to_vec(&value).unwrap();
+    let serde_bytes = SerdeOptions::sorted_maps().to_vec(&value).unwrap();
     assert_eq!(derive_bytes, serde_bytes);
 
     let decoded: T = decode(&derive_bytes, DecodeLimits::for_bytes(derive_bytes.len())).unwrap();

@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use sacp_cbor::query::CborValueRef;
-use sacp_cbor::{CanonicalCbor, CborError, Encoder, ErrorCode};
+use sacp_cbor::{ByteSink, CanonicalCbor, CborError, EncodeResult, ErrorCode, ValueEncoder};
 
 use crate::AbiFieldSetRef;
 
@@ -62,6 +62,14 @@ fn patch_conflict(offset: usize) -> CborError {
     CborError::new(ErrorCode::PatchConflict, offset)
 }
 
+#[allow(clippy::needless_pass_by_value)]
+const fn collapse_vec_error(error: sacp_cbor::EncodeError<CborError>) -> CborError {
+    match error {
+        sacp_cbor::EncodeError::Cbor(error) | sacp_cbor::EncodeError::Sink(error) => error,
+        sacp_cbor::EncodeError::Poisoned => CborError::new(ErrorCode::EncoderPoisoned, 0),
+    }
+}
+
 impl<'a> AbiFieldSetEditor<'a> {
     pub(crate) fn new(fields: AbiFieldSetRef<'a>) -> Self {
         Self {
@@ -103,12 +111,31 @@ impl<'a> AbiFieldSetEditor<'a> {
         }
 
         let pair_count = self.output_pair_count()?;
-        let mut enc = Encoder::new();
-        enc.array(pair_count * 2, |array| {
-            self.emit_edited_fields(array)?;
-            Ok(())
-        })?;
-        enc.finish()
+        struct Edited<'a, 'b> {
+            editor: &'b mut AbiFieldSetEditor<'a>,
+            pair_count: usize,
+        }
+        impl Edited<'_, '_> {
+            fn encode_mut<S: ByteSink>(
+                &mut self,
+                enc: &mut ValueEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                enc.array(self.pair_count * 2, |array| {
+                    self.editor.emit_edited_fields(array)
+                })
+            }
+        }
+
+        let mut edited = Edited {
+            editor: &mut self,
+            pair_count,
+        };
+        let mut enc = sacp_cbor::Encoder::new();
+        enc.encode_with(|enc| edited.encode_mut(enc))
+            .map_err(collapse_vec_error)?;
+        let bytes = enc.finish().map_err(collapse_vec_error)?;
+        let limits = sacp_cbor::DecodeLimits::for_bytes(bytes.len());
+        CanonicalCbor::from_vec(bytes, limits)
     }
 
     fn output_pair_count(&self) -> Result<usize, CborError> {
@@ -163,10 +190,10 @@ impl<'a> AbiFieldSetEditor<'a> {
         }
     }
 
-    fn emit_edited_fields(
+    fn emit_edited_fields<S: ByteSink>(
         &mut self,
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
-    ) -> Result<(), CborError> {
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    ) -> EncodeResult<(), S> {
         let mut op_index = 0usize;
         for entry in self.fields.iter()? {
             let entry = entry?;
@@ -189,10 +216,10 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_existing_op(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    fn emit_existing_op<S: ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         op: &AbiFieldSetOp<'a>,
-    ) -> Result<(), CborError> {
+    ) -> EncodeResult<(), S> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
             crate::__private::encode_field_id(array, *id)?;
             Self::emit_patch_value(array, value)?;
@@ -200,10 +227,10 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_missing_op(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    fn emit_missing_op<S: ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         op: &AbiFieldSetOp<'a>,
-    ) -> Result<(), CborError> {
+    ) -> EncodeResult<(), S> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
             crate::__private::encode_field_id(array, *id)?;
             Self::emit_patch_value(array, value)?;
@@ -211,10 +238,10 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_patch_value(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+    fn emit_patch_value<S: ByteSink>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
         value: &AbiPatchValue<'a>,
-    ) -> Result<(), CborError> {
+    ) -> EncodeResult<(), S> {
         match value {
             AbiPatchValue::Raw(value) => array.raw_value_ref(*value),
             AbiPatchValue::Encoded(value) => array.raw_cbor(value.as_canonical_ref()),

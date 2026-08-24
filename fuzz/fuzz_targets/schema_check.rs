@@ -90,7 +90,7 @@ fuzz_target!(|data: &[u8]| {
     for schema in schemas() {
         if let Ok(witness) = schema.validate(data, limits, ValidationOptions::new()) {
             assert!(validate_canonical(data, limits).is_ok());
-            assert!(schema.check(witness).is_ok());
+            assert!(schema.check(witness, limits).is_ok());
         }
     }
 });

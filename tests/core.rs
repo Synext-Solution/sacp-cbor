@@ -64,9 +64,10 @@ fn integer_ref_decodes_zero_copy_in_both_modes() {
         a.bignum(true, &[0x20, 0, 0, 0, 0, 0, 0]) // -(2^53 + 1)
     })
     .expect("encode");
-    let canon = enc.finish().expect("finish");
-    let bytes = canon.as_bytes();
+    let bytes = enc.finish().expect("finish");
     let limits = DecodeLimits::for_bytes(bytes.len());
+    let canon = sacp_cbor::CanonicalCbor::from_vec(bytes, limits).expect("canonical");
+    let bytes = canon.as_bytes();
 
     let mut checked =
         Decoder::<true>::new_checked_with(bytes, limits, ValidationOptions::new()).expect("new");
@@ -118,9 +119,10 @@ fn integer_ref_decode_rejects_non_integer() {
 
     let mut enc = sacp_cbor::Encoder::new();
     enc.text("nope").expect("encode");
-    let canon = enc.finish().expect("finish");
-    let bytes = canon.as_bytes();
+    let bytes = enc.finish().expect("finish");
     let limits = DecodeLimits::for_bytes(bytes.len());
+    let canon = sacp_cbor::CanonicalCbor::from_vec(bytes, limits).expect("canonical");
+    let bytes = canon.as_bytes();
 
     let mut checked =
         Decoder::<true>::new_checked_with(bytes, limits, ValidationOptions::new()).expect("new");
@@ -143,9 +145,10 @@ fn scalar_funnels_consume_kind_checked_batches() {
         })
     })
     .expect("encode");
-    let canon = enc.finish().expect("finish");
-    let bytes = canon.as_bytes();
+    let bytes = enc.finish().expect("finish");
     let limits = DecodeLimits::for_bytes(bytes.len());
+    let canon = sacp_cbor::CanonicalCbor::from_vec(bytes, limits).expect("canonical");
+    let bytes = canon.as_bytes();
 
     // Checked batch consume, then a full witness.
     let mut d =
@@ -185,8 +188,8 @@ fn scalar_funnels_reject_kind_mismatch_and_restrictions() {
     // ["x"] consumed as integers must fail with ExpectedInteger and poison.
     let mut enc = sacp_cbor::Encoder::new();
     enc.array(1, |a| a.text("x")).expect("encode");
-    let canon = enc.finish().expect("finish");
-    let bytes = canon.as_bytes();
+    let bytes = enc.finish().expect("finish");
+    let bytes = bytes.as_slice();
     let limits = DecodeLimits::for_bytes(bytes.len());
     let mut d =
         Decoder::<true>::new_checked_with(bytes, limits, ValidationOptions::new()).expect("new");
@@ -200,8 +203,8 @@ fn scalar_funnels_reject_kind_mismatch_and_restrictions() {
     // [true] under no-simple mode fails inside the batch.
     let mut enc = sacp_cbor::Encoder::new();
     enc.array(1, |a| a.bool(true)).expect("encode");
-    let canon = enc.finish().expect("finish");
-    let bytes = canon.as_bytes();
+    let bytes = enc.finish().expect("finish");
+    let bytes = bytes.as_slice();
     let limits = DecodeLimits::for_bytes(bytes.len());
     let mut d =
         Decoder::<true>::new_checked_with(bytes, limits, ValidationOptions::new().no_simple())
@@ -240,7 +243,7 @@ fn sorted_scalar_batches_enforce_memcmp_order() {
             Ok(())
         })
         .expect("encode");
-        enc.finish().expect("finish").into_bytes()
+        enc.finish().expect("finish")
     };
     let run = |bytes: &[u8]| {
         let limits = DecodeLimits::for_bytes(bytes.len());
@@ -268,7 +271,7 @@ fn sorted_scalar_batches_enforce_memcmp_order() {
         a.int(1)
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     let err = run(&bytes).expect_err("mismatch");
     assert_eq!(err.code, ErrorCode::ExpectedBytes);
 }

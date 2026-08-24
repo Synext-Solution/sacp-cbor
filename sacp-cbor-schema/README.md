@@ -5,22 +5,22 @@
 The crate compiles a plain Rust data description into a `RecordSchema`. The compiled form performs:
 
 - canonical grammar validation and schema validation in one pass for untrusted bytes;
-- allocation-free validation after compilation on the success path;
+- allocation-free successful validation with a caller-prepared reusable workspace;
 - trusted schema checks over existing `CanonicalCborRef` witnesses;
-- structural containment derivation between old and successor schemas.
+- bounded structural inclusion with distinct proven, refuted, and unknown outcomes.
 
 ## Installation
 
 ```toml
 [dependencies]
-sacp-cbor-schema = "0.1"
+sacp-cbor-schema = "0.2"
 ```
 
 For `no_std` targets:
 
 ```toml
 [dependencies]
-sacp-cbor-schema = { version = "0.1", default-features = false }
+sacp-cbor-schema = { version = "0.2", default-features = false }
 ```
 
 ## Quick Example
@@ -29,6 +29,7 @@ sacp-cbor-schema = { version = "0.1", default-features = false }
 use sacp_cbor::{DecodeLimits, Encoder, ValidationOptions};
 use sacp_cbor_schema::{
     Constraint, CountUnit, FieldDef, FieldType, Int, RecordDef, RecordSchema,
+    SchemaCompileLimits,
 };
 
 let def = RecordDef {
@@ -56,7 +57,10 @@ let def = RecordDef {
     couplings: vec![],
 };
 
-let schema = RecordSchema::compile(&def)?;
+let schema = RecordSchema::compile(
+    &def,
+    SchemaCompileLimits::new(64, 16, 64, 16, 32, 4096, 64 * 1024),
+)?;
 let mut enc = Encoder::new();
 enc.map(2, |m| {
     m.entry("id", |e| e.int(7))?;
@@ -69,7 +73,7 @@ let witness = schema.validate(
     DecodeLimits::for_bytes(bytes.len()),
     ValidationOptions::new(),
 )?;
-schema.check(witness)?;
+schema.check(witness, DecodeLimits::for_bytes(bytes.len()))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -77,11 +81,11 @@ schema.check(witness)?;
 
 | Area | Support |
 | --- | --- |
-| Records | Closed text-keyed CBOR maps, up to 64 fields per record node |
+| Records | Closed text-keyed CBOR maps within caller-selected compile limits |
 | Types | Int, Bool, Float64, Bytes, Text, Array, Set, Map, Union, Record, Any |
 | Constraints | Integer ranges, element/octet counts, int/text enums |
 | Couplings | Requires, ExactlyOne, Together over optional fields |
-| Compatibility | Forward and backward structural containment derivation |
+| Compatibility | Bounded forward/backward inclusion with replayable counterexamples |
 | `no_std` | Supported with `alloc`; `std` is the default feature |
 
 See `SPEC.md` for the normative model.

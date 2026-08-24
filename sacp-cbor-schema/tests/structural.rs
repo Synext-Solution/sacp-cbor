@@ -28,7 +28,7 @@ fn scalar_types_accept_and_reject_wrong_kind() {
         m.entry("e", |e| e.text("ok"))
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     validate(&s, &bytes).expect("valid scalars");
 
     let bad = one_field("a", |e| e.text("not int"));
@@ -48,7 +48,7 @@ fn closed_record_rejects_unknown_and_missing_keys() {
     let empty = {
         let mut enc = Encoder::new();
         enc.map(0, |_| Ok(())).expect("encode");
-        enc.finish().expect("finish").into_bytes()
+        enc.finish().expect("finish")
     };
     let missing = s
         .validate(
@@ -68,7 +68,7 @@ fn closed_record_rejects_unknown_and_missing_keys() {
         m.entry("z", |e| e.int(2))
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     let unknown = s
         .validate(
             &bytes,
@@ -119,7 +119,7 @@ fn arrays_maps_nested_records_and_any_validate() {
         m.entry("z", |e| e.array(1, |a| a.null()))
     })
     .expect("encode");
-    let bytes = enc.finish().expect("finish").into_bytes();
+    let bytes = enc.finish().expect("finish");
     validate(&s, &bytes).expect("valid compound value");
 }
 
@@ -156,6 +156,7 @@ fn set_order_and_duplicates_are_rejected() {
         )
         .expect_err("duplicate");
     assert!(matches!(err.fault, Fault::Shape(ShapeFault::SetDuplicate)));
+    assert_eq!(err.path, ["s", "[1]"], "set duplicate path rule");
 
     let unsorted = one_field("s", |e| {
         e.array(2, |a| {
@@ -171,6 +172,7 @@ fn set_order_and_duplicates_are_rejected() {
         )
         .expect_err("order");
     assert!(matches!(err.fault, Fault::Shape(ShapeFault::SetOrder)));
+    assert_eq!(err.path, ["s", "[1]"], "set order path rule");
 }
 
 #[test]
@@ -186,6 +188,13 @@ fn union_arity_code_and_payload_are_checked() {
                 UnionAlt {
                     code: 2,
                     payload: Some(FieldType::Text),
+                },
+                UnionAlt {
+                    code: 3,
+                    payload: Some(FieldType::Record(Box::new(RecordDef {
+                        fields: vec![field("x", FieldType::Int, true, vec![])],
+                        couplings: vec![],
+                    }))),
                 },
             ]),
             true,
@@ -215,6 +224,52 @@ fn union_arity_code_and_payload_are_checked() {
         err.fault,
         Fault::Shape(ShapeFault::UnionCodeUnknown)
     ));
+    assert_eq!(err.path, ["u", "[0]"], "unknown union code path rule");
+
+    let wrong_code_kind = one_field("u", |e| e.array(1, |a| a.bool(true)));
+    let err = s
+        .validate(
+            &wrong_code_kind,
+            DecodeLimits::for_bytes(wrong_code_kind.len()),
+            ValidationOptions::new(),
+        )
+        .expect_err("union code kind");
+    assert!(matches!(err.fault, Fault::Shape(ShapeFault::WrongKind)));
+    assert_eq!(err.path, ["u", "[0]"], "union code kind path rule");
+
+    let wrong_scalar_payload = one_field("u", |e| {
+        e.array(2, |a| {
+            a.int(2)?;
+            a.int(7)
+        })
+    });
+    let err = s
+        .validate(
+            &wrong_scalar_payload,
+            DecodeLimits::for_bytes(wrong_scalar_payload.len()),
+            ValidationOptions::new(),
+        )
+        .expect_err("scalar payload kind");
+    assert_eq!(err.path, ["u", "[1]"], "scalar union payload path rule");
+
+    let wrong_structured_payload = one_field("u", |e| {
+        e.array(2, |a| {
+            a.int(3)?;
+            a.value_with(|value| value.map(1, |map| map.entry("x", |value| value.text("bad"))))
+        })
+    });
+    let err = s
+        .validate(
+            &wrong_structured_payload,
+            DecodeLimits::for_bytes(wrong_structured_payload.len()),
+            ValidationOptions::new(),
+        )
+        .expect_err("structured payload kind");
+    assert_eq!(
+        err.path,
+        ["u", "[1]", "x"],
+        "structured union payload path rule"
+    );
 
     let wrong_arity = one_field("u", |e| {
         e.array(2, |a| {

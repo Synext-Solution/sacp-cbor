@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use sacp_cbor::query::IntegerRef;
-use sacp_cbor::{profile, Encoder};
+use sacp_cbor::{profile, ByteSink, EncodeError, EncodeResult, Encoder};
 
 use crate::SchemaError;
 
@@ -19,6 +19,17 @@ pub struct Int {
 }
 
 impl Int {
+    pub(crate) fn try_clone(&self) -> Result<Self, SchemaError> {
+        let mut magnitude = Vec::new();
+        magnitude
+            .try_reserve_exact(self.magnitude.len())
+            .map_err(|_| SchemaError::AllocationFailed)?;
+        magnitude.extend_from_slice(&self.magnitude);
+        Ok(Self {
+            negative: self.negative,
+            magnitude,
+        })
+    }
     /// Construct an integer from sign and absolute big-endian magnitude bytes.
     ///
     /// # Errors
@@ -29,9 +40,14 @@ impl Int {
         if magnitude.first() == Some(&0) || (negative && magnitude.is_empty()) {
             return Err(SchemaError::NonNormalizedInt);
         }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(magnitude.len())
+            .map_err(|_| SchemaError::AllocationFailed)?;
+        owned.extend_from_slice(magnitude);
         Ok(Self {
             negative,
-            magnitude: magnitude.to_vec(),
+            magnitude: owned,
         })
     }
 
@@ -54,19 +70,76 @@ impl Int {
     }
 
     pub(crate) fn encode_canonical(&self) -> Result<Vec<u8>, SchemaError> {
-        let mut enc = Encoder::new();
+        let capacity = self.canonical_encoded_len()?;
+        let mut enc =
+            Encoder::try_with_capacity(capacity).map_err(SchemaError::CanonicalEncodingFailed)?;
         if let Some(v) = self.as_safe_i64() {
-            enc.int(v).map_err(SchemaError::CanonicalEncodingFailed)?;
+            enc.int(v).map_err(canonical_encoding_failed)?;
         } else if self.negative {
-            let mag = self.negative_bignum_magnitude();
-            enc.bignum(true, &mag)
-                .map_err(SchemaError::CanonicalEncodingFailed)?;
+            let mag = self.negative_bignum_magnitude()?;
+            enc.bignum(true, &mag).map_err(canonical_encoding_failed)?;
         } else {
             enc.bignum(false, &self.magnitude)
-                .map_err(SchemaError::CanonicalEncodingFailed)?;
+                .map_err(canonical_encoding_failed)?;
         }
-        let canon = enc.finish().map_err(SchemaError::CanonicalEncodingFailed)?;
-        Ok(canon.into_bytes())
+        enc.finish().map_err(canonical_encoding_failed)
+    }
+
+    pub(crate) fn canonical_encoded_len(&self) -> Result<usize, SchemaError> {
+        if let Some(value) = self.as_safe_i64() {
+            let argument = if value < 0 {
+                value.unsigned_abs().saturating_sub(1)
+            } else {
+                value.unsigned_abs()
+            };
+            return Ok(integer_head_len(argument));
+        }
+        let magnitude_len = if self.negative {
+            self.negative_bignum_magnitude_len()
+        } else {
+            self.magnitude.len()
+        };
+        let bytes_head = byte_string_head_len(magnitude_len)?;
+        1usize
+            .checked_add(bytes_head)
+            .and_then(|len| len.checked_add(magnitude_len))
+            .ok_or(SchemaError::OwnedByteLimitExceeded { count: usize::MAX })
+    }
+
+    pub(crate) fn encode_into<S: ByteSink>(
+        &self,
+        encoder: &mut Encoder<S>,
+        scratch: &mut Vec<u8>,
+    ) -> EncodeResult<(), S> {
+        if let Some(value) = self.as_safe_i64() {
+            return encoder.int(value);
+        }
+        if !self.negative {
+            return encoder.bignum(false, &self.magnitude);
+        }
+        scratch.clear();
+        if scratch.capacity() < self.magnitude.len() {
+            return Err(sacp_cbor::EncodeError::Cbor(sacp_cbor::CborError::new(
+                sacp_cbor::ErrorCode::AllocationFailed,
+                encoder.len(),
+            )));
+        }
+        scratch.extend_from_slice(&self.magnitude);
+        let mut index = scratch.len();
+        while index > 0 {
+            index -= 1;
+            if scratch[index] == 0 {
+                scratch[index] = 0xff;
+            } else {
+                scratch[index] -= 1;
+                break;
+            }
+        }
+        let first = scratch
+            .iter()
+            .position(|&byte| byte != 0)
+            .unwrap_or(scratch.len());
+        encoder.bignum(true, &scratch[first..])
     }
 
     fn as_safe_i64(&self) -> Option<i64> {
@@ -83,11 +156,14 @@ impl Int {
         }
     }
 
-    fn negative_bignum_magnitude(&self) -> Vec<u8> {
+    fn negative_bignum_magnitude(&self) -> Result<Vec<u8>, SchemaError> {
         debug_assert!(self.negative);
         debug_assert!(!self.magnitude.is_empty());
 
-        let mut out = self.magnitude.clone();
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.magnitude.len())
+            .map_err(|_| SchemaError::AllocationFailed)?;
+        out.extend_from_slice(&self.magnitude);
         let mut idx = out.len();
         while idx > 0 {
             idx -= 1;
@@ -101,8 +177,62 @@ impl Int {
         while out.first() == Some(&0) {
             out.remove(0);
         }
-        out
+        Ok(out)
     }
+
+    fn negative_bignum_magnitude_len(&self) -> usize {
+        debug_assert!(self.negative);
+        debug_assert!(!self.magnitude.is_empty());
+        let Some(first_nonzero) = self.magnitude.iter().position(|&byte| byte != 0) else {
+            return 0;
+        };
+        if self.magnitude[first_nonzero] == 1
+            && self.magnitude[first_nonzero + 1..]
+                .iter()
+                .all(|&byte| byte == 0)
+        {
+            self.magnitude.len().saturating_sub(first_nonzero + 1)
+        } else {
+            self.magnitude.len().saturating_sub(first_nonzero)
+        }
+    }
+}
+
+const fn integer_head_len(value: u64) -> usize {
+    match value {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+const fn byte_string_head_len(len: usize) -> Result<usize, SchemaError> {
+    if len <= 23 {
+        Ok(1)
+    } else if len <= 0xff {
+        Ok(2)
+    } else if len <= 0xffff {
+        Ok(3)
+    } else if len <= u32::MAX as usize {
+        Ok(5)
+    } else if usize::BITS <= 64 {
+        Ok(9)
+    } else {
+        Err(SchemaError::OwnedByteLimitExceeded { count: usize::MAX })
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+const fn canonical_encoding_failed(error: EncodeError<sacp_cbor::CborError>) -> SchemaError {
+    let error = match error {
+        EncodeError::Cbor(error) | EncodeError::Sink(error) => error,
+        EncodeError::Poisoned => {
+            sacp_cbor::CborError::new(sacp_cbor::ErrorCode::EncoderPoisoned, 0)
+        }
+    };
+    SchemaError::CanonicalEncodingFailed(error)
 }
 
 impl Ord for Int {

@@ -8,6 +8,18 @@ use sacp_cbor::CborError;
 /// Compile-time schema error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SchemaError {
+    /// A schema allocation failed.
+    AllocationFailed,
+    /// The caller's total compiled-node limit was exceeded.
+    TotalNodeLimitExceeded {
+        /// Nodes requested by the source schema.
+        count: usize,
+    },
+    /// The caller's compiled owned-byte limit was exceeded.
+    OwnedByteLimitExceeded {
+        /// Owned bytes requested by the source schema.
+        count: usize,
+    },
     /// A record declares more than the allowed number of fields.
     FieldCapExceeded {
         /// Record path.
@@ -133,6 +145,8 @@ pub struct RecordError {
     pub offset: usize,
     /// Path from the root to the failing value.
     pub path: Vec<String>,
+    /// Whether `path` is the complete diagnostic path. Allocation failure may leave a safe prefix.
+    pub path_complete: bool,
     /// Failure class.
     pub fault: Fault,
 }
@@ -140,6 +154,8 @@ pub struct RecordError {
 /// Validation failure taxonomy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
+    /// Caller-provided validation workspace is not prepared for this schema.
+    WorkspaceTooSmall,
     /// Base canonical grammar or limits failure.
     Grammar(CborError),
     /// Schema shape failure.
@@ -193,6 +209,7 @@ impl From<CborError> for RecordError {
         Self {
             offset: value.offset,
             path: Vec::new(),
+            path_complete: true,
             fault: Fault::Grammar(value),
         }
     }
@@ -201,6 +218,13 @@ impl From<CborError> for RecordError {
 impl fmt::Display for SchemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AllocationFailed => write!(f, "schema allocation failed"),
+            Self::TotalNodeLimitExceeded { count } => {
+                write!(f, "schema exceeds total node limit: {count}")
+            }
+            Self::OwnedByteLimitExceeded { count } => {
+                write!(f, "schema exceeds owned byte limit: {count}")
+            }
             Self::FieldCapExceeded { path, count } => {
                 write!(f, "record {path} declares too many fields: {count}")
             }

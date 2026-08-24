@@ -12,8 +12,8 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 
 ```toml
 [dependencies]
-sacp-cbor = "0.17"
-sacp-cbor-abi = "0.6"
+sacp-cbor = "0.18"
+sacp-cbor-abi = "0.7"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,7 +21,7 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.6", default-features = false }
+sacp-cbor-abi = { version = "0.7", default-features = false }
 ```
 
 ## Struct ABI
@@ -112,8 +112,8 @@ type. Compile the schema once, then validate many canonical messages without cop
 
 ```rust
 use sacp_cbor_abi::{
-    compile_runtime_schema, RuntimeAbiError, RuntimeHookOutcome, RuntimeInline,
-    RuntimeSchema, RuntimeTypeContext, RuntimeValidationConfig, RuntimeValidationHooks,
+    compile_runtime_schema, NoNamedSchemas, RuntimeSchema, RuntimeValidationLimits,
+    RuntimeValidationWorkspace,
 };
 
 let schema = Transfer::schema();
@@ -131,40 +131,22 @@ let view = runtime.view_value(canon.as_canonical_ref().root())?;
 let raw_amount = view.require_raw(3)?;
 assert_eq!(raw_amount.integer()?.as_u128(), Some(5000));
 
-// Deep validation additionally checks known field values against their TypeRef.
-let checked = runtime.validate_value(canon.as_canonical_ref().root(), RuntimeInline)?;
-assert!(checked.get_checked(4, RuntimeInline)?.is_none());
-
-// Hooks add semantic refinements without taking ABI validation away from the runtime.
-struct AmountHook;
-
-impl RuntimeValidationHooks for AmountHook {
-    fn exit_type_ref(
-        &mut self,
-        ctx: RuntimeTypeContext<'_>,
-        _ty: &sacp_cbor_abi::TypeRef,
-        value: sacp_cbor::query::CborValueRef<'_>,
-        outcome: RuntimeHookOutcome,
-    ) -> Result<(), RuntimeAbiError> {
-        if outcome == RuntimeHookOutcome::Success
-            && ctx.field.is_some_and(|field| field.id == 3)
-            && value.integer()?.as_u128() == Some(0)
-        {
-            return Err(RuntimeAbiError::hook_rejected(
-                "amount must be nonzero",
-                value.offset(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-let mut hooks = AmountHook;
-let checked = runtime.validate_value_with_hooks(
+// Deep validation checks every known TypeRef with explicit work bounds. Prepare once and reuse
+// the workspace; the runtime validation machine does not grow the machine stack or allocate
+// validation frames while checking a value.
+let limits = RuntimeValidationLimits::new(
+    16,    // nested named/vector/enum-payload depth
+    1_024, // validation-machine steps
+    1_024, // visited container items
+    32,    // simultaneously live continuation frames
+);
+let mut workspace = RuntimeValidationWorkspace::new();
+workspace.prepare(limits)?;
+let checked = runtime.validate_value(
     canon.as_canonical_ref().root(),
-    RuntimeInline,
-    RuntimeValidationConfig::default(),
-    &mut hooks,
+    &NoNamedSchemas,
+    limits,
+    &mut workspace,
 )?;
 assert_eq!(checked.require_raw(3)?.integer()?.as_u128(), Some(5000));
 ```
@@ -275,7 +257,8 @@ pub mod wire {
     }
     pub mod cbor {
         pub use sacp_cbor::{
-            CanonicalCbor, CborDecode, CborError, Decoder, Encoder, ErrorCode,
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, EncodeResult, Encoder,
+            ErrorCode, ValueEncoder, encode_with_to_canonical,
         };
     }
 }

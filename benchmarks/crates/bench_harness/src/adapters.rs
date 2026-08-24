@@ -183,14 +183,15 @@ impl Adapter for Cbor4ii {
 
 pub fn encode_sacp_stream(value: &BenchValue) -> Result<Vec<u8>, String> {
     let mut enc = sacp_cbor::Encoder::new();
-    encode_bench_value(&mut enc, value).map_err(|e| format!("{e}"))?;
-    Ok(enc.finish().map_err(|err| err.to_string())?.into_bytes())
+    enc.encode_with(|value_encoder| encode_bench_value(value_encoder, value))
+        .map_err(|e| format!("{e}"))?;
+    enc.finish().map_err(|err| err.to_string())
 }
 
-fn encode_bench_value(
-    enc: &mut sacp_cbor::Encoder,
+fn encode_bench_value<S: sacp_cbor::ByteSink>(
+    enc: &mut sacp_cbor::ValueEncoder<'_, S>,
     v: &BenchValue,
-) -> Result<(), sacp_cbor::CborError> {
+) -> sacp_cbor::EncodeResult<(), S> {
     match v {
         BenchValue::Null => enc.null(),
         BenchValue::Bool(b) => enc.bool(*b),
@@ -200,27 +201,29 @@ fn encode_bench_value(
         BenchValue::Array(items) => enc.array(items.len(), |a| encode_bench_array(a, items)),
         BenchValue::Map(entries) => enc.map(entries.len(), |m| {
             for (k, v) in entries {
-                m.entry(k.as_str(), |enc| encode_bench_value(enc, v))?;
+                m.entry(k.as_str(), |enc| {
+                    enc.encode_with(|value_encoder| encode_bench_value(value_encoder, v))
+                })?;
             }
             Ok(())
         }),
     }
 }
 
-fn encode_bench_array(
-    a: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+fn encode_bench_array<S: sacp_cbor::ByteSink>(
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
     items: &[BenchValue],
-) -> Result<(), sacp_cbor::CborError> {
+) -> sacp_cbor::EncodeResult<(), S> {
     for item in items {
         encode_bench_value_in_array(a, item)?;
     }
     Ok(())
 }
 
-fn encode_bench_value_in_array(
-    a: &mut sacp_cbor::encode::ArrayEncoder<'_>,
+fn encode_bench_value_in_array<S: sacp_cbor::ByteSink>(
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
     v: &BenchValue,
-) -> Result<(), sacp_cbor::CborError> {
+) -> sacp_cbor::EncodeResult<(), S> {
     match v {
         BenchValue::Null => a.null(),
         BenchValue::Bool(b) => a.bool(*b),
@@ -230,7 +233,9 @@ fn encode_bench_value_in_array(
         BenchValue::Array(items) => a.array(items.len(), |inner| encode_bench_array(inner, items)),
         BenchValue::Map(entries) => a.map(entries.len(), |m| {
             for (k, v) in entries {
-                m.entry(k.as_str(), |enc| encode_bench_value(enc, v))?;
+                m.entry(k.as_str(), |enc| {
+                    enc.encode_with(|value_encoder| encode_bench_value(value_encoder, v))
+                })?;
             }
             Ok(())
         }),

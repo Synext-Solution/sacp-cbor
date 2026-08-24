@@ -8,7 +8,8 @@ pub mod codec {
         use alloc::vec::Vec;
 
         pub use private_cbor::{
-            CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, Decoder, Encoder, ErrorCode,
+            ByteSink, CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, Decoder,
+            EncodeResult, Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
         };
         pub use private_cbor::encode::ArrayEncoder;
 
@@ -17,10 +18,13 @@ pub mod codec {
         }
 
         pub trait CborEncode {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError>;
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                array.value_with(|enc| self.encode(enc))
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| self.encode(enc))
             }
         }
 
@@ -34,15 +38,18 @@ pub mod codec {
             ($($ty:ty),* $(,)?) => {
                 $(
                     impl CborEncode for $ty {
-                        fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+                        fn encode<S: ByteSink>(
+                            &self,
+                            enc: &mut ValueEncoder<'_, S>,
+                        ) -> EncodeResult<(), S> {
                             private_cbor::CborEncode::encode(self, enc)
                         }
 
-                        fn encode_array_item(
+                        fn encode_array_item<S: ByteSink>(
                             &self,
-                            array: &mut ArrayEncoder<'_>,
-                        ) -> Result<(), CborError> {
-                            private_cbor::CborEncode::encode_array_item(self, array)
+                            array: &mut ArrayEncoder<'_, S>,
+                        ) -> EncodeResult<(), S> {
+                            array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
                         }
                     }
 
@@ -60,12 +67,15 @@ pub mod codec {
         passthrough!((), bool, u8, u16, u32, u64, i8, i16, i32, i64, String);
 
         impl CborEncode for &str {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                private_cbor::CborEncode::encode_array_item(self, array)
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
@@ -78,22 +88,28 @@ pub mod codec {
         }
 
         impl CborEncode for CanonicalCbor {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                private_cbor::CborEncode::encode_array_item(self, array)
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
         impl CborEncode for CanonicalCborRef<'_> {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                private_cbor::CborEncode::encode_array_item(self, array)
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
@@ -114,12 +130,15 @@ pub mod codec {
         }
 
         impl CborEncode for query::CborValueRef<'_> {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                private_cbor::CborEncode::encode_array_item(self, array)
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
@@ -132,15 +151,20 @@ pub mod codec {
         }
 
         impl<T: CborEncode> CborEncode for Option<T> {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 enc.map(1, |map| match self {
                     None => map.entry("none", Encoder::null),
-                    Some(value) => map.entry("some", |enc| CborEncode::encode(value, enc)),
+                    Some(value) => map.entry("some", |enc| {
+                        enc.encode_with(|value_enc| CborEncode::encode(value, value_enc))
+                    }),
                 })
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                array.value_with(|enc| self.encode(enc))
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| self.encode(enc))
             }
         }
 
@@ -168,7 +192,7 @@ pub mod codec {
         }
 
         impl<T: CborEncode> CborEncode for Vec<T> {
-            fn encode(&self, enc: &mut Encoder) -> Result<(), CborError> {
+            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
                 enc.array(self.len(), |array| {
                     for value in self {
                         CborEncode::encode_array_item(value, array)?;
@@ -177,8 +201,11 @@ pub mod codec {
                 })
             }
 
-            fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-                array.value_with(|enc| self.encode(enc))
+            fn encode_array_item<S: ByteSink>(
+                &self,
+                array: &mut ArrayEncoder<'_, S>,
+            ) -> EncodeResult<(), S> {
+                array.encode_with(|enc| self.encode(enc))
             }
         }
 
@@ -197,8 +224,19 @@ pub mod codec {
 
         pub fn encode_to_vec<T: CborEncode>(value: &T) -> Result<Vec<u8>, CborError> {
             let mut enc = Encoder::new();
-            CborEncode::encode(value, &mut enc)?;
-            Ok(enc.finish()?.into_bytes())
+            enc.encode_with(|value_enc| CborEncode::encode(value, value_enc))
+                .map_err(collapse)?;
+            enc.finish().map_err(collapse)
+        }
+
+        fn collapse(error: private_cbor::EncodeError<CborError>) -> CborError {
+            match error {
+                private_cbor::EncodeError::Cbor(error)
+                | private_cbor::EncodeError::Sink(error) => error,
+                private_cbor::EncodeError::Poisoned => {
+                    CborError::new(ErrorCode::EncoderPoisoned, 0)
+                }
+            }
         }
 
         pub fn decode<'de, T: CborDecode<'de>>(

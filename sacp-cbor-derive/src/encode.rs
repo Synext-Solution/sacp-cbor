@@ -45,7 +45,10 @@ fn encode_impl(
 ) -> proc_macro2::TokenStream {
     quote! {
         impl #impl_generics #crate_path::CborEncode for #name #ty_generics #where_clause {
-            fn encode(&self, enc: &mut #crate_path::Encoder) -> ::core::result::Result<(), #crate_path::CborError> {
+            fn encode<__S: #crate_path::ByteSink>(
+                &self,
+                enc: &mut #crate_path::ValueEncoder<'_, __S>,
+            ) -> #crate_path::EncodeResult<(), __S> {
                 #body
             }
         }
@@ -156,7 +159,9 @@ where
         entries.push(map_entry(
             key,
             quote! {
-                m.entry(#key, |enc| #crate_path::CborEncode::encode(#value_ts, enc))?;
+                m.entry(#key, |enc| enc.encode_with(|value_enc| {
+                    #crate_path::CborEncode::encode(#value_ts, value_enc)
+                }))?;
             },
         ));
     }
@@ -182,7 +187,9 @@ fn tuple_variant_parts<'a>(
         if type_needs_trait_bound(field.ty, name, type_params) {
             bounds.push(field.ty);
         }
-        items.push(quote! { #crate_path::CborEncode::encode_array_item(#var, a)?; });
+        items.push(quote! {
+            a.encode_with(|enc| #crate_path::CborEncode::encode(#var, enc))?;
+        });
     }
 
     Ok((pats, items))
@@ -246,7 +253,9 @@ pub(crate) fn encode_struct(
                 }
 
                 items.push(quote! {
-                    #crate_path::CborEncode::encode_array_item(&self.#index, a)?;
+                    a.encode_with(|enc| {
+                        #crate_path::CborEncode::encode(&self.#index, enc)
+                    })?;
                 });
             }
 
@@ -349,7 +358,9 @@ fn encode_enum_external(
                     let value = &pats[0];
                     arms.push(quote! {
                         Self::#ident( #(#pats),* ) => enc.map(1, |m| {
-                            m.entry(#vname, |enc| #crate_path::CborEncode::encode(#value, enc))?;
+                            m.entry(#vname, |enc| enc.encode_with(|value_enc| {
+                                #crate_path::CborEncode::encode(#value, value_enc)
+                            }))?;
                             Ok(())
                         })
                     });
@@ -423,7 +434,9 @@ fn encode_enum_internal(
             Fields::Unit => {
                 arms.push(quote! {
                     Self::#ident => enc.map(1, |m| {
-                        m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
+                        m.entry(#tag, |enc| enc.encode_with(|value_enc| {
+                            #crate_path::CborEncode::encode(&#vname, value_enc)
+                        }))?;
                         Ok(())
                     })
                 });
@@ -441,7 +454,9 @@ fn encode_enum_internal(
                 entries.push(map_entry(
                     tag,
                     quote! {
-                        m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
+                        m.entry(#tag, |enc| enc.encode_with(|value_enc| {
+                            #crate_path::CborEncode::encode(&#vname, value_enc)
+                        }))?;
                     },
                 ));
                 let entries = sort_entries(entries);
@@ -487,7 +502,9 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| enc.encode_with(|value_enc| {
+                                #crate_path::CborEncode::encode(&#vname, value_enc)
+                            }))?;
                         },
                     ),
                     map_entry(
@@ -514,7 +531,9 @@ fn encode_enum_adjacent(
                     map_entry(
                         content,
                         quote! {
-                            m.entry(#content, |enc| #crate_path::CborEncode::encode(#value, enc))?;
+                            m.entry(#content, |enc| enc.encode_with(|value_enc| {
+                                #crate_path::CborEncode::encode(#value, value_enc)
+                            }))?;
                         },
                     )
                 } else {
@@ -535,7 +554,9 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| enc.encode_with(|value_enc| {
+                                #crate_path::CborEncode::encode(&#vname, value_enc)
+                            }))?;
                         },
                     ),
                     content_entry,
@@ -564,7 +585,9 @@ fn encode_enum_adjacent(
                     map_entry(
                         tag,
                         quote! {
-                            m.entry(#tag, |enc| #crate_path::CborEncode::encode(&#vname, enc))?;
+                            m.entry(#tag, |enc| enc.encode_with(|value_enc| {
+                                #crate_path::CborEncode::encode(&#vname, value_enc)
+                            }))?;
                         },
                     ),
                     map_entry(

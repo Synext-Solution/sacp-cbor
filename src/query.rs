@@ -590,7 +590,6 @@ impl<'a> MapRef<'a> {
     pub fn get(self, key: &str) -> Result<Option<CborValueRef<'a>>, CborError> {
         checked_text_len(key.len()).map_err(|code| CborError::new(code, self.map_off))?;
         let mut pos = self.entries_start;
-        let mut scratch = wire::SkipScratch::new();
 
         for _ in 0..self.len {
             let key_off = pos;
@@ -601,10 +600,10 @@ impl<'a> MapRef<'a> {
             let cmp = cmp_text_key_bytes_to_query(key_bytes, key);
             match cmp {
                 Ordering::Less => {
-                    pos = value_end_with_scratch(self.data, value_start, &mut scratch)?;
+                    pos = value_end(self.data, value_start)?;
                 }
                 Ordering::Equal => {
-                    let end = value_end_with_scratch(self.data, value_start, &mut scratch)?;
+                    let end = value_end(self.data, value_start)?;
                     return Ok(Some(CborValueRef::new(self.data, value_start, end)));
                 }
                 Ordering::Greater => return Ok(None),
@@ -736,7 +735,6 @@ impl<'a> MapRef<'a> {
             data: self.data,
             pos: self.entries_start,
             remaining: self.len,
-            scratch: wire::SkipScratch::new(),
         }
     }
 
@@ -751,7 +749,6 @@ impl<'a> MapRef<'a> {
             data: self.data,
             pos: self.entries_start,
             remaining: self.len,
-            scratch: wire::SkipScratch::new(),
         }
     }
 
@@ -774,7 +771,6 @@ impl<'a> MapRef<'a> {
             data: self.data,
             pos: self.entries_start,
             remaining: self.len,
-            scratch: wire::SkipScratch::new(),
         };
 
         Ok(ExtrasIter {
@@ -965,10 +961,9 @@ impl<'a> ArrayRef<'a> {
         }
 
         let mut pos = self.items_start;
-        let mut scratch = wire::SkipScratch::new();
         for i in 0..self.len {
             let start = pos;
-            let end = value_end_with_scratch(self.data, start, &mut scratch)?;
+            let end = value_end(self.data, start)?;
             if i == index {
                 return Ok(Some(CborValueRef::new(self.data, start, end)));
             }
@@ -982,12 +977,12 @@ impl<'a> ArrayRef<'a> {
     ///
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
     #[inline]
-    pub fn iter(self) -> impl Iterator<Item = Result<CborValueRef<'a>, CborError>> + 'a {
+    #[must_use]
+    pub const fn iter(self) -> ArrayIter<'a> {
         ArrayIter {
             data: self.data,
             pos: self.items_start,
             remaining: self.len,
-            scratch: wire::SkipScratch::new(),
         }
     }
 }
@@ -1049,7 +1044,6 @@ struct MapScanState<'a> {
     pos: usize,
     cached: Option<CachedKey<'a>>,
     map_remaining: usize,
-    scratch: wire::SkipScratch,
 }
 
 impl<'a> MapScanState<'a> {
@@ -1059,7 +1053,6 @@ impl<'a> MapScanState<'a> {
             pos,
             cached: None,
             map_remaining,
-            scratch: wire::SkipScratch::new(),
         }
     }
 
@@ -1078,7 +1071,7 @@ impl<'a> MapScanState<'a> {
     }
 
     fn consume_cached_entry(&mut self, ck: CachedKey<'a>) -> Result<usize, CborError> {
-        let end = value_end_with_scratch(self.data, ck.value_start, &mut self.scratch)?;
+        let end = value_end(self.data, ck.value_start)?;
         self.pos = end;
         self.cached = None;
         self.map_remaining -= 1;
@@ -1181,12 +1174,8 @@ fn read_text_bytes<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Cbor
     wire::read_text_payload_trusted(data, pos)
 }
 
-fn value_end_with_scratch(
-    data: &[u8],
-    start: usize,
-    scratch: &mut wire::SkipScratch,
-) -> Result<usize, CborError> {
-    wire::value_end_trusted_with_scratch(data, start, scratch)
+fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
+    wire::value_end_trusted(data, start)
 }
 
 fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
@@ -1289,7 +1278,6 @@ struct MapIter<'a> {
     data: &'a [u8],
     pos: usize,
     remaining: usize,
-    scratch: wire::SkipScratch,
 }
 
 impl<'a> Iterator for MapIter<'a> {
@@ -1310,7 +1298,7 @@ impl<'a> Iterator for MapIter<'a> {
         };
 
         let value_start = key_pos;
-        let end = match value_end_with_scratch(self.data, value_start, &mut self.scratch) {
+        let end = match value_end(self.data, value_start) {
             Ok(e) => e,
             Err(e) => {
                 self.remaining = 0;
@@ -1333,7 +1321,6 @@ struct MapIterEncoded<'a> {
     data: &'a [u8],
     pos: usize,
     remaining: usize,
-    scratch: wire::SkipScratch,
 }
 
 #[cfg(feature = "edit")]
@@ -1357,7 +1344,7 @@ impl<'a> Iterator for MapIterEncoded<'a> {
         let key_end = key_pos;
 
         let value_start = key_end;
-        let end = match value_end_with_scratch(self.data, value_start, &mut self.scratch) {
+        let end = match value_end(self.data, value_start) {
             Ok(e) => e,
             Err(e) => {
                 self.remaining = 0;
@@ -1376,11 +1363,11 @@ impl<'a> Iterator for MapIterEncoded<'a> {
     }
 }
 
-struct ArrayIter<'a> {
+/// Allocation-free forward iterator over borrowed canonical array items.
+pub struct ArrayIter<'a> {
     data: &'a [u8],
     pos: usize,
     remaining: usize,
-    scratch: wire::SkipScratch,
 }
 
 impl<'a> Iterator for ArrayIter<'a> {
@@ -1393,7 +1380,7 @@ impl<'a> Iterator for ArrayIter<'a> {
         }
 
         let start = self.pos;
-        let end = match value_end_with_scratch(self.data, start, &mut self.scratch) {
+        let end = match value_end(self.data, start) {
             Ok(e) => e,
             Err(e) => {
                 self.remaining = 0;

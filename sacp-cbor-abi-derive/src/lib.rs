@@ -607,10 +607,10 @@ fn derive_struct(
 
     Ok(quote! {
         impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
-            fn abi_encode(
+            fn abi_encode<__S: #cbor_path::ByteSink>(
                 &self,
-                enc: &mut #cbor_path::Encoder,
-            ) -> ::core::result::Result<(), #cbor_path::CborError> {
+                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            ) -> #cbor_path::EncodeResult<(), __S> {
                 #encode
             }
         }
@@ -663,10 +663,10 @@ fn derive_transparent_struct(
 
     Ok(quote! {
         impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
-            fn abi_encode(
+            fn abi_encode<__S: #cbor_path::ByteSink>(
                 &self,
-                enc: &mut #cbor_path::Encoder,
-            ) -> ::core::result::Result<(), #cbor_path::CborError> {
+                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            ) -> #cbor_path::EncodeResult<(), __S> {
                 #abi_path::AbiEncode::abi_encode(#access, enc)
             }
         }
@@ -773,10 +773,10 @@ fn derive_enum(
 
     Ok(quote! {
         impl #impl_generics #abi_path::AbiEncode for #name #ty_generics #where_clause {
-            fn abi_encode(
+            fn abi_encode<__S: #cbor_path::ByteSink>(
                 &self,
-                enc: &mut #cbor_path::Encoder,
-            ) -> ::core::result::Result<(), #cbor_path::CborError> {
+                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            ) -> #cbor_path::EncodeResult<(), __S> {
                 #encode
             }
         }
@@ -981,7 +981,7 @@ fn encode_field_set_body(
             quote! {
                 if let ::core::option::Option::Some(__abi_value) = #value_access {
                 #abi_path::__private::encode_field_id(__abi_array, #id)?;
-                __abi_array.value_with(|enc| {
+                __abi_array.encode_with(|enc| {
                     #abi_path::AbiEncode::abi_encode(__abi_value, enc)
                 })?;
                 }
@@ -989,7 +989,7 @@ fn encode_field_set_body(
         } else {
             quote! {
                 #abi_path::__private::encode_field_id(__abi_array, #id)?;
-                __abi_array.value_with(|enc| {
+                __abi_array.encode_with(|enc| {
                     #abi_path::AbiEncode::abi_encode(#value_access, enc)
                 })?;
             }
@@ -1225,7 +1225,7 @@ fn encode_enum_body(
             quote! {
                 Self::#ident { #(#pats,)* #unknown_pat } => enc.array(2, |__abi_array| {
                     #abi_path::__private::encode_field_id(__abi_array, #id)?;
-                    __abi_array.value_with(|enc| {
+                    __abi_array.encode_with(|enc| {
                         #body
                     })?;
                     ::core::result::Result::Ok(())

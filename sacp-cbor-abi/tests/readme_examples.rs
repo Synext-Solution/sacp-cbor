@@ -1,7 +1,7 @@
 use sacp_cbor::{CanonicalCbor, DecodeLimits};
 use sacp_cbor_abi::{
     compile_runtime_schema, decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass,
-    RuntimeInline, RuntimeSchema, UnknownFields, UnknownVariant,
+    NoNamedSchemas, RuntimeSchema, UnknownFields, UnknownVariant,
 };
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
@@ -79,7 +79,10 @@ pub mod wire {
         pub use sacp_cbor_abi::*;
     }
     pub mod cbor {
-        pub use sacp_cbor::{CanonicalCbor, CborDecode, CborError, Decoder, Encoder, ErrorCode};
+        pub use sacp_cbor::{
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, EncodeResult, ErrorCode,
+            ValueEncoder,
+        };
     }
 }
 
@@ -127,9 +130,16 @@ fn stable_public_abi_readme_examples_match_api() {
     let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap() else {
         unreachable!("Transfer schema is a struct")
     };
-    let mode = RuntimeInline;
+    let limits = sacp_cbor_abi::RuntimeValidationLimits::new(8, 64, 64, 16);
+    let mut workspace = sacp_cbor_abi::RuntimeValidationWorkspace::new();
+    workspace.prepare(limits).unwrap();
     let runtime_view = runtime
-        .validate_value(canon.as_canonical_ref().root(), mode)
+        .validate_value(
+            canon.as_canonical_ref().root(),
+            &NoNamedSchemas,
+            limits,
+            &mut workspace,
+        )
         .unwrap();
     assert_eq!(
         runtime_view

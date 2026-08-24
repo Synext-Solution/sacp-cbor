@@ -2,12 +2,19 @@
 
 use sacp_cbor::profile::{MAX_SAFE_INTEGER_I64, MIN_SAFE_INTEGER};
 use sacp_cbor::scalar::F64Bits;
-use sacp_cbor::{CborError, Encoder, ErrorCode};
+use sacp_cbor::{EncodeError, EncodeResult, Encoder, ErrorCode, VecSink};
 
-fn encode_one(f: impl FnOnce(&mut Encoder) -> Result<(), CborError>) -> Vec<u8> {
+fn encode_one(f: impl FnOnce(&mut Encoder) -> EncodeResult<(), VecSink>) -> Vec<u8> {
     let mut enc = Encoder::new();
     f(&mut enc).unwrap();
-    enc.finish().unwrap().into_bytes()
+    enc.finish().unwrap()
+}
+
+fn error_code(error: EncodeError<sacp_cbor::CborError>) -> ErrorCode {
+    match error {
+        EncodeError::Cbor(error) | EncodeError::Sink(error) => error.code,
+        EncodeError::Poisoned => ErrorCode::EncoderPoisoned,
+    }
 }
 
 #[test]
@@ -46,11 +53,11 @@ fn encode_nint_boundaries() {
 fn encode_rejects_int_outside_safe_range() {
     let too_big = MAX_SAFE_INTEGER_I64 + 1;
     let err = Encoder::new().int(too_big).unwrap_err();
-    assert_eq!(err.code, ErrorCode::IntegerOutsideSafeRange);
+    assert_eq!(error_code(err), ErrorCode::IntegerOutsideSafeRange);
 
     let too_small = MIN_SAFE_INTEGER - 1;
     let err = Encoder::new().int(too_small).unwrap_err();
-    assert_eq!(err.code, ErrorCode::IntegerOutsideSafeRange);
+    assert_eq!(error_code(err), ErrorCode::IntegerOutsideSafeRange);
 }
 
 #[test]

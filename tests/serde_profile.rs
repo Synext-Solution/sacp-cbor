@@ -2,10 +2,14 @@
 
 use sacp_cbor::profile::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 use sacp_cbor::serde::{
-    from_canonical_bytes, from_canonical_bytes_ref, from_slice, to_vec, SerdeOptions,
+    from_canonical_bytes, from_canonical_bytes_ref, from_slice, to_vec, SerdeEncodeError,
+    SerdeOptions,
 };
-use sacp_cbor::{collections::MapEntries, decode, CanonicalCbor, DecodeLimits, ErrorCode};
-use serde::ser::SerializeSeq;
+use sacp_cbor::{
+    collections::MapEntries, decode, CanonicalCbor, DecodeLimits, EncodeError, EncodeLimits,
+    Encoder, ErrorCode,
+};
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -13,6 +17,87 @@ use std::collections::BTreeMap;
 fn serde_rejects_negative_zero() {
     let err = to_vec(&(-0.0_f64)).unwrap_err();
     assert_eq!(err.code, ErrorCode::NegativeZeroForbidden);
+}
+
+struct SwallowsSequenceError;
+
+impl Serialize for SwallowsSequenceError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(1))?;
+        let _ = sequence.serialize_element(&-0.0_f64);
+        sequence.end()
+    }
+}
+
+struct SwallowsStructFieldError;
+
+impl Serialize for SwallowsStructFieldError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("SwallowsStructFieldError", 1)?;
+        let _ = state.serialize_field("value", &-0.0_f64);
+        state.end()
+    }
+}
+
+#[test]
+fn serde_root_custom_serialize_cannot_hide_a_swallowed_float_error() {
+    let mut encoder = Encoder::new();
+    let error = SerdeOptions::strict()
+        .encode(&SwallowsSequenceError, &mut encoder)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SerdeEncodeError::Encode(EncodeError::Poisoned)
+    ));
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
+}
+
+struct SortedMapStartFailure;
+
+impl Serialize for SortedMapStartFailure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_map(Some(1 << 30))?.end()
+    }
+}
+
+struct SwallowsSortedMapStartError;
+
+impl Serialize for SwallowsSortedMapStartError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(1))?;
+        let _ = sequence.serialize_element(&SortedMapStartFailure);
+        sequence.end()
+    }
+}
+
+#[test]
+fn serde_custom_serialize_cannot_hide_sorted_map_start_preflight_error() {
+    let limits = EncodeLimits {
+        max_map_len: 0,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&SwallowsSortedMapStartError, &mut encoder)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SerdeEncodeError::Encode(EncodeError::Poisoned)
+    ));
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn serde_strict_struct_cannot_hide_a_swallowed_field_error() {
+    let mut encoder = Encoder::new();
+    let error = SerdeOptions::strict()
+        .encode(&SwallowsStructFieldError, &mut encoder)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SerdeEncodeError::Encode(EncodeError::Poisoned)
+    ));
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
 }
 
 #[test]
@@ -41,6 +126,7 @@ fn serde_rejects_non_text_map_keys() {
 
     let err = to_vec(&m).unwrap_err();
     assert_eq!(err.code, ErrorCode::MapKeyMustBeText);
+    assert_eq!(err.offset, 1);
 }
 
 #[test]
@@ -82,6 +168,186 @@ fn serde_options_sorted_maps_accepts_hashmap_and_is_canonical() {
         decoded.0,
         vec![("b".to_string(), false), ("aa".to_string(), true)]
     );
+}
+
+#[derive(Serialize)]
+struct NonCanonicalStructOrder {
+    longer: u8,
+    x: u8,
+}
+
+#[test]
+fn serde_strict_struct_rejects_noncanonical_declaration_order() {
+    let value = NonCanonicalStructOrder { longer: 1, x: 2 };
+    let error = SerdeOptions::strict().to_vec(&value).unwrap_err();
+    assert_eq!(error.code, ErrorCode::NonCanonicalMapOrder);
+}
+
+#[test]
+fn serde_sorted_struct_explicitly_repairs_noncanonical_declaration_order() {
+    let value = NonCanonicalStructOrder { longer: 1, x: 2 };
+    let bytes = SerdeOptions::sorted_maps().to_vec(&value).unwrap();
+    assert_eq!(bytes[0], 0xa2);
+    assert_eq!(&bytes[1..4], &[0x61, b'x', 0x02]);
+}
+
+struct HugeMapHint;
+
+impl Serialize for HugeMapHint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_map(Some(1 << 30))?.end()
+    }
+}
+
+fn serde_cbor_code<E>(error: SerdeEncodeError<E>) -> ErrorCode {
+    match error {
+        SerdeEncodeError::Encode(EncodeError::Cbor(error)) => error.code,
+        SerdeEncodeError::Encode(EncodeError::Sink(_) | EncodeError::Poisoned) => {
+            panic!("expected canonical-profile error")
+        }
+    }
+}
+
+#[test]
+fn serde_sorted_map_preflights_size_hint_before_entry_allocation() {
+    let limits = EncodeLimits {
+        max_map_len: 0,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&HugeMapHint, &mut encoder)
+        .unwrap_err();
+    assert_eq!(serde_cbor_code(error), ErrorCode::MapLenLimitExceeded);
+    assert!(encoder.is_empty());
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn serde_sorted_map_preflights_wire_lower_bound_before_entry_allocation() {
+    let limits = EncodeLimits {
+        // The five-byte map header fits exactly; only the checked two-byte-per-pair
+        // wire lower bound makes this declaration impossible.
+        max_output_bytes: 5,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&HugeMapHint, &mut encoder)
+        .unwrap_err();
+    assert_eq!(serde_cbor_code(error), ErrorCode::MessageLenLimitExceeded);
+    assert!(encoder.is_empty());
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+struct SwallowsStrictFieldKeyLimit;
+
+impl Serialize for SwallowsStrictFieldKeyLimit {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("SwallowsStrictFieldKeyLimit", 1)?;
+        let _ = state.serialize_field("too-long", &0_u8);
+        state.serialize_field("a", &1_u8)?;
+        state.end()
+    }
+}
+
+#[test]
+fn serde_strict_struct_cannot_hide_a_swallowed_key_limit_error() {
+    let limits = EncodeLimits {
+        max_text_len: 1,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::strict()
+        .encode(&SwallowsStrictFieldKeyLimit, &mut encoder)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SerdeEncodeError::Encode(EncodeError::Poisoned)
+    ));
+    assert_eq!(encoder.as_bytes(), [0xa1]);
+}
+
+#[test]
+fn serde_sorted_map_applies_remaining_output_to_buffered_values() {
+    let mut values = BTreeMap::new();
+    values.insert("a", vec![0_u8; 1024]);
+    let limits = EncodeLimits {
+        max_output_bytes: 8,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&values, &mut encoder)
+        .unwrap_err();
+    assert_eq!(serde_cbor_code(error), ErrorCode::MessageLenLimitExceeded);
+    assert!(encoder.is_empty());
+}
+
+#[test]
+fn serde_sorted_map_items_are_cumulative_across_buffered_values() {
+    let mut values = BTreeMap::new();
+    values.insert("a", vec![1_u8]);
+    values.insert("b", vec![2_u8]);
+    let limits = EncodeLimits {
+        max_total_items: 5,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&values, &mut encoder)
+        .unwrap_err();
+    assert_eq!(serde_cbor_code(error), ErrorCode::TotalItemsLimitExceeded);
+    assert!(encoder.is_empty());
+}
+
+#[test]
+fn serde_sorted_map_values_inherit_outer_container_depth() {
+    let mut values = BTreeMap::new();
+    values.insert("a", vec![1_u8]);
+    let limits = EncodeLimits {
+        max_depth: 1,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&values, &mut encoder)
+        .unwrap_err();
+    assert_eq!(serde_cbor_code(error), ErrorCode::DepthLimitExceeded);
+    assert!(encoder.is_empty());
+}
+
+#[test]
+fn serde_sorted_buffer_errors_use_the_current_outer_output_offset() {
+    let mut values = BTreeMap::new();
+    values.insert("a", -0.0_f64);
+    let error = SerdeOptions::sorted_maps().to_vec(&(values,)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::NegativeZeroForbidden);
+    assert_eq!(error.offset, 1);
+}
+
+#[derive(Serialize)]
+struct SortedOversizedKey {
+    oversized: u8,
+}
+
+#[test]
+fn serde_sorted_struct_key_limit_uses_current_outer_output_offset() {
+    let limits = EncodeLimits {
+        max_text_len: 1,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    let error = SerdeOptions::sorted_maps()
+        .encode(&(SortedOversizedKey { oversized: 1 },), &mut encoder)
+        .unwrap_err();
+    match error {
+        SerdeEncodeError::Encode(EncodeError::Cbor(error)) => {
+            assert_eq!(error.code, ErrorCode::TextLenLimitExceeded);
+            assert_eq!(error.offset, 1);
+        }
+        _ => panic!("expected canonical-profile error"),
+    }
 }
 
 #[test]

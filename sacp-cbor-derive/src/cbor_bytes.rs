@@ -17,20 +17,12 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     let crate_path = &input.crate_path;
     let mut emitter = Emitter::new(crate_path);
-    let enc = format_ident!("__cbor_enc");
     let enc_ref = format_ident!("__cbor_enc_ref");
-    let body = emitter.emit_value(&input.value, &enc_ref, Target::Encoder);
+    let body = emitter.emit_value(&input.value, &enc_ref, Target::Value);
 
     let out = quote! {
         {
-            (|| -> ::core::result::Result<#crate_path::CanonicalCbor, #crate_path::CborError> {
-                let mut #enc = #crate_path::Encoder::new();
-                {
-                    let #enc_ref = &mut #enc;
-                    #body?;
-                }
-                #enc.finish()
-            })()
+            #crate_path::encode_with_to_canonical(|#enc_ref| #body)
         }
     };
 
@@ -177,6 +169,7 @@ struct Emitter<'a> {
 
 #[derive(Clone, Copy)]
 enum Target {
+    Value,
     Encoder,
     Array,
 }
@@ -200,10 +193,13 @@ impl<'a> Emitter<'a> {
         match value {
             Value::Null => quote! { #enc.null() },
             Value::Expr(expr) => match target {
-                Target::Encoder => quote! { #crate_path::CborEncode::encode(&#expr, #enc) },
-                Target::Array => {
-                    quote! { #crate_path::CborEncode::encode_array_item(&#expr, #enc) }
-                }
+                Target::Value => quote! { #crate_path::CborEncode::encode(&#expr, #enc) },
+                Target::Encoder => quote! { #enc.encode_with(|value_enc| {
+                    #crate_path::CborEncode::encode(&#expr, value_enc)
+                }) },
+                Target::Array => quote! { #enc.encode_with(|value_enc| {
+                    #crate_path::CborEncode::encode(&#expr, value_enc)
+                }) },
             },
             Value::Array(elems) => {
                 let len = elems.len();

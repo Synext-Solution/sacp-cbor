@@ -20,6 +20,13 @@ PACKAGES = {
     "sacp-cbor-abi": ROOT / "sacp-cbor-abi" / "Cargo.toml",
     "sacp-cbor-abi-derive": ROOT / "sacp-cbor-abi-derive" / "Cargo.toml",
 }
+RUST_VERSIONS = {
+    "sacp-cbor": "1.85",
+    "sacp-cbor-derive": "1.75",
+    "sacp-cbor-schema": "1.85",
+    "sacp-cbor-abi": "1.85",
+    "sacp-cbor-abi-derive": "1.75",
+}
 
 
 def version(manifest: Path) -> str:
@@ -88,7 +95,9 @@ def main() -> None:
 
     source = r'''use sacp_cbor::{CborDecode, CborEncode, DecodeLimits};
 use sacp_cbor_abi::CborAbi;
-use sacp_cbor_schema::{FieldDef, FieldType, RecordDef, RecordSchema};
+use sacp_cbor_schema::{
+    FieldDef, FieldType, RecordDef, RecordSchema, SchemaCompileLimits,
+};
 
 #[derive(Debug, PartialEq, Eq, CborEncode, CborDecode)]
 struct NativeMessage {
@@ -120,21 +129,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert_eq!(abi_decoded, public);
 
-    let schema = RecordSchema::compile(&RecordDef {
-        fields: vec![FieldDef {
-            key: "id".to_owned(),
-            ty: FieldType::Int,
-            required: true,
-            constraints: vec![],
-        }],
-        couplings: vec![],
-    })?;
+    let schema = RecordSchema::compile(
+        &RecordDef {
+            fields: vec![FieldDef {
+                key: "id".to_owned(),
+                ty: FieldType::Int,
+                required: true,
+                constraints: vec![],
+            }],
+            couplings: vec![],
+        },
+        SchemaCompileLimits::new(8, 8, 8, 8, 8, 64, 1024),
+    )?;
     let witness = schema.validate(
         &[0xa1, 0x62, b'i', b'd', 0x09],
         DecodeLimits::for_bytes(5),
         sacp_cbor::ValidationOptions::new(),
     )?;
-    schema.check(witness)?;
+    schema.check(witness, DecodeLimits::for_bytes(witness.as_bytes().len()))?;
     Ok(())
 }
 '''
@@ -150,6 +162,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             for name, archive in archives.items()
         }
+        for name, package_root in extracted.items():
+            package = tomllib.loads(
+                (package_root / "Cargo.toml").read_text(encoding="utf-8")
+            )["package"]
+            actual = package.get("rust-version")
+            expected = RUST_VERSIONS[name]
+            if actual != expected:
+                raise ValueError(
+                    f"{name} packaged rust-version is {actual!r}, expected {expected!r}"
+                )
         patch_lines = ["[patch.crates-io]"]
         for name in sorted(extracted):
             patch_lines.append(

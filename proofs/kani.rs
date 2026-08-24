@@ -6,7 +6,7 @@ use crate::profile::{
     NEGATIVE_ZERO_BITS,
 };
 use crate::wire::{read_len_at, read_uint_arg_at};
-use crate::{CborError, EncodeLimits, Encoder, ErrorCode};
+use crate::{CborError, EncodeError, EncodeLimits, Encoder, ErrorCode};
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
     match actual {
@@ -254,27 +254,25 @@ fn text_key_payload_order_is_antisymmetric_for_short_payloads() {
 }
 
 #[kani::proof]
-fn encoder_rolls_back_after_failed_array_callback() {
+fn encoder_poison_is_sticky_after_failed_array_callback() {
     let mut enc = Encoder::new();
     let err = enc
-        .array(1, |_array| Err(CborError::new(ErrorCode::PatchConflict, 0)))
+        .array(1, |_array| {
+            Err(CborError::new(ErrorCode::PatchConflict, 0).into())
+        })
         .unwrap_err();
-    assert!(err.code == ErrorCode::PatchConflict);
-    assert!(enc.is_empty());
-    enc.null().unwrap();
-    let out = enc.finish().unwrap();
-    assert!(out.as_bytes() == [0xf6]);
+    assert!(matches!(err, EncodeError::Cbor(error) if error.code == ErrorCode::PatchConflict));
+    assert!(matches!(enc.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
 }
 
 #[kani::proof]
-fn encoder_rolls_back_after_array_underfill() {
+fn encoder_poison_is_sticky_after_array_underfill() {
     let mut enc = Encoder::new();
     let err = enc.array(1, |_array| Ok(())).unwrap_err();
-    assert!(err.code == ErrorCode::ArrayLenMismatch);
-    assert!(enc.is_empty());
-    enc.null().unwrap();
-    let out = enc.finish().unwrap();
-    assert!(out.as_bytes() == [0xf6]);
+    assert!(matches!(err, EncodeError::Cbor(error) if error.code == ErrorCode::ArrayLenMismatch));
+    assert!(matches!(enc.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
 }
 
 #[kani::proof]
@@ -282,9 +280,8 @@ fn encoder_root_slot_accepts_exactly_one_value() {
     let mut enc = Encoder::new();
     enc.null().unwrap();
     let err = enc.bool(true).unwrap_err();
-    assert!(err.code == ErrorCode::TrailingBytes);
-    let out = enc.finish().unwrap();
-    assert!(out.as_bytes() == [0xf6]);
+    assert!(matches!(err, EncodeError::Cbor(error) if error.code == ErrorCode::TrailingBytes));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
 }
 
 #[kani::proof]
@@ -292,20 +289,21 @@ fn encoder_array_slot_conservation_for_one_scalar() {
     let mut enc = Encoder::new();
     enc.array(1, |array| array.null()).unwrap();
     let out = enc.finish().unwrap();
-    assert!(out.as_bytes() == [0x81, 0xf6]);
+    assert!(out == [0x81, 0xf6]);
 }
 
 #[kani::proof]
-fn encoder_rolls_back_after_text_output_limit() {
+fn encoder_poison_is_sticky_after_text_output_limit() {
     let limits = EncodeLimits {
         max_output_bytes: 2,
         ..EncodeLimits::unbounded()
     };
     let mut enc = Encoder::with_limits(limits).unwrap();
     let err = enc.text("aa").unwrap_err();
-    assert!(err.code == ErrorCode::MessageLenLimitExceeded);
+    assert!(
+        matches!(err, EncodeError::Cbor(error) if error.code == ErrorCode::MessageLenLimitExceeded)
+    );
     assert!(enc.is_empty());
-    enc.null().unwrap();
-    let out = enc.finish().unwrap();
-    assert!(out.as_bytes() == [0xf6]);
+    assert!(matches!(enc.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
 }

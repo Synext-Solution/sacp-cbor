@@ -9,7 +9,10 @@ mod wire {
     }
 
     pub mod cbor {
-        pub use sacp_cbor::{CanonicalCbor, CborDecode, CborError, Decoder, Encoder, ErrorCode};
+        pub use sacp_cbor::{
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, EncodeResult, ErrorCode,
+            ValueEncoder,
+        };
     }
 }
 

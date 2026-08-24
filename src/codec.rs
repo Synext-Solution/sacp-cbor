@@ -1,7 +1,7 @@
 //! Native encode/decode traits for SACP-CBOR/1.
 
 #[cfg(feature = "alloc")]
-use crate::encode::{ArrayEncoder, Encoder};
+use crate::encode::{ByteSink, EncodeResult, ValueEncoder};
 use crate::{CborError, Decoder};
 
 /// Decode a value from a streaming decoder.
@@ -23,14 +23,5 @@ pub trait CborEncode {
     /// # Errors
     ///
     /// Returns an error if encoding fails.
-    fn encode(&self, enc: &mut Encoder) -> Result<(), CborError>;
-
-    /// Encode `self` as the next item of an array.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if encoding fails.
-    fn encode_array_item(&self, array: &mut ArrayEncoder<'_>) -> Result<(), CborError> {
-        array.value_with(|enc| self.encode(enc))
-    }
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
 }

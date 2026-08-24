@@ -30,17 +30,18 @@ core_harnesses=(
   payload_comparator_equal_means_duplicate_key
   text_key_payload_order_is_transitive_for_short_payloads
   text_key_payload_order_is_antisymmetric_for_short_payloads
-  encoder_rolls_back_after_failed_array_callback
-  encoder_rolls_back_after_array_underfill
+  encoder_poison_is_sticky_after_failed_array_callback
+  encoder_poison_is_sticky_after_array_underfill
   encoder_root_slot_accepts_exactly_one_value
   encoder_array_slot_conservation_for_one_scalar
-  encoder_rolls_back_after_text_output_limit
+  encoder_poison_is_sticky_after_text_output_limit
 )
 
 abi_harnesses=(
   abi_id_validator_accepts_exact_nonzero_u32_range
   sorted_query_ids_accepts_exact_nonzero_singleton
   sorted_query_ids_accepts_exact_strict_nonzero_order_for_len3
+  runtime_schema_ids_accept_exact_strict_nonzero_order_for_len3
 )
 
 for harness in "${core_harnesses[@]}"; do

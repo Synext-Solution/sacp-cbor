@@ -27,7 +27,7 @@ impl F64Bits {
     /// # Errors
     ///
     /// Returns an error if `value` is `-0.0`. NaNs are canonicalized to the required NaN bit pattern.
-    pub fn try_from_f64(value: f64) -> Result<Self, CborError> {
+    pub const fn try_from_f64(value: f64) -> Result<Self, CborError> {
         let bits = value.to_bits();
         if bits == NEGATIVE_ZERO_BITS {
             return Err(CborError::new(ErrorCode::NegativeZeroForbidden, 0));
@@ -48,7 +48,7 @@ impl F64Bits {
     /// Convert into an `f64`.
     #[inline]
     #[must_use]
-    pub fn to_f64(self) -> f64 {
+    pub const fn to_f64(self) -> f64 {
         f64::from_bits(self.0)
     }
 }

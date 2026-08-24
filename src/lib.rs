@@ -135,6 +135,8 @@ mod proofs;
 pub mod query;
 pub mod scalar;
 #[cfg(feature = "serde")]
+mod serde_encode;
+#[cfg(feature = "serde")]
 mod serde_impl;
 pub(crate) mod utf8;
 mod wire;
@@ -152,6 +154,8 @@ pub use crate::codec::CborDecode;
 pub use crate::decode::{
     decode, decode_canonical, ArrayDecoder, Decoder, MapDecoder, MapKey, ScalarKind,
 };
+#[cfg(feature = "alloc")]
+pub use crate::decode::{TraversalSession, TraversalWorkspace};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{DecodeLimits, EncodeLimits, ValidationOptions};
 pub use crate::parse::{validate_canonical, validate_canonical_with};
@@ -165,9 +169,17 @@ pub use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
 pub use crate::codec::CborEncode;
 #[cfg(feature = "alloc")]
-pub use crate::codec_impls::{encode_to_canonical, encode_to_vec};
+pub use crate::codec_impls::{encode_to_canonical, encode_to_vec, encode_with_to_canonical};
+#[cfg(all(feature = "alloc", feature = "sha2"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "alloc", feature = "sha2"))))]
+pub use crate::encode::DigestSink;
+#[cfg(feature = "std")]
+pub use crate::encode::IoSink;
 #[cfg(feature = "alloc")]
-pub use crate::encode::Encoder;
+pub use crate::encode::{
+    ByteSink, CountOverflow, CountingSink, EncodeError, EncodeResult, Encoder, ValueEncoder,
+    VecSink,
+};
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]
 pub use sacp_cbor_derive::cbor_bytes;
@@ -177,8 +189,9 @@ pub use sacp_cbor_derive::cbor_bytes;
 pub mod serde {
     //! Serde encode/decode integration for SACP-CBOR/1.
 
+    pub use crate::serde_encode::{to_vec, SerdeEncodeError, SerdeOptions};
     pub use crate::serde_impl::{
-        from_canonical_bytes, from_canonical_bytes_ref, from_slice, to_vec, DeError, SerdeOptions,
+        from_canonical_bytes, from_canonical_bytes_ref, from_slice, DeError,
     };
 }
 

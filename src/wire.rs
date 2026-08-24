@@ -267,20 +267,36 @@ pub fn read_text_trusted<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str,
     utf8::trusted(bytes).map_err(|()| CborError::new(ErrorCode::MalformedCanonical, off))
 }
 
-pub fn value_end_trusted_with_scratch(
-    data: &[u8],
-    start: usize,
-    scratch: &mut SkipScratch,
-) -> Result<usize, CborError> {
+pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
     let mut cursor = Cursor::with_pos(data, start);
     let mut items_seen = 0;
-    skip_one_value_with_scratch::<false>(
-        &mut cursor,
-        WalkPolicy::trusted(),
-        &mut items_seen,
-        0,
-        scratch,
-    )?;
+    let mut pending = 1usize;
+    while pending != 0 {
+        let off = cursor.position();
+        let initial = cursor.read_u8()?;
+        let frame = skip_primitive::<false>(
+            &mut cursor,
+            WalkPolicy::trusted(),
+            &mut items_seen,
+            0,
+            off,
+            initial >> 5,
+            initial & 0x1f,
+        )?;
+        pending -= 1;
+        let children = match frame {
+            Some(Frame::Array { remaining }) => remaining,
+            Some(Frame::Map {
+                remaining_pairs, ..
+            }) => remaining_pairs
+                .checked_mul(2)
+                .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?,
+            None => 0,
+        };
+        pending = pending
+            .checked_add(children)
+            .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+    }
     Ok(cursor.position())
 }
 

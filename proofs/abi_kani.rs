@@ -1,7 +1,4 @@
-use crate::runtime::{
-    validate_sorted_schema_ids, RequiredSeen, RuntimeAbiError, RuntimeInline,
-    RuntimeNamedResolution, RuntimeRejectNamed, RuntimeTypeMode,
-};
+use crate::runtime::validate_sorted_schema_ids;
 use crate::view::{validate_abi_id_value, validate_sorted_query_ids};
 use sacp_cbor::{CborError, ErrorCode};
 
@@ -68,44 +65,4 @@ fn runtime_schema_ids_accept_exact_strict_nonzero_order_for_len3() {
     } else {
         assert!(actual.is_err());
     }
-}
-
-#[kani::proof]
-fn runtime_required_seen_small_bitset_tracks_len3_exactly() {
-    let mark0: bool = kani::any();
-    let mark1: bool = kani::any();
-    let mark2: bool = kani::any();
-    let mut seen = RequiredSeen::new(3).unwrap();
-
-    if mark0 {
-        seen.mark(0);
-    }
-    if mark1 {
-        seen.mark(1);
-    }
-    if mark2 {
-        seen.mark(2);
-    }
-
-    assert!(seen.all_seen(3) == (mark0 && mark1 && mark2));
-}
-
-#[kani::proof]
-fn runtime_inline_named_policy_is_always_opaque() {
-    let has_version: bool = kani::any();
-    let version_value: u32 = kani::any();
-    let version = has_version.then_some(version_value);
-
-    let actual = RuntimeInline.resolve_named("runtime.Named", version);
-    assert!(matches!(actual, Ok(RuntimeNamedResolution::Opaque)));
-}
-
-#[kani::proof]
-fn runtime_reject_named_policy_always_rejects_named() {
-    let has_version: bool = kani::any();
-    let version_value: u32 = kani::any();
-    let version = has_version.then_some(version_value);
-
-    let actual = RuntimeRejectNamed.resolve_named("runtime.Named", version);
-    assert!(matches!(actual, Err(RuntimeAbiError::UnresolvedNamedType)));
 }

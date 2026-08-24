@@ -38,7 +38,7 @@ fn len_header(major: u8, len: usize) -> Vec<u8> {
 
 fn tstr_encoded(len: usize, fill: u8) -> Vec<u8> {
     let mut out = len_header(3, len);
-    out.extend(std::iter::repeat(fill).take(len));
+    out.extend(std::iter::repeat_n(fill, len));
     out
 }
 
@@ -183,7 +183,7 @@ fn rejects_non_canonical_uint_encoding() {
 fn rejects_non_canonical_length_encoding_for_text() {
     // length 23 text encoded with ai=24
     let mut bytes = vec![0x78, 23];
-    bytes.extend(std::iter::repeat(b'a').take(23));
+    bytes.extend(std::iter::repeat_n(b'a', 23));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
     assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
@@ -207,7 +207,7 @@ fn rejects_non_canonical_tag_encoding() {
 #[test]
 fn rejects_non_canonical_length_encoding_for_bytes() {
     let mut bytes = vec![0x58, 23];
-    bytes.extend(std::iter::repeat(0u8).take(23));
+    bytes.extend(std::iter::repeat_n(0u8, 23));
     let err = validate_canonical(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap_err();
     assert_eq!(err.code, ErrorCode::NonCanonicalEncoding);
 }
@@ -598,7 +598,7 @@ fn accepts_limits_at_boundary_and_rejects_boundary_plus_one() {
 fn accepts_nesting_beyond_inline_stack_capacity() {
     let depth = 40usize;
     let mut bytes = Vec::with_capacity(depth + 1);
-    bytes.extend(std::iter::repeat(0x81).take(depth));
+    bytes.extend(std::iter::repeat_n(0x81, depth));
     bytes.push(0xf6);
 
     let mut limits = DecodeLimits::for_bytes(bytes.len());
