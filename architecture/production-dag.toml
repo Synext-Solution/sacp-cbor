@@ -1,0 +1,46 @@
+schema-version = 1
+
+[[package]]
+name = "sacp-cbor"
+responsibility = "Canonical CBOR validation, encoding, decoding, querying, editing, and optional integrations."
+
+[[package]]
+name = "sacp-cbor-derive"
+responsibility = "Procedural macros for the native Rust-shape codec."
+
+[[package]]
+name = "sacp-cbor-schema"
+responsibility = "Compiled closed-record schema validation and structural compatibility."
+
+[[package]]
+name = "sacp-cbor-abi"
+responsibility = "Stable public ABI schemas, runtime validation, views, and compatibility."
+
+[[package]]
+name = "sacp-cbor-abi-derive"
+responsibility = "Procedural macros for stable public ABI types."
+
+# Edges point from a production package to a direct production dependency.
+[[edge]]
+from = "sacp-cbor"
+to = "sacp-cbor-derive"
+kind = "normal"
+optional = true
+
+[[edge]]
+from = "sacp-cbor-schema"
+to = "sacp-cbor"
+kind = "normal"
+optional = false
+
+[[edge]]
+from = "sacp-cbor-abi"
+to = "sacp-cbor"
+kind = "normal"
+optional = false
+
+[[edge]]
+from = "sacp-cbor-abi"
+to = "sacp-cbor-abi-derive"
+kind = "normal"
+optional = true

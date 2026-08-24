@@ -16,5 +16,6 @@ fuzz/Cargo.lock
 .idea
 .vscode
 *:Zone.Identifier
+**/__pycache__/
 /tests/fixtures/derive_crate_path_override/target
 /tests/fixtures/strict_facade/target

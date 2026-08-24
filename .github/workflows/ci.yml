@@ -5,25 +5,32 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Shellcheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00b27aa7cb85167568cb48a3838b75f4265f2bca # master, 2026-08-24
         with:
           scandir: scripts
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
+
+      - name: Verify production dependency DAG
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          python3 scripts/check_package_dag.py
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -64,23 +71,49 @@ jobs:
       - name: Build ABI (no default features)
         run: cargo build -p sacp-cbor-abi --no-default-features
 
-      - name: Package derive crate
-        run: cargo package -p sacp-cbor-derive --locked
+      - name: Build schema (no default features)
+        run: cargo build -p sacp-cbor-schema --no-default-features
 
-      - name: Package ABI derive crate
-        run: cargo package -p sacp-cbor-abi-derive --locked
+      - name: Package all publishable crates
+        run: |
+          cargo package -p sacp-cbor-derive --locked
+          cargo package -p sacp-cbor --locked
+          cargo package -p sacp-cbor-schema --locked
+          cargo package -p sacp-cbor-abi-derive --locked
+          cargo package -p sacp-cbor-abi --locked
+
+      - name: Consume the packaged tarballs
+        run: python3 scripts/package_consumer_smoke.py
 
       - name: Docs
         run: cargo doc --workspace --no-deps --all-features
 
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pinned nightly
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
+        with:
+          toolchain: nightly-2026-08-01
+
+      - name: Install cargo-fuzz 0.13.2
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Build every fuzz target
+        working-directory: fuzz
+        run: cargo fuzz build
+
   bench-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
 
       - name: Fetch datasets
@@ -105,7 +138,7 @@ jobs:
         run: cargo run -p bench_harness --bin report
 
       - name: Upload bench report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bench-report
           path: benchmarks/reports/latest/
@@ -113,212 +146,30 @@ jobs:
   kani:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Run ABI Kani proofs
-        uses: model-checking/kani-github-action@v1
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
         with:
-          kani-version: "0.67.0"
-          command: cargo-kani
-          args: "-p sacp-cbor-abi"
+          toolchain: "1.97.1"
 
-  release:
-    needs: [test, bench-smoke, miri, kani]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish to crates.io and tag
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        shell: bash
+      - name: Install Kani 0.67.0
         run: |
-          set -euo pipefail
-          package_meta() {
-            MANIFEST="$1" python3 -c 'import os, pathlib, tomllib; data=tomllib.loads(pathlib.Path(os.environ["MANIFEST"]).read_text()); pkg=data.get("package", {}); name=pkg.get("name"); version=pkg.get("version"); print("MISSING" if not name or not version else f"{name} {version}")'
-          }
+          cargo install kani-verifier --locked --version 0.67.0
+          cargo kani setup
 
-          dependency_version() {
-            MANIFEST="$1" DEP="$2" python3 -c 'import os, pathlib, tomllib; data=tomllib.loads(pathlib.Path(os.environ["MANIFEST"]).read_text()); print(data["dependencies"][os.environ["DEP"]]["version"])'
-          }
-
-          meta="$(package_meta "Cargo.toml")"
-
-          if [ "$meta" = "MISSING" ] || [ -z "${meta:-}" ]; then
-            echo "Failed to parse package name/version from Cargo.toml" >&2
-            exit 1
-          fi
-          crate="${meta%% *}"
-          version="${meta#* }"
-          if [ -z "${crate:-}" ] || [ -z "${version:-}" ] || [ "$crate" = "$version" ]; then
-            echo "Malformed package metadata: '${meta}'" >&2
-            exit 1
-          fi
-
-          # README must always face the current release line, never a past one.
-          release_line="${version%.*}"
-          stale_readme="$(grep -hoE 'sacp-cbor = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-abi/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${release_line}" || true)"
-          if [ -n "${stale_readme}" ]; then
-            echo "README references stale sacp-cbor version(s): ${stale_readme} (current line ${release_line})." >&2
-            exit 1
-          fi
-
-          tag="v${version}"
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists."
-            tag_exists=1
-          else
-            tag_exists=0
-          fi
-
-          is_published() {
-            CRATE="$1" VERSION="$2" python3 -c $'import json, os, sys, urllib.request, urllib.error\ncrate=os.environ[\"CRATE\"]\nversion=os.environ[\"VERSION\"]\nurl=f\"https://crates.io/api/v1/crates/{crate}\"\ntry:\n    with urllib.request.urlopen(url, timeout=10) as resp:\n        data=json.load(resp)\nexcept urllib.error.HTTPError as exc:\n    if exc.code == 404:\n        sys.exit(1)\n    print(f\"Failed to query crates.io: {exc}\", file=sys.stderr)\n    sys.exit(2)\nexcept Exception as exc:\n    print(f\"Failed to query crates.io: {exc}\", file=sys.stderr)\n    sys.exit(2)\nversions={v.get(\"num\") for v in data.get(\"versions\", [])}\nsys.exit(0 if version in versions else 1)\n'
-          }
-
-          wait_for_published() {
-            local crate="$1"
-            local version="$2"
-            for attempt in $(seq 1 30); do
-              if is_published "$crate" "$version" && cargo info "${crate}@${version}" >/dev/null 2>&1; then
-                return 0
-              fi
-              echo "Waiting for ${crate} ${version} to appear on crates.io (${attempt}/30)."
-              sleep 10
-            done
-            echo "${crate} ${version} did not appear on crates.io in time." >&2
-            return 1
-          }
-
-          derive_meta="$(package_meta "sacp-cbor-derive/Cargo.toml")"
-          if [ "$derive_meta" = "MISSING" ] || [ -z "${derive_meta:-}" ]; then
-            echo "Failed to parse package name/version from sacp-cbor-derive/Cargo.toml" >&2
-            exit 1
-          fi
-          derive_crate="${derive_meta%% *}"
-          derive_version="${derive_meta#* }"
-          derive_dep_version="$(dependency_version "Cargo.toml" "sacp-cbor-derive")"
-          if [ "$derive_crate" != "sacp-cbor-derive" ]; then
-            echo "Unexpected derive crate name: ${derive_crate}" >&2
-            exit 1
-          fi
-          if [ "$derive_version" != "$derive_dep_version" ]; then
-            echo "sacp-cbor-derive package version (${derive_version}) does not match dependency version (${derive_dep_version})." >&2
-            exit 1
-          fi
-          if [ "$derive_version" != "$version" ]; then
-            echo "sacp-cbor-derive package version (${derive_version}) does not match root version (${version})." >&2
-            exit 1
-          fi
-
-          abi_derive_meta="$(package_meta "sacp-cbor-abi-derive/Cargo.toml")"
-          if [ "$abi_derive_meta" = "MISSING" ] || [ -z "${abi_derive_meta:-}" ]; then
-            echo "Failed to parse package name/version from sacp-cbor-abi-derive/Cargo.toml" >&2
-            exit 1
-          fi
-          abi_derive_crate="${abi_derive_meta%% *}"
-          abi_derive_version="${abi_derive_meta#* }"
-          abi_meta="$(package_meta "sacp-cbor-abi/Cargo.toml")"
-          if [ "$abi_meta" = "MISSING" ] || [ -z "${abi_meta:-}" ]; then
-            echo "Failed to parse package name/version from sacp-cbor-abi/Cargo.toml" >&2
-            exit 1
-          fi
-          abi_crate="${abi_meta%% *}"
-          abi_version="${abi_meta#* }"
-          abi_root_dep_version="$(dependency_version "sacp-cbor-abi/Cargo.toml" "sacp-cbor")"
-          abi_derive_dep_version="$(dependency_version "sacp-cbor-abi/Cargo.toml" "sacp-cbor-abi-derive")"
-          abi_release_line="${abi_version%.*}"
-
-          stale_abi_readme="$(grep -hoE 'sacp-cbor-abi = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-abi/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${abi_release_line}" || true)"
-          if [ -n "${stale_abi_readme}" ]; then
-            echo "README references stale sacp-cbor-abi version(s): ${stale_abi_readme} (current line ${abi_release_line})." >&2
-            exit 1
-          fi
-
-          if [ "$abi_root_dep_version" != "$version" ]; then
-            echo "sacp-cbor-abi dependency on sacp-cbor (${abi_root_dep_version}) does not match root version (${version})." >&2
-            exit 1
-          fi
-          if [ "$abi_derive_dep_version" != "$abi_derive_version" ]; then
-            echo "sacp-cbor-abi-derive package version (${abi_derive_version}) does not match dependency version (${abi_derive_dep_version})." >&2
-            exit 1
-          fi
-
-          schema_meta="$(package_meta "sacp-cbor-schema/Cargo.toml")"
-          if [ "$schema_meta" = "MISSING" ] || [ -z "${schema_meta:-}" ]; then
-            echo "Failed to parse package name/version from sacp-cbor-schema/Cargo.toml" >&2
-            exit 1
-          fi
-          schema_crate="${schema_meta%% *}"
-          schema_version="${schema_meta#* }"
-          schema_dep_version="$(dependency_version "sacp-cbor-schema/Cargo.toml" "sacp-cbor")"
-          schema_release_line="${schema_version%.*}"
-          if [ "$schema_crate" != "sacp-cbor-schema" ]; then
-            echo "Unexpected schema crate name: ${schema_crate}" >&2
-            exit 1
-          fi
-          if [ "$schema_dep_version" != "$version" ]; then
-            echo "sacp-cbor-schema dependency on sacp-cbor (${schema_dep_version}) does not match root version (${version})." >&2
-            exit 1
-          fi
-
-          stale_schema_readme="$(grep -hoE 'sacp-cbor-schema = (\{ )?(version = )?"[0-9]+\.[0-9]+(\.[0-9]+)?"' README.md sacp-cbor-schema/README.md | grep -oE '"[0-9.]+"' | tr -d '"' | grep -vx "${schema_release_line}" || true)"
-          if [ -n "${stale_schema_readme}" ]; then
-            echo "README references stale sacp-cbor-schema version(s): ${stale_schema_readme} (current line ${schema_release_line})." >&2
-            exit 1
-          fi
-
-          publish_crate() {
-            local crate="$1"
-            local version="$2"
-            local package="$3"
-            local published
-
-            set +e
-            is_published "$crate" "$version"
-            published=$?
-            set -e
-            if [ "$published" -gt 1 ]; then
-              exit 1
-            fi
-            if [ "$published" -eq 0 ]; then
-              echo "${crate} ${version} already on crates.io; skipping publish."
-              return 0
-            fi
-            if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-              echo "CARGO_REGISTRY_TOKEN is not set; cannot publish ${crate} ${version}." >&2
-              exit 1
-            fi
-            cargo publish -p "$package" --locked
-            wait_for_published "$crate" "$version"
-          }
-
-          publish_crate "sacp-cbor-derive" "$derive_version" "sacp-cbor-derive"
-          publish_crate "$crate" "$version" "sacp-cbor"
-          publish_crate "$schema_crate" "$schema_version" "sacp-cbor-schema"
-          publish_crate "$abi_derive_crate" "$abi_derive_version" "sacp-cbor-abi-derive"
-          publish_crate "$abi_crate" "$abi_version" "sacp-cbor-abi"
-
-          if [ "$tag_exists" -eq 0 ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git tag "${tag}"
-            git push origin "refs/tags/${tag}"
-          fi
+      - name: Run core and ABI Kani proofs
+        run: ./scripts/proof.sh
 
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install Rust (nightly + Miri)
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned nightly with Miri
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-24
         with:
+          toolchain: nightly-2026-08-01
           components: miri
 
       - name: Miri unsafe-feature query smoke
