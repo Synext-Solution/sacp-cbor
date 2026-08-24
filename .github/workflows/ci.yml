@@ -75,12 +75,7 @@ jobs:
         run: cargo build -p sacp-cbor-schema --no-default-features
 
       - name: Package all publishable crates
-        run: |
-          cargo package -p sacp-cbor-derive --locked
-          cargo package -p sacp-cbor --locked
-          cargo package -p sacp-cbor-schema --locked
-          cargo package -p sacp-cbor-abi-derive --locked
-          cargo package -p sacp-cbor-abi --locked
+        run: cargo package --workspace --locked
 
       - name: Consume the packaged tarballs
         run: python3 scripts/package_consumer_smoke.py

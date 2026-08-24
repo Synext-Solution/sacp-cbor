@@ -26,21 +26,25 @@ from = "sacp-cbor"
 to = "sacp-cbor-derive"
 kind = "normal"
 optional = true
+target = "all"
 
 [[edge]]
 from = "sacp-cbor-schema"
 to = "sacp-cbor"
 kind = "normal"
 optional = false
+target = "all"
 
 [[edge]]
 from = "sacp-cbor-abi"
 to = "sacp-cbor"
 kind = "normal"
 optional = false
+target = "all"
 
 [[edge]]
 from = "sacp-cbor-abi"
 to = "sacp-cbor-abi-derive"
 kind = "normal"
 optional = true
+target = "all"

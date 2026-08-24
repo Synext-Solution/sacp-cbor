@@ -49,8 +49,18 @@ require_readme_line() {
   fi
 }
 
-is_published() {
-  CRATE="$1" VERSION="$2" python3 -c $'import json, os, sys, urllib.request, urllib.error\ncrate=os.environ["CRATE"]\nversion=os.environ["VERSION"]\nurl=f"https://crates.io/api/v1/crates/{crate}"\ntry:\n    with urllib.request.urlopen(url, timeout=10) as response:\n        data=json.load(response)\nexcept urllib.error.HTTPError as error:\n    if error.code == 404:\n        sys.exit(1)\n    print(f"Failed to query crates.io: {error}", file=sys.stderr)\n    sys.exit(2)\nexcept Exception as error:\n    print(f"Failed to query crates.io: {error}", file=sys.stderr)\n    sys.exit(2)\nversions={entry.get("num") for entry in data.get("versions", [])}\nsys.exit(0 if version in versions else 1)\n'
+readonly REGISTRY_MISSING=10
+readonly REGISTRY_QUERY_FAILED=13
+
+package_archive() {
+  printf 'target/package/%s-%s.crate\n' "$1" "$2"
+}
+
+verify_published_artifact() {
+  local crate="$1"
+  local version="$2"
+  python3 scripts/check_registry_artifact.py \
+    "$crate" "$version" "$(package_archive "$crate" "$version")"
 }
 
 wait_for_published() {
@@ -58,8 +68,16 @@ wait_for_published() {
   local version="$2"
   local attempt
   for attempt in $(seq 1 30); do
-    if is_published "$crate" "$version" && cargo info "${crate}@${version}" >/dev/null 2>&1; then
+    local status
+    set +e
+    verify_published_artifact "$crate" "$version"
+    status=$?
+    set -e
+    if [[ "$status" -eq 0 ]] && cargo info "${crate}@${version}" >/dev/null 2>&1; then
       return 0
+    fi
+    if [[ "$status" -ne "$REGISTRY_MISSING" && "$status" -ne "$REGISTRY_QUERY_FAILED" ]]; then
+      return "$status"
     fi
     echo "Waiting for ${crate} ${version} to appear on crates.io (${attempt}/30)."
     sleep 10
@@ -74,10 +92,10 @@ publish_crate() {
   local package="$3"
   local published
   set +e
-  is_published "$crate" "$version"
+  verify_published_artifact "$crate" "$version"
   published=$?
   set -e
-  if [[ "$published" -gt 1 ]]; then
+  if [[ "$published" -ne 0 && "$published" -ne "$REGISTRY_MISSING" ]]; then
     exit 1
   fi
   if [[ "$published" -eq 0 ]]; then
@@ -116,7 +134,7 @@ validate_existing_tag_state() {
   for release in "$@"; do
     read -r crate version _package <<<"$release"
     set +e
-    is_published "$crate" "$version"
+    verify_published_artifact "$crate" "$version"
     published=$?
     set -e
     if [[ "$published" -ne 0 ]]; then
@@ -124,6 +142,36 @@ validate_existing_tag_state() {
       exit 1
     fi
   done
+}
+
+workspace_release_matrix() {
+  local expected_root_version="$1"
+  local root_version derive_version schema_version abi_derive_version abi_version
+  root_version="$(require_meta Cargo.toml sacp-cbor)"
+  derive_version="$(require_meta sacp-cbor-derive/Cargo.toml sacp-cbor-derive)"
+  schema_version="$(require_meta sacp-cbor-schema/Cargo.toml sacp-cbor-schema)"
+  abi_derive_version="$(require_meta sacp-cbor-abi-derive/Cargo.toml sacp-cbor-abi-derive)"
+  abi_version="$(require_meta sacp-cbor-abi/Cargo.toml sacp-cbor-abi)"
+
+  if [[ "$expected_root_version" != "$root_version" ]]; then
+    echo "Requested version ${expected_root_version} does not match sacp-cbor ${root_version}." >&2
+    exit 1
+  fi
+  if [[ "$derive_version" != "$root_version" ]]; then
+    echo "sacp-cbor-derive ${derive_version} does not match sacp-cbor ${root_version}." >&2
+    exit 1
+  fi
+  require_exact_dependency Cargo.toml sacp-cbor-derive "$derive_version"
+  require_exact_dependency sacp-cbor-schema/Cargo.toml sacp-cbor "$root_version"
+  require_exact_dependency sacp-cbor-abi/Cargo.toml sacp-cbor "$root_version"
+  require_exact_dependency sacp-cbor-abi/Cargo.toml sacp-cbor-abi-derive "$abi_derive_version"
+
+  printf '%s\n' \
+    "sacp-cbor-derive ${derive_version} sacp-cbor-derive" \
+    "sacp-cbor ${root_version} sacp-cbor" \
+    "sacp-cbor-schema ${schema_version} sacp-cbor-schema" \
+    "sacp-cbor-abi-derive ${abi_derive_version} sacp-cbor-abi-derive" \
+    "sacp-cbor-abi ${abi_version} sacp-cbor-abi"
 }
 
 main() {
@@ -147,36 +195,24 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-root_version="$(require_meta Cargo.toml sacp-cbor)"
-derive_version="$(require_meta sacp-cbor-derive/Cargo.toml sacp-cbor-derive)"
-schema_version="$(require_meta sacp-cbor-schema/Cargo.toml sacp-cbor-schema)"
-abi_derive_version="$(require_meta sacp-cbor-abi-derive/Cargo.toml sacp-cbor-abi-derive)"
-abi_version="$(require_meta sacp-cbor-abi/Cargo.toml sacp-cbor-abi)"
-
-if [[ "$RELEASE_VERSION" != "$root_version" ]]; then
-  echo "Requested version ${RELEASE_VERSION} does not match sacp-cbor ${root_version}." >&2
-  exit 1
-fi
-if [[ "$derive_version" != "$root_version" ]]; then
-  echo "sacp-cbor-derive ${derive_version} does not match sacp-cbor ${root_version}." >&2
-  exit 1
-fi
-require_exact_dependency Cargo.toml sacp-cbor-derive "$derive_version"
-require_exact_dependency sacp-cbor-schema/Cargo.toml sacp-cbor "$root_version"
-require_exact_dependency sacp-cbor-abi/Cargo.toml sacp-cbor "$root_version"
-require_exact_dependency sacp-cbor-abi/Cargo.toml sacp-cbor-abi-derive "$abi_derive_version"
+local release_matrix
+release_matrix="$(workspace_release_matrix "$RELEASE_VERSION")"
+local -a releases
+mapfile -t releases <<<"$release_matrix"
+root_version="${releases[1]#* }"
+root_version="${root_version%% *}"
+derive_version="${releases[0]#* }"
+derive_version="${derive_version%% *}"
+schema_version="${releases[2]#* }"
+schema_version="${schema_version%% *}"
+abi_derive_version="${releases[3]#* }"
+abi_derive_version="${abi_derive_version%% *}"
+abi_version="${releases[4]#* }"
+abi_version="${abi_version%% *}"
 
 require_readme_line sacp-cbor "${root_version%.*}" README.md sacp-cbor-abi/README.md
 require_readme_line sacp-cbor-schema "${schema_version%.*}" README.md sacp-cbor-schema/README.md
 require_readme_line sacp-cbor-abi "${abi_version%.*}" README.md sacp-cbor-abi/README.md
-
-local -a releases=(
-  "sacp-cbor-derive ${derive_version} sacp-cbor-derive"
-  "sacp-cbor ${root_version} sacp-cbor"
-  "sacp-cbor-schema ${schema_version} sacp-cbor-schema"
-  "sacp-cbor-abi-derive ${abi_derive_version} sacp-cbor-abi-derive"
-  "sacp-cbor-abi ${abi_version} sacp-cbor-abi"
-)
 
 for release in "${releases[@]}"; do
   read -r crate version _package <<<"$release"
@@ -206,8 +242,8 @@ done
 # A tag is the final release marker. Never create it until every registry object is observable.
 for release in "${releases[@]}"; do
   read -r crate version _package <<<"$release"
-  if ! is_published "$crate" "$version"; then
-    echo "Refusing to tag: ${crate} ${version} is not observable on crates.io." >&2
+  if ! verify_published_artifact "$crate" "$version"; then
+    echo "Refusing to tag: ${crate} ${version} is not an authenticated equivalent package payload on crates.io." >&2
     exit 1
   fi
 done

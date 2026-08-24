@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/Synext-Solution/sacp-cbor"
 
 [dependencies]
-sacp-cbor = { path = "..", version = "0.17.6", default-features = false, features = ["alloc"] }
+sacp-cbor = { path = "..", version = "=0.17.6", default-features = false, features = ["alloc"] }
 
 [features]
 default = ["std"]

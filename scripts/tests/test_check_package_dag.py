@@ -19,7 +19,13 @@ def fixture():
             {"name": "derive", "responsibility": "macros"},
         ],
         "edge": [
-            {"from": "api", "to": "derive", "kind": "normal", "optional": True}
+            {
+                "from": "api",
+                "to": "derive",
+                "kind": "normal",
+                "optional": True,
+                "target": "all",
+            }
         ],
     }
     metadata = {
@@ -34,6 +40,7 @@ def fixture():
                         "kind": None,
                         "optional": True,
                         "source": None,
+                        "target": None,
                     }
                 ],
             },
@@ -51,7 +58,13 @@ class ProductionDagTests(unittest.TestCase):
     def test_undeclared_cargo_edge_is_rejected(self):
         spec, metadata = fixture()
         metadata["packages"][1]["dependencies"].append(
-            {"name": "api", "kind": None, "optional": False, "source": None}
+            {
+                "name": "api",
+                "kind": None,
+                "optional": False,
+                "source": None,
+                "target": None,
+            }
         )
         errors = dag.validate(spec, metadata)
         self.assertTrue(
@@ -66,6 +79,38 @@ class ProductionDagTests(unittest.TestCase):
         self.assertTrue(any("declared edge is absent" in error for error in errors), errors)
         self.assertTrue(any("undeclared production edge" in error for error in errors), errors)
 
+    def test_target_specific_edge_cannot_hide_behind_unconditional_edge(self):
+        spec, metadata = fixture()
+        metadata = copy.deepcopy(metadata)
+        metadata["packages"][0]["dependencies"].append(
+            {
+                "name": "derive",
+                "kind": None,
+                "optional": True,
+                "source": None,
+                "target": "cfg(unix)",
+            }
+        )
+        errors = dag.validate(spec, metadata)
+        self.assertTrue(any("cfg(unix)" in error for error in errors), errors)
+        self.assertTrue(any("undeclared production edge" in error for error in errors), errors)
+
+    def test_build_dependency_cannot_hide_behind_normal_dependency(self):
+        spec, metadata = fixture()
+        metadata = copy.deepcopy(metadata)
+        metadata["packages"][0]["dependencies"].append(
+            {
+                "name": "derive",
+                "kind": "build",
+                "optional": True,
+                "source": None,
+                "target": None,
+            }
+        )
+        errors = dag.validate(spec, metadata)
+        self.assertTrue(any("'build'" in error for error in errors), errors)
+        self.assertTrue(any("undeclared production edge" in error for error in errors), errors)
+
     def test_cycle_is_rejected(self):
         spec, metadata = fixture()
         spec = copy.deepcopy(spec)
@@ -75,10 +120,17 @@ class ProductionDagTests(unittest.TestCase):
             "to": "api",
             "kind": "normal",
             "optional": False,
+            "target": "all",
         }
         spec["edge"].append(reverse)
         metadata["packages"][1]["dependencies"].append(
-            {"name": "api", "kind": None, "optional": False, "source": None}
+            {
+                "name": "api",
+                "kind": None,
+                "optional": False,
+                "source": None,
+                "target": None,
+            }
         )
         errors = dag.validate(spec, metadata)
         self.assertTrue(any("dependency cycle" in error for error in errors), errors)

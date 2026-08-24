@@ -27,18 +27,27 @@ def load_metadata(root: Path) -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
-def declared_edges(spec: dict[str, Any]) -> set[tuple[str, str, str, bool]]:
+Edge = tuple[str, str, str, bool, str]
+
+
+def declared_edges(spec: dict[str, Any]) -> set[Edge]:
     return {
-        (edge["from"], edge["to"], edge["kind"], edge["optional"])
+        (
+            edge["from"],
+            edge["to"],
+            edge["kind"],
+            edge["optional"],
+            edge["target"],
+        )
         for edge in spec.get("edge", [])
     }
 
 
-def metadata_edges(metadata: dict[str, Any]) -> set[tuple[str, str, str, bool]]:
+def metadata_edges(metadata: dict[str, Any]) -> set[Edge]:
     workspace_ids = set(metadata["workspace_members"])
     packages = {package["id"]: package for package in metadata["packages"]}
     workspace_names = {packages[package_id]["name"] for package_id in workspace_ids}
-    edges: set[tuple[str, str, str, bool]] = set()
+    edges: set[Edge] = set()
     for package_id in workspace_ids:
         package = packages[package_id]
         for dependency in package["dependencies"]:
@@ -51,6 +60,7 @@ def metadata_edges(metadata: dict[str, Any]) -> set[tuple[str, str, str, bool]]:
                     dependency["name"],
                     kind,
                     dependency["optional"],
+                    dependency.get("target") or "all",
                 )
             )
     return edges
@@ -87,13 +97,15 @@ def validate(spec: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
     edges = declared_edges(spec)
     if len(edge_entries) != len(edges):
         errors.append("production DAG declares an edge more than once")
-    for source, target, kind, _optional in edges:
+    for source, target, kind, _optional, dependency_target in edges:
         if source not in declared_names or target not in declared_names:
             errors.append(f"edge {source} -> {target} refers to an undeclared package")
         if source == target:
             errors.append(f"self dependency is forbidden: {source} -> {target}")
         if kind not in {"normal", "build"}:
             errors.append(f"edge {source} -> {target} has invalid production kind {kind!r}")
+        if not isinstance(dependency_target, str) or not dependency_target:
+            errors.append(f"edge {source} -> {target} has an invalid target selector")
 
     actual_edges = metadata_edges(metadata)
     for edge in sorted(edges - actual_edges):
@@ -102,7 +114,7 @@ def validate(spec: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
         errors.append(f"undeclared production edge in Cargo metadata: {edge}")
 
     adjacency = {name: set() for name in declared_names}
-    for source, target, _kind, _optional in edges:
+    for source, target, _kind, _optional, _dependency_target in edges:
         if source in adjacency and target in adjacency:
             adjacency[source].add(target)
 

@@ -13,8 +13,8 @@ default = ["derive"]
 derive = ["dep:sacp-cbor-abi-derive"]
 
 [dependencies]
-sacp-cbor = { path = "..", version = "0.17.6", default-features = false, features = ["alloc"] }
-sacp-cbor-abi-derive = { path = "../sacp-cbor-abi-derive", version = "0.3.0", optional = true }
+sacp-cbor = { path = "..", version = "=0.17.6", default-features = false, features = ["alloc"] }
+sacp-cbor-abi-derive = { path = "../sacp-cbor-abi-derive", version = "=0.3.0", optional = true }
 sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
