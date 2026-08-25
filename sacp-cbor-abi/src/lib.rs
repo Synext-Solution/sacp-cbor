@@ -1290,8 +1290,11 @@ impl<'de, T: AbiDecode<'de>> AbiDecode<'de> for Vec<T> {
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
     ) -> Result<Self, CborError> {
+        let array_off = decoder.position();
         let mut array = decoder.array()?;
         let mut out = Vec::new();
+        out.try_reserve_exact(array.remaining())
+            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, array_off))?;
         while let Some(value) = array.decode_next(AbiDecode::abi_decode)? {
             out.push(value);
         }

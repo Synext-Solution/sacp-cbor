@@ -1038,6 +1038,12 @@ fn decode_field_set_body(
     let unknown_decl = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
         quote! {
             let mut __abi_unknown_fields = #abi_path::__private::Vec::<#abi_path::UnknownField>::new();
+            __abi_unknown_fields
+                .try_reserve_exact(__abi_array.remaining() / 2)
+                .map_err(|_| #cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::AllocationFailed,
+                    __abi_arr_off,
+                ))?;
         }
     } else {
         quote! {}

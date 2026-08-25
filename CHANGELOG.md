@@ -52,6 +52,9 @@ Published crates:
 - Runtime admission uses explicit work limits and caller-prepared reusable
   frame storage, so deep validation is stack-safe and allocation-free after
   preparation.
+- Owned vector decoding and generated unknown-field preservation reserve their
+  complete bounded capacity before the first element is stored and report
+  allocation refusal as `AllocationFailed` at the enclosing array offset.
 
 ### `sacp-cbor-abi-derive`
 
