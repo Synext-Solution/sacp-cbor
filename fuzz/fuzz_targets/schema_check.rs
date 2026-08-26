@@ -3,8 +3,12 @@
 use libfuzzer_sys::fuzz_target;
 use sacp_cbor::{validate_canonical, DecodeLimits, ValidationOptions};
 use sacp_cbor_schema::{
-    Constraint, CountUnit, Coupling, FieldDef, FieldType, Int, RecordDef, RecordSchema, UnionAlt,
+    Constraint, CountUnit, Coupling, FieldDef, FieldType, Int, RecordDef, RecordSchema,
+    SchemaCompileLimits, UnionAlt,
 };
+
+const SCHEMA_COMPILE_LIMITS: SchemaCompileLimits =
+    SchemaCompileLimits::new(64, 16, 64, 16, 32, 4096, 64 * 1024);
 
 fn schemas() -> Vec<RecordSchema> {
     let basic = RecordDef {
@@ -81,7 +85,10 @@ fn schemas() -> Vec<RecordSchema> {
 
     [basic, complex]
         .iter()
-        .filter_map(|def| RecordSchema::compile(def).ok())
+        .map(|def| {
+            RecordSchema::compile(def, SCHEMA_COMPILE_LIMITS)
+                .expect("fixed fuzz schema must remain within its declared compile limits")
+        })
         .collect()
 }
 
