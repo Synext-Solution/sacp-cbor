@@ -6,7 +6,50 @@ use crate::profile::{
     NEGATIVE_ZERO_BITS,
 };
 use crate::wire::{read_len_at, read_uint_arg_at};
-use crate::{CborError, EncodeError, EncodeLimits, Encoder, ErrorCode};
+use crate::{ByteSink, CborError, EncodeError, EncodeLimits, Encoder, ErrorCode};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TwoByteSinkError;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TwoByteSink {
+    bytes: [u8; 2],
+    len: usize,
+}
+
+impl TwoByteSink {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 2],
+            len: 0,
+        }
+    }
+}
+
+impl ByteSink for TwoByteSink {
+    type Error = TwoByteSinkError;
+    type Output = [u8; 2];
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let Some(end) = self.len.checked_add(bytes.len()) else {
+            return Err(TwoByteSinkError);
+        };
+        if end > self.bytes.len() {
+            return Err(TwoByteSinkError);
+        }
+        self.bytes[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        if self.len == self.bytes.len() {
+            Ok(self.bytes)
+        } else {
+            Err(TwoByteSinkError)
+        }
+    }
+}
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
     match actual {
@@ -286,7 +329,9 @@ fn encoder_root_slot_accepts_exactly_one_value() {
 
 #[kani::proof]
 fn encoder_array_slot_conservation_for_one_scalar() {
-    let mut enc = Encoder::new();
+    // Keep the proof focused on the encoder state machine. A fixed output object preserves the
+    // exact-byte assertion without asking the solver to model output-`Vec` growth and equality.
+    let mut enc = Encoder::with_sink(TwoByteSink::new());
     enc.array(1, |array| array.null()).unwrap();
     let out = enc.finish().unwrap();
     assert!(out == [0x81, 0xf6]);
