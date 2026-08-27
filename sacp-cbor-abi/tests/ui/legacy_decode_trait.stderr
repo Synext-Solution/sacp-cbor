@@ -1,0 +1,15 @@
+error[E0107]: trait takes 1 generic argument but 0 generic arguments were supplied
+ --> tests/ui/legacy_decode_trait.rs:3:35
+  |
+3 | fn requires_legacy_decode<'de, T: AbiDecode<'de>>() {}
+  |                                   ^^^^^^^^^ expected 1 generic argument
+  |
+note: trait defined here, with 1 generic parameter: `C`
+ --> src/lib.rs
+  |
+  | pub trait AbiDecode<'de, C: AbiDecodeContext + ?Sized>: Sized {
+  |           ^^^^^^^^^      -
+help: add missing generic argument
+  |
+3 | fn requires_legacy_decode<'de, T: AbiDecode<'de, C>>() {}
+  |                                                +++

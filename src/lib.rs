@@ -81,7 +81,10 @@
 //! Validation and borrowed query traversal are allocation-free. Owned APIs use fallible reservation
 //! helpers for `Vec`, `String`, and `Box<str>` construction and report [`ErrorCode::AllocationFailed`]
 //! where Rust exposes allocation failure. Standard-library collections may still abort on process
-//! OOM inside their own insertion routines.
+//! OOM inside their own insertion routines. [`Decoder::decode_text_with_guard`],
+//! [`Decoder::decode_bytes_with_guard`], [`ArrayDecoder::admit_with`], and
+//! [`Decoder::decode_canonical_with_guard`] expose validated sizes at the last core-owned boundary
+//! before caller payload ownership or allocation.
 //!
 //! ## Feature flags
 //!
@@ -152,7 +155,8 @@ mod int;
 pub use crate::canonical::CanonicalCborRef;
 pub use crate::codec::CborDecode;
 pub use crate::decode::{
-    decode, decode_canonical, ArrayDecoder, Decoder, MapDecoder, MapKey, ScalarKind,
+    decode, decode_canonical, ArrayDecoder, ContainerHeader, Decoder, EncodedValueHeader,
+    MapDecoder, MapKey, PayloadHeader, ScalarKind,
 };
 #[cfg(feature = "alloc")]
 pub use crate::decode::{TraversalSession, TraversalWorkspace};

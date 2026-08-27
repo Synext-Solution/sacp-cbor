@@ -156,7 +156,7 @@ fn struct_abi_uses_sorted_numeric_ids() {
     assert_abi_vector("transfer-basic", &value, "880101020203183204626f6b");
 
     let bytes = encode_to_vec(&value).unwrap();
-    let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded, value);
 }
 
@@ -197,7 +197,8 @@ fn type_override_keeps_schema_identity_stable() {
 #[test]
 fn borrowed_text_fields_decode_without_copying() {
     let bytes = [0x82, 0x01, 0x63, b'a', b'd', b'a'];
-    let decoded: Borrowed<'_> = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Borrowed<'_> =
+        decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded.name, "ada");
 
     let start = bytes.as_ptr() as usize;
@@ -239,7 +240,7 @@ fn generated_view_accessors_are_zero_copy() {
     assert_eq!(unknown[0].id, 9);
     assert_eq!(unknown[0].value.as_bytes(), &[0xf5]);
 
-    assert_eq!(view.to_owned().unwrap(), value);
+    assert_eq!(view.to_owned(&mut ()).unwrap(), value);
 }
 
 #[test]
@@ -256,7 +257,7 @@ fn generated_view_integer_accessors_preserve_bignum_semantics() {
 
     assert_eq!(view.amount().unwrap(), u64::MAX);
     assert_eq!(view.amount_raw().unwrap().as_bytes()[0], 0xc2);
-    assert_eq!(view.to_owned().unwrap(), value);
+    assert_eq!(view.to_owned(&mut ()).unwrap(), value);
 }
 
 #[test]
@@ -264,7 +265,7 @@ fn generated_view_arrays_decode_items_lazily() {
     let bytes = [
         0x84, 0x01, 0x82, 0x01, 0x63, b'b', b'a', b'd', 0x02, 0x62, b'o', b'k',
     ];
-    assert_abi_rejects::<VectorPayload>(&bytes, ErrorCode::ExpectedInteger);
+    assert_abi_rejects::<VectorPayload, _>(&bytes, ErrorCode::ExpectedInteger, &mut ());
     let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let view = VectorPayloadView::from_canonical(canon.as_canonical_ref()).unwrap();
 
@@ -275,7 +276,7 @@ fn generated_view_arrays_decode_items_lazily() {
     let err = items.get(1).unwrap_err();
     assert_eq!(err.code, ErrorCode::ExpectedInteger);
     assert_eq!(
-        view.to_owned().unwrap_err().code,
+        view.to_owned(&mut ()).unwrap_err().code,
         ErrorCode::ExpectedInteger
     );
 }
@@ -283,10 +284,11 @@ fn generated_view_arrays_decode_items_lazily() {
 #[test]
 fn unknown_fields_can_be_ignored_or_preserved() {
     let bytes = [0x84, 0x01, 0x05, 0x02, 0xf5];
-    let decoded: Lenient = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Lenient = decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded, Lenient { value: 5 });
 
-    let decoded: Preserving = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Preserving =
+        decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded.value, 5);
     assert_eq!(decoded.unknown.len(), 1);
     assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
@@ -295,7 +297,7 @@ fn unknown_fields_can_be_ignored_or_preserved() {
 #[test]
 fn generated_view_rejects_invalid_field_ids() {
     let zero_unknown = [0x84, 0x00, 0xf5, 0x01, 0x05];
-    assert_abi_rejects::<Lenient>(&zero_unknown, ErrorCode::InvalidAbiValue);
+    assert_abi_rejects::<Lenient, _>(&zero_unknown, ErrorCode::InvalidAbiValue, &mut ());
     let canon =
         CanonicalCbor::from_slice(&zero_unknown, DecodeLimits::for_bytes(zero_unknown.len()))
             .unwrap();
@@ -331,7 +333,8 @@ fn enum_abi_preserves_unknown_variants() {
         "8209f5",
     );
 
-    let decoded: Decision = decode(&[0x82, 0x09, 0xf5], DecodeLimits::for_bytes(3)).unwrap();
+    let decoded: Decision =
+        decode(&[0x82, 0x09, 0xf5], DecodeLimits::for_bytes(3), &mut ()).unwrap();
     assert!(matches!(
         decoded,
         Decision::Unknown(UnknownVariant { id: 9, .. })
@@ -362,7 +365,7 @@ fn generated_enum_view_validates_and_caches_payload() {
     assert_eq!(unknown.id, 9);
     assert_eq!(unknown.payload.as_bytes(), &[0xf5]);
 
-    assert_abi_rejects::<Decision>(&[0x82, 0x00, 0xf5], ErrorCode::InvalidAbiValue);
+    assert_abi_rejects::<Decision, _>(&[0x82, 0x00, 0xf5], ErrorCode::InvalidAbiValue, &mut ());
     let zero = CanonicalCbor::from_slice(&[0x82, 0x00, 0xf5], DecodeLimits::for_bytes(3)).unwrap();
     let err = DecisionView::from_canonical(zero.as_canonical_ref()).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidAbiValue);
@@ -373,35 +376,48 @@ fn transparent_newtype_uses_inner_wire_encoding() {
     let value = AccountId(String::from("abc"));
     assert_abi_vector("account-id", &value, "63616263");
 
-    let decoded: AccountId = decode(&[0x63, b'a', b'b', b'c'], DecodeLimits::for_bytes(4)).unwrap();
+    let decoded: AccountId = decode(
+        &[0x63, b'a', b'b', b'c'],
+        DecodeLimits::for_bytes(4),
+        &mut (),
+    )
+    .unwrap();
     assert_eq!(decoded, value);
 }
 
 #[test]
-fn transparent_validation_failure_is_an_abi_value_error() {
-    assert_abi_rejects::<ValidatedAccountId>(&[0x60], ErrorCode::InvalidAbiValue);
+fn transparent_semantic_invariant_is_checked_only_by_owned_decode() {
+    assert_abi_rejects::<ValidatedAccountId, _>(&[0x60], ErrorCode::InvalidAbiValue, &mut ());
 
     let canon = CanonicalCbor::from_slice(&[0x60], DecodeLimits::for_bytes(1)).unwrap();
-    let err = ValidatedAccountIdView::from_canonical(canon.as_canonical_ref()).unwrap_err();
+    let view = ValidatedAccountIdView::from_canonical(canon.as_canonical_ref()).unwrap();
+    assert_eq!(view.inner().unwrap(), "");
+    let err = view.to_owned(&mut ()).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidAbiValue);
 }
 
 #[test]
 fn decode_rejects_missing_unknown_duplicate_and_unsorted_fields() {
-    assert_abi_rejects::<Transfer>(&[0x84, 0x01, 0x01, 0x02, 0x02], ErrorCode::MissingKey);
+    assert_abi_rejects::<Transfer, _>(
+        &[0x84, 0x01, 0x01, 0x02, 0x02],
+        ErrorCode::MissingKey,
+        &mut (),
+    );
 
     let unknown = [
         0x88, 0x01, 0x01, 0x02, 0x02, 0x03, 0x18, 0x32, 0x18, 0x63, 0x00,
     ];
-    assert_abi_rejects::<Transfer>(&unknown, ErrorCode::UnknownField);
+    assert_abi_rejects::<Transfer, _>(&unknown, ErrorCode::UnknownField, &mut ());
 
-    assert_abi_rejects::<Transfer>(
+    assert_abi_rejects::<Transfer, _>(
         &[0x86, 0x01, 0x01, 0x01, 0x02, 0x03, 0x18, 0x32],
         ErrorCode::DuplicateMapKey,
+        &mut (),
     );
-    assert_abi_rejects::<Transfer>(
+    assert_abi_rejects::<Transfer, _>(
         &[0x86, 0x02, 0x02, 0x01, 0x01, 0x03, 0x18, 0x32],
         ErrorCode::NonCanonicalMapOrder,
+        &mut (),
     );
 }
 

@@ -34,11 +34,15 @@ pub(crate) fn derive_struct_view(
     let self_ty = quote!(#name #view_ty_generics);
     let to_owned = quote! {
         #[inline]
-        pub fn to_owned(
+        pub fn to_owned<__C>(
             &self,
-        ) -> ::core::result::Result<#self_ty, #cbor_path::CborError> {
+            context: &mut __C,
+        ) -> ::core::result::Result<#self_ty, __C::Error>
+        where
+            __C: #abi_path::AbiDecodeContext + ?Sized,
+        {
             let __abi_canon = self.raw.as_canonical_ref();
-            #abi_path::decode_canonical(__abi_canon)
+            #abi_path::decode_canonical(__abi_canon, context)
         }
     };
 
@@ -85,15 +89,8 @@ fn derive_transparent_struct_view(
     let view_ty_generics = ty_generics_with_lifetime(generics, &view_lifetime);
     let self_ty = quote!(#name #view_ty_generics);
     let inner_ty = view_type(inner.ty, &view_lifetime);
-    let validate_invariants = if attrs.try_from.is_some() {
-        quote! {
-            let __abi_canon = value.as_canonical_ref();
-            let _: #self_ty = #abi_path::decode_canonical(__abi_canon)?;
-        }
-    } else {
-        quote! {
-            let _ = <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field(value)?;
-        }
+    let validate_invariants = quote! {
+        let _ = <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field(value)?;
     };
 
     Ok(quote! {
@@ -135,11 +132,15 @@ fn derive_transparent_struct_view(
             }
 
             #[inline]
-            pub fn to_owned(
+            pub fn to_owned<__C>(
                 &self,
-            ) -> ::core::result::Result<#self_ty, #cbor_path::CborError> {
+                context: &mut __C,
+            ) -> ::core::result::Result<#self_ty, __C::Error>
+            where
+                __C: #abi_path::AbiDecodeContext + ?Sized,
+            {
                 let __abi_canon = self.raw.as_canonical_ref();
-                #abi_path::decode_canonical(__abi_canon)
+                #abi_path::decode_canonical(__abi_canon, context)
             }
         }
 

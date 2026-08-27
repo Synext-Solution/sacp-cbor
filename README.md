@@ -31,8 +31,8 @@ This repository publishes five crates with different responsibilities:
 | `sacp-cbor` | `0.18` | Canonical CBOR validation, zero-copy query, encoding, editing, and optional serde integration. |
 | `sacp-cbor-derive` | `0.18` | Companion derive macros for the Rust-shape codec; normally enabled through `sacp-cbor`'s `derive` feature. |
 | `sacp-cbor-schema` | `0.2` | Closed-record schema validation over canonical values, with explicit compile/validation limits and replayable inclusion results. |
-| `sacp-cbor-abi` | `0.7` | Stable public ABI schemas, numeric field/variant IDs, structural runtime admission, compatibility reports, and zero-copy ABI views. |
-| `sacp-cbor-abi-derive` | `0.4` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
+| `sacp-cbor-abi` | `0.8` | Stable public ABI schemas, numeric field/variant IDs, structural runtime admission, compatibility reports, and zero-copy ABI views. |
+| `sacp-cbor-abi-derive` | `0.5` | Companion `#[derive(CborAbi)]` macro; normally enabled through `sacp-cbor-abi`'s default `derive` feature. |
 
 Use `sacp-cbor` for canonical CBOR infrastructure and internal Rust-shape codecs. Use
 `sacp-cbor-abi` for public protocols that must remain stable across Rust refactors. Use
@@ -735,7 +735,12 @@ let value = Transfer {
 };
 
 let bytes = encode_to_vec(&value)?;
-let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+let mut context = ();
+let decoded: Transfer = decode(
+    &bytes,
+    DecodeLimits::for_bytes(bytes.len()),
+    &mut context,
+)?;
 assert_eq!(decoded, value);
 
 let wire_hash = Transfer::schema().wire_hash()?;
@@ -761,6 +766,23 @@ Field IDs and variant IDs must be nonzero `u32` values. On the wire, ABI field-s
 strictly increasing; duplicate, decreasing, zero, and odd-length field-set arrays are rejected.
 Required `Option<T>` fields are rejected at derive time; optional fields must be declared with
 `#[abi(optional)]` and are omitted when `None`.
+
+### Context-aware owned admission
+
+Owned ABI decoding always takes one explicit `AbiDecodeContext`. The same mutable context is
+threaded through the complete recursive decode. Its typed `admit` hook observes the stable
+type/variant/field location and the declared length of each owned `Vec`, `String`, `Bytes`, retained
+canonical payload, or preserved unknown before the first corresponding reservation or copy. Core
+header canonicality and declared-length `DecodeLimits` are checked first. Hook errors remain in the
+caller's error domain; core and allocation failures convert through `From<CborError>`. Truncation or
+invalid UTF-8 can fail after admission, so a stateful context belongs to the decode transaction and
+must be discarded or rolled back if decoding fails.
+
+Pass `&mut ()` when `DecodeLimits` are the complete admission policy. Protocols with aggregate or
+field-specific budgets implement `AbiDecodeContext` and return their own typed refusal. Borrowed
+`&str`, `BytesRef`, and `CanonicalCborRef` values do not trigger owned-admission hooks. Final semantic
+types should be the ABI declarations themselves; decoding through an intermediate ABI DTO and then
+copying into a second owner defeats this boundary.
 
 Enums encode as `[variant_id, payload]`. Unit variants use `null`; named variants use the same
 field-set encoding as structs:
@@ -804,7 +826,7 @@ assert_eq!(view.memo()?, None);
 let raw_amount = view.amount_raw()?;
 assert_eq!(raw_amount.as_bytes(), &[0x19, 0x13, 0x88]); // 5000
 
-let owned_again = view.to_owned()?;
+let owned_again = view.to_owned(&mut context)?;
 assert_eq!(owned_again, value);
 ```
 
@@ -819,8 +841,9 @@ View accessor mapping is chosen for borrowing:
 
 Named enum payload views are validated and cached during enum view construction, so repeated
 `as_route()` calls do not rescan the payload field-set. Transparent newtypes encode exactly like
-their inner type while keeping a named ABI identity; if `#[abi(try_from = "...")]` is present, the
-view constructor enforces the same invariant as owned decode.
+their inner type while keeping a named ABI identity. Borrowed view construction validates the wire
+shape without allocating; a `#[abi(try_from = "...")]` semantic invariant is enforced by explicit
+owned decode or `view.to_owned(context)`.
 
 ### Unknown fields
 
@@ -1200,6 +1223,14 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 - `decode(bytes, limits) -> Result<T, CborError>`
 - `decode_canonical(canon_ref, limits) -> Result<T, CborError>`
+- `Decoder::decode_text_with_guard` / `decode_bytes_with_guard` expose a core-limited declared
+  payload length before reading the payload
+- `ArrayDecoder::admit_with` exposes a core-limited element count before caller allocation
+- `Decoder::decode_canonical_with_guard` exposes a validated encoded length before caller ownership
+- `sacp_cbor_abi::decode(bytes, limits, context) -> Result<T, C::Error>`
+- `sacp_cbor_abi::decode_canonical(canon_ref, context) -> Result<T, C::Error>`
+- `sacp_cbor_abi::AbiDecodeContext::admit(location, value)` observes owned semantic lengths after core structural
+  admission and before the first corresponding reservation or copy
 - `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)
 - `encode_to_canonical(&value) -> Result<CanonicalCbor, CborError>` (`alloc`)
 - `CborEncode::encode` receives a `ValueEncoder`, not the underlying encoder;

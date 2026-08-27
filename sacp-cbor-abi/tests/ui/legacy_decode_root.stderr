@@ -1,0 +1,15 @@
+error[E0061]: this function takes 3 arguments but 2 arguments were supplied
+ --> tests/ui/legacy_decode_root.rs:5:18
+  |
+5 |     let _: u64 = sacp_cbor_abi::decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+  |                  ^^^^^^^^^^^^^^^^^^^^^---------------------------------------------- argument #3 of type `&mut _` is missing
+  |
+note: function defined here
+ --> src/lib.rs
+  |
+  | pub fn decode<'de, T, C>(
+  |        ^^^^^^
+help: provide the argument
+  |
+5 |     let _: u64 = sacp_cbor_abi::decode(&bytes, DecodeLimits::for_bytes(bytes.len()), /* context */).unwrap();
+  |                                                                                    +++++++++++++++

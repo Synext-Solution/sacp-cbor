@@ -64,8 +64,10 @@ pub struct Decoder<'de, const CHECKED: bool> {
 /// operations on that decoder return the stored malformed-canonical error.
 pub struct ArrayDecoder<'a, 'de, const CHECKED: bool> {
     decoder: &'a mut Decoder<'de, CHECKED>,
+    header_offset: usize,
     remaining: usize,
     entered: bool,
+    admission_open: bool,
 }
 
 /// Map decoder guard that manages depth, length, and key ordering.
@@ -439,6 +441,116 @@ pub enum ScalarKind {
     Float,
 }
 
+/// Declared framing metadata for a text or byte-string payload.
+///
+/// This is passed to the guarded payload decode APIs after the header and canonical length have
+/// been decoded and the decoder's resource limit has been enforced, but before the payload bytes
+/// are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadHeader {
+    header_offset: usize,
+    declared_len: usize,
+}
+
+impl PayloadHeader {
+    /// Return the byte offset of the text or byte-string header.
+    #[must_use]
+    pub const fn header_offset(self) -> usize {
+        self.header_offset
+    }
+
+    /// Return the payload length declared by the header.
+    #[must_use]
+    pub const fn declared_len(self) -> usize {
+        self.declared_len
+    }
+}
+
+/// Declared framing metadata for a container.
+///
+/// This is passed to [`ArrayDecoder::admit_with`] after the array header, canonical length, and
+/// decoder limits have been checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerHeader {
+    header_offset: usize,
+    declared_len: usize,
+}
+
+/// Framing metadata for one complete canonical encoded value.
+///
+/// This is passed to [`Decoder::decode_canonical_with_guard`] after the value has been traversed
+/// and validated against the decoder's grammar and resource limits, but before a caller can copy
+/// the encoded bytes into owned storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedValueHeader {
+    header_offset: usize,
+    encoded_len: usize,
+}
+
+impl EncodedValueHeader {
+    /// Return the byte offset of the encoded value's initial byte.
+    #[must_use]
+    pub const fn header_offset(self) -> usize {
+        self.header_offset
+    }
+
+    /// Return the complete encoded length of the value.
+    #[must_use]
+    pub const fn encoded_len(self) -> usize {
+        self.encoded_len
+    }
+}
+
+impl ContainerHeader {
+    /// Return the byte offset of the container header.
+    #[must_use]
+    pub const fn header_offset(self) -> usize {
+        self.header_offset
+    }
+
+    /// Return the number of elements declared by the container header.
+    #[must_use]
+    pub const fn declared_len(self) -> usize {
+        self.declared_len
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PayloadKind {
+    Bytes,
+    Text,
+}
+
+impl PayloadKind {
+    const fn major(self) -> u8 {
+        match self {
+            Self::Bytes => 2,
+            Self::Text => 3,
+        }
+    }
+
+    const fn expected_error(self) -> ErrorCode {
+        match self {
+            Self::Bytes => ErrorCode::ExpectedBytes,
+            Self::Text => ErrorCode::ExpectedText,
+        }
+    }
+
+    const fn limit(self, limits: &DecodeLimits) -> usize {
+        match self {
+            Self::Bytes => limits.max_bytes_len,
+            Self::Text => limits.max_text_len,
+        }
+    }
+
+    const fn limit_error(self) -> ErrorCode {
+        match self {
+            Self::Bytes => ErrorCode::BytesLenLimitExceeded,
+            Self::Text => ErrorCode::TextLenLimitExceeded,
+        }
+    }
+}
+
 /// Text key metadata returned by [`MapDecoder::next_key_ref`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapKey<'de> {
@@ -502,40 +614,6 @@ impl<'de> Decoder<'de, true> {
     ) -> Result<Self, CborError> {
         Self::new_with(bytes, limits, options)
     }
-
-    /// Complete a checked pass and return the canonical witness.
-    ///
-    /// Succeeds only when this decoder consumed the input as **exactly one
-    /// canonical item**: no poisoned container guard, no trailing bytes,
-    /// and exactly one value completed at the root. Every consuming method
-    /// of a checked decoder applies the same canonical-grammar checks as
-    /// [`validate_canonical`](crate::validate_canonical) (and the same
-    /// restriction modes as
-    /// [`validate_canonical_with`](crate::validate_canonical_with) when
-    /// constructed via [`new_checked_with`](Self::new_checked_with)), so a
-    /// successful `finish` attests the same property — one validation-grade
-    /// pass, no second traversal.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stored poison, `TrailingBytes` when input remains, or
-    /// `MalformedCanonical` when the pass did not consume exactly one root
-    /// value.
-    pub fn finish(self) -> Result<CanonicalCborRef<'de>, CborError> {
-        self.check_poison()?;
-        let pos = self.cursor.position();
-        let data = self.cursor.data();
-        if pos != data.len() {
-            return Err(CborError::new(ErrorCode::TrailingBytes, pos));
-        }
-        if self.root_values != 1 {
-            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
-        }
-        if self.active_traversal_id.is_some() {
-            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
-        }
-        Ok(CanonicalCborRef::new(data))
-    }
 }
 
 impl<'de> Decoder<'de, false> {
@@ -555,6 +633,35 @@ impl<'de> Decoder<'de, false> {
 }
 
 impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
+    /// Complete a decode pass and return the canonical witness.
+    ///
+    /// Succeeds only when this decoder consumed the input as **exactly one canonical item**: no
+    /// poisoned container guard, no trailing bytes, and exactly one value completed at the root.
+    /// A checked decoder enforces the same canonical grammar as
+    /// [`validate_canonical`](crate::validate_canonical) during that single pass. A trusted decoder
+    /// preserves the canonical witness supplied to [`new_trusted`](Decoder::new_trusted) while
+    /// enforcing the same completion protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stored poison, `TrailingBytes` when input remains, or `MalformedCanonical` when
+    /// the pass did not consume exactly one root value.
+    pub fn finish(self) -> Result<CanonicalCborRef<'de>, CborError> {
+        self.check_poison()?;
+        let pos = self.cursor.position();
+        let data = self.cursor.data();
+        if pos != data.len() {
+            return Err(CborError::new(ErrorCode::TrailingBytes, pos));
+        }
+        if CHECKED && self.root_values != 1 {
+            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
+        }
+        if self.active_traversal_id.is_some() {
+            return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
+        }
+        Ok(CanonicalCborRef::new(data))
+    }
+
     /// Run an explicitly-driven traversal in a fresh generative brand.
     ///
     /// The branded session cannot escape `f` or be unified with a session for another decoder.
@@ -790,6 +897,103 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             return Err(CborError::new(ErrorCode::BytesLenLimitExceeded, off));
         }
         self.cursor.read_exact(len)
+    }
+
+    /// Decode a text string after giving the caller one opportunity to admit its declared payload
+    /// length.
+    ///
+    /// The guard runs after the text header, canonical length, and [`DecodeLimits::max_text_len`]
+    /// have been checked, but before the payload is read or UTF-8 is validated. A guard error is
+    /// returned unchanged and poisons the decoder because framing bytes have already been consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the guard's error, or a converted decode error when the value is not canonical text,
+    /// violates the configured limits, is truncated, or contains invalid UTF-8.
+    pub fn decode_text_with_guard<E, F>(&mut self, guard: F) -> Result<&'de str, E>
+    where
+        E: From<CborError>,
+        F: FnOnce(PayloadHeader) -> Result<(), E>,
+    {
+        self.decode_payload_with_guard(PayloadKind::Text, guard, |bytes, off| {
+            if CHECKED {
+                crate::utf8::validate_utf8(bytes)
+                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))
+            } else {
+                crate::utf8::trusted(bytes)
+                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))
+            }
+        })
+    }
+
+    /// Decode a byte string after giving the caller one opportunity to admit its declared payload
+    /// length.
+    ///
+    /// The guard runs after the byte-string header, canonical length, and
+    /// [`DecodeLimits::max_bytes_len`] have been checked, but before the payload is read. A guard
+    /// error is returned unchanged and poisons the decoder because framing bytes have already been
+    /// consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the guard's error, or a converted decode error when the value is not a canonical byte
+    /// string, violates the configured limits, or is truncated.
+    pub fn decode_bytes_with_guard<E, F>(&mut self, guard: F) -> Result<&'de [u8], E>
+    where
+        E: From<CborError>,
+        F: FnOnce(PayloadHeader) -> Result<(), E>,
+    {
+        self.decode_payload_with_guard(PayloadKind::Bytes, guard, |bytes, _| Ok(bytes))
+    }
+
+    fn decode_payload_with_guard<T, E, F, P>(
+        &mut self,
+        kind: PayloadKind,
+        guard: F,
+        parse: P,
+    ) -> Result<T, E>
+    where
+        E: From<CborError>,
+        F: FnOnce(PayloadHeader) -> Result<(), E>,
+        P: FnOnce(&'de [u8], usize) -> Result<T, CborError>,
+    {
+        if let Err(err) = self.check_poison() {
+            return Err(E::from(err));
+        }
+
+        let header = (|| {
+            let (major, ai, off) = self.read_header()?;
+            if major != kind.major() {
+                return Err(CborError::new(kind.expected_error(), off));
+            }
+            let len = self.read_len(ai, off)?;
+            if len > kind.limit(&self.limits) {
+                return Err(CborError::new(kind.limit_error(), off));
+            }
+            Ok(PayloadHeader {
+                header_offset: off,
+                declared_len: len,
+            })
+        })();
+
+        let header = match header {
+            Ok(header) => header,
+            Err(err) => {
+                self.poison_err(err);
+                return Err(E::from(err));
+            }
+        };
+
+        if let Err(err) = guard(header) {
+            self.poison(ErrorCode::MalformedCanonical, header.header_offset);
+            return Err(err);
+        }
+
+        let result = self
+            .cursor
+            .read_exact(header.declared_len)
+            .and_then(|bytes| parse(bytes, header.header_offset));
+        self.seal_value(result).map_err(E::from)
     }
 
     #[inline]
@@ -1123,6 +1327,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// Returns `ExpectedArray` if the next value is not an array, or a limit error.
     pub fn array(&mut self) -> Result<ArrayDecoder<'_, 'de, CHECKED>, CborError> {
         self.require_claimed_traversal_slot()?;
+        let header_offset = self.position();
         let entry = self.array_entry();
         let (len, entered) = self.seal_step(entry)?;
         if !entered {
@@ -1131,8 +1336,10 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         }
         Ok(ArrayDecoder {
             decoder: self,
+            header_offset,
             remaining: len,
             entered,
+            admission_open: true,
         })
     }
 
@@ -1508,6 +1715,38 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         self.seal_value(result)
     }
 
+    /// Decode one complete canonical encoded value after caller admission.
+    ///
+    /// The decoder traverses the value once, enforcing its grammar and resource limits, then calls
+    /// `admit` with the value's offset and encoded length. The callback therefore runs before any
+    /// caller-owned copy while retaining the same single traversal used by [`Self::skip_value`]. A
+    /// callback rejection is sticky: every later decoder operation returns a protocol error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error converted into `E`, or the callback's error unchanged.
+    pub fn decode_canonical_with_guard<E, F>(
+        &mut self,
+        admit: F,
+    ) -> Result<CanonicalCborRef<'de>, E>
+    where
+        E: From<CborError>,
+        F: FnOnce(EncodedValueHeader) -> Result<(), E>,
+    {
+        let start = self.position();
+        self.skip_value().map_err(E::from)?;
+        let end = self.position();
+        let header = EncodedValueHeader {
+            header_offset: start,
+            encoded_len: end - start,
+        };
+        if let Err(err) = admit(header) {
+            self.poison(ErrorCode::MalformedCanonical, start);
+            return Err(err);
+        }
+        Ok(CanonicalCborRef::new(&self.data()[start..end]))
+    }
+
     /// Peek at the kind of the next CBOR value without consuming it.
     ///
     /// # Errors
@@ -1521,6 +1760,40 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
 }
 
 impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
+    /// Admit this array using its already-decoded header metadata.
+    ///
+    /// This consumes and returns the guard so admission cannot be accidentally separated from the
+    /// array traversal. Admission is allowed exactly once and only before the first element is
+    /// consumed. The callback runs after structural and resource-limit checks. Rejecting an empty
+    /// array is sticky even though the array has no elements to consume.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's error unchanged and poisons the underlying decoder. Repeated or late
+    /// admission returns a converted protocol error and also poisons the decoder.
+    pub fn admit_with<E, F>(mut self, admit: F) -> Result<Self, E>
+    where
+        E: From<CborError>,
+        F: FnOnce(ContainerHeader) -> Result<(), E>,
+    {
+        if !self.admission_open {
+            let error = CborError::new(ErrorCode::MalformedCanonical, self.header_offset);
+            self.decoder.poison_err(error);
+            return Err(E::from(error));
+        }
+        self.admission_open = false;
+        let header = ContainerHeader {
+            header_offset: self.header_offset,
+            declared_len: self.remaining,
+        };
+        if let Err(err) = admit(header) {
+            self.decoder
+                .poison(ErrorCode::MalformedCanonical, self.header_offset);
+            return Err(err);
+        }
+        Ok(self)
+    }
+
     /// Remaining elements in the array.
     #[inline]
     #[must_use]
@@ -1546,6 +1819,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         if self.remaining == 0 {
             return Ok(None);
         }
+        self.admission_open = false;
         let value = T::decode(self.decoder)?;
         self.remaining -= 1;
         Ok(Some(value))
@@ -1582,6 +1856,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         if self.remaining == 0 {
             return Ok(None);
         }
+        self.admission_open = false;
         match f(self.decoder) {
             Ok(value) => {
                 self.remaining -= 1;
@@ -1601,6 +1876,9 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if skipping fails.
     pub fn skip_remaining(&mut self) -> Result<(), CborError> {
+        if self.remaining > 0 {
+            self.admission_open = false;
+        }
         while self.remaining > 0 {
             self.decoder.skip_value()?;
             self.remaining -= 1;
@@ -1623,6 +1901,9 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     /// malformed, or violates limits or validation options.
     pub fn skip_scalars(&mut self, kind: ScalarKind) -> Result<(), CborError> {
         self.decoder.check_poison()?;
+        if self.remaining > 0 {
+            self.admission_open = false;
+        }
         while self.remaining > 0 {
             let result = self.decoder.consume_scalar_raw(kind);
             self.decoder.seal_value(result)?;
@@ -1650,6 +1931,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         if self.remaining == 0 {
             return Ok(None);
         }
+        self.admission_open = false;
         let start = self.decoder.position();
         let result = self.decoder.consume_scalar_raw(kind);
         self.decoder.seal_value(result)?;
@@ -1676,6 +1958,9 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     /// decoder like any failed consuming operation.
     pub fn skip_sorted_scalars(&mut self, kind: ScalarKind) -> Result<(), CborError> {
         self.decoder.check_poison()?;
+        if self.remaining > 0 {
+            self.admission_open = false;
+        }
         let data = self.decoder.cursor.data();
         let mut prev: Option<Range<usize>> = None;
         while self.remaining > 0 {

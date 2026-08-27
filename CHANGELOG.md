@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.18.1 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.18.1
+- `sacp-cbor-derive` 0.18.1
+- `sacp-cbor-schema` 0.2.1
+- `sacp-cbor-abi` 0.8.0
+- `sacp-cbor-abi-derive` 0.5.0
+
+### `sacp-cbor`
+
+- Added guarded text and byte payload decode funnels. The caller observes the canonical, core-limited
+  declared length after its header is consumed and before payload read, UTF-8 validation, or owned
+  copy. Caller errors remain typed and poison the single-pass decoder.
+- Added consuming array admission after canonical length and structural limits but before caller
+  allocation. Empty-array refusal is sticky as well.
+- Added guarded canonical-value traversal so callers can admit the validated encoded length before
+  copying the complete value into owned storage.
+- `CanonicalCborRef::to_owned_with_offset` preserves a caller-known absolute input offset in the
+  allocation failure diagnostic for nested canonical values.
+- `Decoder::finish` now closes both checked and canonical-trusted passes with the same poison,
+  trailing-input, and traversal-protocol checks.
+- This is additive: no published core API was removed or changed.
+
+### `sacp-cbor-derive`
+
+- Version-only release required by the root crate's exact companion dependency.
+
+### `sacp-cbor-schema`
+
+- Dependency-only patch release tracking the exact `sacp-cbor` 0.18.1 runtime.
+
+### `sacp-cbor-abi`
+
+- **Breaking:** owned decode has one context-carrying API. `AbiDecode` is parameterized by
+  `AbiDecodeContext`; `decode`, `decode_canonical`, and generated view `to_owned` require the same
+  explicit mutable context. The old context-free trait method and entry-point signatures are removed.
+- `Vec`, `String`, `Bytes`, owned canonical values, and preserved unknowns invoke typed admission
+  after core grammar/length limits and before their first reservation or payload copy. Location
+  metadata identifies the stable type, variant, and field without counting ABI framing arrays as
+  semantic sequences. Borrowed values remain zero-copy and emit no owned-admission event.
+- Preserved unknown fields are admitted and fallibly reserved by actual observed count instead of
+  reserving the enclosing field-set's upper bound.
+- Nested owned canonical values report allocation failure at their actual payload header instead of
+  losing the location at offset zero.
+
+### `sacp-cbor-abi-derive`
+
+- **Breaking:** generated struct, enum, transparent, nested-field, unknown-preservation, and
+  `to_owned` decoders recursively thread one caller context and its typed error domain.
+- Borrowed transparent views no longer allocate an owned value to enforce `try_from`; that semantic
+  invariant is checked by explicit owned decode while view construction validates wire structure.
+
+Release publication now waits for both the authenticated registry artifact and Cargo index
+resolution, including recovery of an identical artifact published by an interrupted prior run.
+
 ## 0.18.0 workspace release
 
 Published crates:

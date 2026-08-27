@@ -69,14 +69,16 @@ wait_for_published() {
   local attempt
   for attempt in $(seq 1 30); do
     local status
-    set +e
-    verify_published_artifact "$crate" "$version"
-    status=$?
-    set -e
-    if [[ "$status" -eq 0 ]] && cargo info "${crate}@${version}" >/dev/null 2>&1; then
-      return 0
+    if verify_published_artifact "$crate" "$version"; then
+      status=0
+    else
+      status=$?
     fi
-    if [[ "$status" -ne "$REGISTRY_MISSING" && "$status" -ne "$REGISTRY_QUERY_FAILED" ]]; then
+    if [[ "$status" -eq 0 ]]; then
+      if cargo info "${crate}@${version}" >/dev/null 2>&1; then
+        return 0
+      fi
+    elif [[ "$status" -ne "$REGISTRY_MISSING" && "$status" -ne "$REGISTRY_QUERY_FAILED" ]]; then
       return "$status"
     fi
     echo "Waiting for ${crate} ${version} to appear on crates.io (${attempt}/30)."
@@ -91,16 +93,18 @@ publish_crate() {
   local version="$2"
   local package="$3"
   local published
-  set +e
-  verify_published_artifact "$crate" "$version"
-  published=$?
-  set -e
+  if verify_published_artifact "$crate" "$version"; then
+    published=0
+  else
+    published=$?
+  fi
   if [[ "$published" -ne 0 && "$published" -ne "$REGISTRY_MISSING" ]]; then
-    exit 1
+    return "$published"
   fi
   if [[ "$published" -eq 0 ]]; then
-    echo "${crate} ${version} is already on crates.io; skipping."
-    return 0
+    echo "${crate} ${version} is already on crates.io; waiting for Cargo resolution."
+    wait_for_published "$crate" "$version"
+    return
   fi
   if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
     echo "CARGO_REGISTRY_TOKEN is not set; cannot publish ${crate} ${version}." >&2
@@ -133,10 +137,11 @@ validate_existing_tag_state() {
   fi
   for release in "$@"; do
     read -r crate version _package <<<"$release"
-    set +e
-    verify_published_artifact "$crate" "$version"
-    published=$?
-    set -e
+    if verify_published_artifact "$crate" "$version"; then
+      published=0
+    else
+      published=$?
+    fi
     if [[ "$published" -ne 0 ]]; then
       echo "Existing ${tag} cannot be recovered: ${crate} ${version} is not confirmed published." >&2
       exit 1

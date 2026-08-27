@@ -597,6 +597,8 @@ fn derive_struct(
         &field_set,
         attrs.unknown_fields,
         quote!(Self),
+        &attrs.type_id,
+        None,
         abi_path,
         cbor_path,
     );
@@ -615,10 +617,15 @@ fn derive_struct(
             }
         }
 
-        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
+        impl<'__sacp_abi, __C> #abi_path::AbiDecode<'__sacp_abi, __C> for #name #decode_ty_generics
+        where
+            __C: #abi_path::AbiDecodeContext + ?Sized,
+        {
             fn abi_decode<const CHECKED: bool>(
                 decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
-            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
+                context: &mut __C,
+                _location: #abi_path::AbiDecodeLocation,
+            ) -> ::core::result::Result<Self, __C::Error> {
                 #decode
             }
         }
@@ -652,7 +659,10 @@ fn derive_transparent_struct(
     let decode_construct = if let Some(try_from) = try_from {
         quote! {
             #try_from(__abi_inner).map_err(|_| {
-                #cbor_path::CborError::new(#cbor_path::ErrorCode::InvalidAbiValue, __abi_off)
+                #abi_path::__private::decode_error::<__C>(
+                    #cbor_path::ErrorCode::InvalidAbiValue,
+                    __abi_off,
+                )
             })
         }
     } else {
@@ -671,12 +681,18 @@ fn derive_transparent_struct(
             }
         }
 
-        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
+        impl<'__sacp_abi, __C> #abi_path::AbiDecode<'__sacp_abi, __C> for #name #decode_ty_generics
+        where
+            __C: #abi_path::AbiDecodeContext + ?Sized,
+        {
             fn abi_decode<const CHECKED: bool>(
                 decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
-            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
+                context: &mut __C,
+                location: #abi_path::AbiDecodeLocation,
+            ) -> ::core::result::Result<Self, __C::Error> {
                 let __abi_off = decoder.position();
-                let __abi_inner: #decode_inner_ty = #abi_path::AbiDecode::abi_decode(decoder)?;
+                let __abi_inner: #decode_inner_ty =
+                    #abi_path::AbiDecode::abi_decode(decoder, context, location)?;
                 #decode_construct
             }
         }
@@ -781,10 +797,15 @@ fn derive_enum(
             }
         }
 
-        impl<'__sacp_abi> #abi_path::AbiDecode<'__sacp_abi> for #name #decode_ty_generics {
+        impl<'__sacp_abi, __C> #abi_path::AbiDecode<'__sacp_abi, __C> for #name #decode_ty_generics
+        where
+            __C: #abi_path::AbiDecodeContext + ?Sized,
+        {
             fn abi_decode<const CHECKED: bool>(
                 decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
-            ) -> ::core::result::Result<Self, #cbor_path::CborError> {
+                context: &mut __C,
+                _location: #abi_path::AbiDecodeLocation,
+            ) -> ::core::result::Result<Self, __C::Error> {
                 #decode
             }
         }
@@ -1027,9 +1048,15 @@ fn decode_field_set_body(
     field_set: &FieldSetSpec<'_>,
     unknown_mode: UnknownFieldMode,
     target: proc_macro2::TokenStream,
+    type_id: &LitStr,
+    variant_id: Option<u32>,
     abi_path: &Path,
     cbor_path: &Path,
 ) -> proc_macro2::TokenStream {
+    let variant_id = match variant_id {
+        Some(id) => quote!(::core::option::Option::Some(#id)),
+        None => quote!(::core::option::Option::None),
+    };
     let storage_decls = field_set.fields.iter().map(|field| {
         let ident = storage_ident(field.ident);
         let ty = &field.decode_ty;
@@ -1038,12 +1065,6 @@ fn decode_field_set_body(
     let unknown_decl = if matches!(unknown_mode, UnknownFieldMode::Preserve) {
         quote! {
             let mut __abi_unknown_fields = #abi_path::__private::Vec::<#abi_path::UnknownField>::new();
-            __abi_unknown_fields
-                .try_reserve_exact(__abi_array.remaining() / 2)
-                .map_err(|_| #cbor_path::CborError::new(
-                    #cbor_path::ErrorCode::AllocationFailed,
-                    __abi_arr_off,
-                ))?;
         }
     } else {
         quote! {}
@@ -1053,18 +1074,27 @@ fn decode_field_set_body(
         let id = field.id;
         let storage = storage_ident(field.ident);
         let decode_ty = &field.decode_wire_ty;
+        let location = quote! {
+            #abi_path::AbiDecodeLocation::Field {
+                type_id: #type_id,
+                variant_id: #variant_id,
+                field_id: #id,
+            }
+        };
         if field.optional {
             quote! {
                 #id => {
                     if #storage.is_some() {
-                        return Err(#cbor_path::CborError::new(
+                        return Err(#abi_path::__private::decode_error::<__C>(
                             #cbor_path::ErrorCode::DuplicateMapKey,
                             __abi_id_off,
                         ));
                     }
                     let __abi_value: #decode_ty = __abi_array
-                        .decode_next(#abi_path::AbiDecode::abi_decode)?
-                        .ok_or_else(|| #cbor_path::CborError::new(
+                        .decode_next_with(|decoder| {
+                            #abi_path::AbiDecode::abi_decode(decoder, context, #location)
+                        })?
+                        .ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                             #cbor_path::ErrorCode::ArrayLenMismatch,
                             __abi_arr_off,
                         ))?;
@@ -1075,14 +1105,16 @@ fn decode_field_set_body(
             quote! {
                 #id => {
                     if #storage.is_some() {
-                        return Err(#cbor_path::CborError::new(
+                        return Err(#abi_path::__private::decode_error::<__C>(
                             #cbor_path::ErrorCode::DuplicateMapKey,
                             __abi_id_off,
                         ));
                     }
                     let __abi_value: #decode_ty = __abi_array
-                        .decode_next(#abi_path::AbiDecode::abi_decode)?
-                        .ok_or_else(|| #cbor_path::CborError::new(
+                        .decode_next_with(|decoder| {
+                            #abi_path::AbiDecode::abi_decode(decoder, context, #location)
+                        })?
+                        .ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                             #cbor_path::ErrorCode::ArrayLenMismatch,
                             __abi_arr_off,
                         ))?;
@@ -1095,7 +1127,7 @@ fn decode_field_set_body(
     let unknown_arm = match unknown_mode {
         UnknownFieldMode::Reject => quote! {
             _ => {
-                return Err(#cbor_path::CborError::new(
+                return Err(#abi_path::__private::decode_error::<__C>(
                     #cbor_path::ErrorCode::UnknownField,
                     __abi_id_off,
                 ));
@@ -1106,7 +1138,7 @@ fn decode_field_set_body(
                 let _: () = __abi_array.decode_next(|decoder| {
                     decoder.skip_value()?;
                     ::core::result::Result::Ok(())
-                })?.ok_or_else(|| #cbor_path::CborError::new(
+                })?.ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                     #cbor_path::ErrorCode::ArrayLenMismatch,
                     __abi_arr_off,
                 ))?;
@@ -1114,9 +1146,30 @@ fn decode_field_set_body(
         },
         UnknownFieldMode::Preserve => quote! {
             _ => {
+                let __abi_location = #abi_path::AbiDecodeLocation::UnknownField {
+                    type_id: #type_id,
+                    variant_id: #variant_id,
+                    field_id: __abi_id,
+                };
+                context.admit(
+                    __abi_location,
+                    #abi_path::AbiDecodeValue::UnknownField { offset: __abi_id_off },
+                )?;
+                __abi_unknown_fields.try_reserve(1).map_err(|_| {
+                    #abi_path::__private::decode_error::<__C>(
+                        #cbor_path::ErrorCode::AllocationFailed,
+                        __abi_arr_off,
+                    )
+                })?;
                 let __abi_value: #cbor_path::CanonicalCbor = __abi_array
-                    .decode_next(#cbor_path::CborDecode::decode)?
-                    .ok_or_else(|| #cbor_path::CborError::new(
+                    .decode_next_with(|decoder| {
+                        #abi_path::AbiDecode::abi_decode(
+                            decoder,
+                            context,
+                            __abi_location,
+                        )
+                    })?
+                    .ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                         #cbor_path::ErrorCode::ArrayLenMismatch,
                         __abi_arr_off,
                     ))?;
@@ -1135,7 +1188,7 @@ fn decode_field_set_body(
             quote! { #ident: #storage.unwrap_or(::core::option::Option::None), }
         } else {
             quote! {
-                #ident: #storage.ok_or_else(|| #cbor_path::CborError::new(
+                #ident: #storage.ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                     #cbor_path::ErrorCode::MissingKey,
                     __abi_arr_off,
                 ))?,
@@ -1154,7 +1207,7 @@ fn decode_field_set_body(
         let __abi_arr_off = decoder.position();
         let mut __abi_array = decoder.array()?;
         if __abi_array.remaining() % 2 != 0 {
-            return Err(#cbor_path::CborError::new(
+            return Err(#abi_path::__private::decode_error::<__C>(
                 #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ));
@@ -1167,25 +1220,25 @@ fn decode_field_set_body(
                 let off = decoder.position();
                 let id = #cbor_path::CborDecode::decode(decoder)?;
                 ::core::result::Result::Ok((off, id))
-            })?.ok_or_else(|| #cbor_path::CborError::new(
+            })?.ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                 #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ))?;
             if __abi_id == 0 {
-                return Err(#cbor_path::CborError::new(
+                return Err(#abi_path::__private::decode_error::<__C>(
                     #cbor_path::ErrorCode::InvalidAbiValue,
                     __abi_id_off,
                 ));
             }
             if let ::core::option::Option::Some(prev) = __abi_prev_id {
                 if __abi_id == prev {
-                    return Err(#cbor_path::CborError::new(
+                    return Err(#abi_path::__private::decode_error::<__C>(
                         #cbor_path::ErrorCode::DuplicateMapKey,
                         __abi_id_off,
                     ));
                 }
                 if __abi_id < prev {
-                    return Err(#cbor_path::CborError::new(
+                    return Err(#abi_path::__private::decode_error::<__C>(
                         #cbor_path::ErrorCode::NonCanonicalMapOrder,
                         __abi_id_off,
                     ));
@@ -1281,6 +1334,7 @@ fn decode_enum_body(
 ) -> proc_macro2::TokenStream {
     let abi_path = &attrs.abi_path;
     let cbor_path = &attrs.cbor_path;
+    let type_id = &attrs.type_id;
     let arms = variants.iter().map(|variant| {
         let ident = variant.ident;
         let id = variant.id;
@@ -1288,8 +1342,14 @@ fn decode_enum_body(
             quote! {
                 #id => {
                     let _: () = __abi_array
-                        .decode_next(#abi_path::AbiDecode::abi_decode)?
-                        .ok_or_else(|| #cbor_path::CborError::new(
+                        .decode_next_with(|decoder| {
+                            #abi_path::AbiDecode::abi_decode(
+                                decoder,
+                                context,
+                                #abi_path::AbiDecodeLocation::Root,
+                            )
+                        })?
+                        .ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                             #cbor_path::ErrorCode::ArrayLenMismatch,
                             __abi_arr_off,
                         ))?;
@@ -1301,14 +1361,16 @@ fn decode_enum_body(
                 &variant.fields,
                 attrs.unknown_fields,
                 quote!(Self::#ident),
+                &attrs.type_id,
+                Some(id),
                 abi_path,
                 cbor_path,
             );
             quote! {
                 #id => {
-                    __abi_array.decode_next(|decoder| {
+                    __abi_array.decode_next_with(|decoder| {
                         #body
-                    })?.ok_or_else(|| #cbor_path::CborError::new(
+                    })?.ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                         #cbor_path::ErrorCode::ArrayLenMismatch,
                         __abi_arr_off,
                     ))
@@ -1322,9 +1384,23 @@ fn decode_enum_body(
         let ident = unknown.ident;
         quote! {
             _ => {
+                let __abi_location = #abi_path::AbiDecodeLocation::UnknownVariant {
+                    type_id: #type_id,
+                    variant_id: __abi_id,
+                };
+                context.admit(
+                    __abi_location,
+                    #abi_path::AbiDecodeValue::UnknownVariant { offset: __abi_id_off },
+                )?;
                 let __abi_payload: #cbor_path::CanonicalCbor = __abi_array
-                    .decode_next(#cbor_path::CborDecode::decode)?
-                    .ok_or_else(|| #cbor_path::CborError::new(
+                    .decode_next_with(|decoder| {
+                        #abi_path::AbiDecode::abi_decode(
+                            decoder,
+                            context,
+                            __abi_location,
+                        )
+                    })?
+                    .ok_or_else(|| #abi_path::__private::decode_error::<__C>(
                         #cbor_path::ErrorCode::ArrayLenMismatch,
                         __abi_arr_off,
                     ))?;
@@ -1336,7 +1412,7 @@ fn decode_enum_body(
         }
     } else {
         quote! {
-            _ => Err(#cbor_path::CborError::new(
+            _ => Err(#abi_path::__private::decode_error::<__C>(
                 #cbor_path::ErrorCode::UnknownEnumVariant,
                 __abi_id_off,
             ))
@@ -1347,7 +1423,7 @@ fn decode_enum_body(
         let __abi_arr_off = decoder.position();
         let mut __abi_array = decoder.array()?;
         if __abi_array.remaining() != 2 {
-            return Err(#cbor_path::CborError::new(
+            return Err(#abi_path::__private::decode_error::<__C>(
                 #cbor_path::ErrorCode::ArrayLenMismatch,
                 __abi_arr_off,
             ));
@@ -1356,12 +1432,12 @@ fn decode_enum_body(
             let off = decoder.position();
             let id = #cbor_path::CborDecode::decode(decoder)?;
             ::core::result::Result::Ok((off, id))
-        })?.ok_or_else(|| #cbor_path::CborError::new(
+        })?.ok_or_else(|| #abi_path::__private::decode_error::<__C>(
             #cbor_path::ErrorCode::ArrayLenMismatch,
             __abi_arr_off,
         ))?;
         if __abi_id == 0 {
-            return Err(#cbor_path::CborError::new(
+            return Err(#abi_path::__private::decode_error::<__C>(
                 #cbor_path::ErrorCode::InvalidAbiValue,
                 __abi_id_off,
             ));
