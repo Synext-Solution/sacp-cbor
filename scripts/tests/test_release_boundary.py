@@ -21,11 +21,17 @@ def bash_path(path: Path) -> str:
 
 
 def bash(command: str, *, cwd: Path = ROOT):
-    return subprocess.run(
-        ["bash", "-c", command],
+    result = subprocess.run(
+        ["bash"],
         cwd=cwd,
+        input=command.encode("utf-8"),
         capture_output=True,
-        text=True,
+    )
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        result.stdout.decode("utf-8"),
+        result.stderr.decode("utf-8"),
     )
 
 
@@ -162,18 +168,25 @@ validate_existing_tag_state v1.2.3 abc "one 1.0.0 one" "two 2.0.0 two"
     def test_publish_recovery_waits_until_identical_artifact_is_cargo_resolvable(self):
         script = shlex.quote(bash_path(RELEASE_SCRIPT))
         with tempfile.TemporaryDirectory(prefix="sacp-release-recovery-") as temp:
-            calls = Path(temp) / "cargo-info-calls"
+            fixture = Path(temp)
+            calls = fixture / "cargo-info-calls"
+            ready = fixture / "cargo-info-ready"
             calls.touch()
             calls_arg = shlex.quote(bash_path(calls))
+            ready_arg = shlex.quote(bash_path(ready))
             command = f'''source {script}
 verify_published_artifact() {{ return 0; }}
 cargo() {{
-  if [[ "\\$1" != "info" ]]; then
-    printf 'unexpected cargo call: %s\\n' "\\$*"
+  if [[ "$1" != "info" ]]; then
+    printf 'unexpected cargo call: %s\\n' "$*"
     return 99
   fi
   printf 'info\\n' >> {calls_arg}
-  [[ "\\$(wc -l < {calls_arg})" -ge 2 ]]
+  if [[ -e {ready_arg} ]]; then
+    return 0
+  fi
+  : > {ready_arg}
+  return 1
 }}
 sleep() {{ :; }}
 publish_crate one 1.0.0 one
@@ -191,31 +204,40 @@ publish_crate one 1.0.0 one
             artifact_calls = fixture / "artifact-calls"
             info_calls = fixture / "info-calls"
             publish_calls = fixture / "publish-calls"
+            artifact_ready = fixture / "artifact-ready"
+            info_ready = fixture / "info-ready"
             for path in (artifact_calls, info_calls, publish_calls):
                 path.touch()
             artifact_arg = shlex.quote(bash_path(artifact_calls))
             info_arg = shlex.quote(bash_path(info_calls))
             publish_arg = shlex.quote(bash_path(publish_calls))
+            artifact_ready_arg = shlex.quote(bash_path(artifact_ready))
+            info_ready_arg = shlex.quote(bash_path(info_ready))
             command = f'''source {script}
 verify_published_artifact() {{
   printf 'artifact\\n' >> {artifact_arg}
-  if [[ "\\$(wc -l < {artifact_arg})" -eq 1 ]]; then
+  if [[ ! -e {artifact_ready_arg} ]]; then
+    : > {artifact_ready_arg}
     return 10
   fi
   return 0
 }}
 cargo() {{
-  case "\\$1" in
+  case "$1" in
     publish)
       printf 'publish\\n' >> {publish_arg}
       return 0
       ;;
     info)
       printf 'info\\n' >> {info_arg}
-      [[ "\\$(wc -l < {info_arg})" -ge 2 ]]
+      if [[ -e {info_ready_arg} ]]; then
+        return 0
+      fi
+      : > {info_ready_arg}
+      return 1
       ;;
     *)
-      printf 'unexpected cargo call: %s\\n' "\\$*"
+      printf 'unexpected cargo call: %s\\n' "$*"
       return 99
       ;;
   esac
