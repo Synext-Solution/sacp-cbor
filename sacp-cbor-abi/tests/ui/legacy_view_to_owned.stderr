@@ -1,0 +1,16 @@
+error[E0061]: this method takes 1 argument but 0 arguments were supplied
+  --> tests/ui/legacy_view_to_owned.rs:15:18
+   |
+15 |     let _ = view.to_owned();
+   |                  ^^^^^^^^-- argument #1 of type `&mut _` is missing
+   |
+note: method defined here
+  --> tests/ui/legacy_view_to_owned.rs:4:10
+   |
+ 4 | #[derive(CborAbi)]
+   |          ^^^^^^^
+   = note: this error originates in the derive macro `CborAbi` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: provide the argument
+   |
+15 |     let _ = view.to_owned(/* context */);
+   |                           +++++++++++++

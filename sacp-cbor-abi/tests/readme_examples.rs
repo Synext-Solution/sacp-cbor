@@ -108,7 +108,7 @@ fn stable_public_abi_readme_examples_match_api() {
     };
 
     let bytes = encode_to_vec(&value).unwrap();
-    let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded, value);
     assert_eq!(
         bytes,
@@ -124,7 +124,7 @@ fn stable_public_abi_readme_examples_match_api() {
     assert_eq!(view.amount().unwrap(), 5000);
     assert_eq!(view.memo().unwrap(), None);
     assert_eq!(view.amount_raw().unwrap().as_bytes(), &[0x19, 0x13, 0x88]);
-    assert_eq!(view.to_owned().unwrap(), value);
+    assert_eq!(view.to_owned(&mut ()).unwrap(), value);
 
     let schema = Transfer::schema();
     let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap() else {

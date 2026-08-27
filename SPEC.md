@@ -145,6 +145,13 @@ diagnostic metadata. Unknown fields may be rejected, ignored, or preserved; unkn
 may be rejected or preserved. Lifetime-only derived ABI types may borrow decoded field values from
 the input.
 
+Owned ABI decode is one context-carrying traversal. Core canonical and structural limits admit a
+declared length before the caller context observes it; the caller admits that semantic location
+before the first corresponding owned reservation or payload copy. The same context and typed error
+domain recurse through nested ABI fields and sequence elements. ABI framing arrays and numeric IDs
+are not semantic sequence events. Borrowed field values remain zero-copy and do not emit owned
+admission events.
+
 ## Collection Policy
 
 `Vec<T>` represents a CBOR array. Byte strings use `Bytes`, `BytesRef`, byte slices, or fixed byte
@@ -188,6 +195,11 @@ Validation and borrowed query traversal are allocation-free. Owned decode paths 
 reservation before vector/string construction where Rust exposes that boundary. Standard collection
 decoding is not part of the robust core because standard map/set insertion does not provide a fully
 fallible allocation contract.
+
+Guarded core decode operations expose text/byte payload lengths after canonical headers and core
+limits but before payload read, expose array element counts before caller allocation, and expose a
+complete validated canonical span before caller ownership. A caller rejection is sticky. These
+operations do not create a second validation traversal or expose the decoder's raw cursor.
 
 The default build forbids unsafe code. The `unsafe` feature is limited to trusted-boundary
 constructors and unchecked UTF-8 conversion for already canonical data.

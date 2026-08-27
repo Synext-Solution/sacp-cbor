@@ -11,4 +11,9 @@ fn abi_schema_errors_fail_to_compile() {
     t.compile_fail("tests/ui/unknown_fields_without_storage.rs");
     t.compile_fail("tests/ui/invalid_unknown_variant.rs");
     t.compile_fail("tests/ui/ty_version_without_ty.rs");
+    t.compile_fail("tests/ui/legacy_decode_trait.rs");
+    t.compile_fail("tests/ui/legacy_decode_method.rs");
+    t.compile_fail("tests/ui/legacy_decode_root.rs");
+    t.compile_fail("tests/ui/legacy_decode_canonical_root.rs");
+    t.compile_fail("tests/ui/legacy_view_to_owned.rs");
 }

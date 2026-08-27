@@ -159,16 +159,99 @@ validate_existing_tag_state v1.2.3 abc "one 1.0.0 one" "two 2.0.0 two"
         result = bash(command)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_publish_skips_only_an_identical_unyanked_artifact(self):
+    def test_publish_recovery_waits_until_identical_artifact_is_cargo_resolvable(self):
+        script = shlex.quote(bash_path(RELEASE_SCRIPT))
+        with tempfile.TemporaryDirectory(prefix="sacp-release-recovery-") as temp:
+            calls = Path(temp) / "cargo-info-calls"
+            calls.touch()
+            calls_arg = shlex.quote(bash_path(calls))
+            command = f'''source {script}
+verify_published_artifact() {{ return 0; }}
+cargo() {{
+  if [[ "\\$1" != "info" ]]; then
+    printf 'unexpected cargo call: %s\\n' "\\$*"
+    return 99
+  fi
+  printf 'info\\n' >> {calls_arg}
+  [[ "\\$(wc -l < {calls_arg})" -ge 2 ]]
+}}
+sleep() {{ :; }}
+publish_crate one 1.0.0 one
+'''
+            result = bash(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text(encoding="utf-8").count("info"), 2)
+            self.assertIn("already on crates.io; waiting for Cargo resolution", result.stdout)
+            self.assertNotIn("unexpected cargo call", result.stdout)
+
+    def test_new_publish_waits_past_artifact_visibility_until_cargo_resolves(self):
+        script = shlex.quote(bash_path(RELEASE_SCRIPT))
+        with tempfile.TemporaryDirectory(prefix="sacp-release-publish-") as temp:
+            fixture = Path(temp)
+            artifact_calls = fixture / "artifact-calls"
+            info_calls = fixture / "info-calls"
+            publish_calls = fixture / "publish-calls"
+            for path in (artifact_calls, info_calls, publish_calls):
+                path.touch()
+            artifact_arg = shlex.quote(bash_path(artifact_calls))
+            info_arg = shlex.quote(bash_path(info_calls))
+            publish_arg = shlex.quote(bash_path(publish_calls))
+            command = f'''source {script}
+verify_published_artifact() {{
+  printf 'artifact\\n' >> {artifact_arg}
+  if [[ "\\$(wc -l < {artifact_arg})" -eq 1 ]]; then
+    return 10
+  fi
+  return 0
+}}
+cargo() {{
+  case "\\$1" in
+    publish)
+      printf 'publish\\n' >> {publish_arg}
+      return 0
+      ;;
+    info)
+      printf 'info\\n' >> {info_arg}
+      [[ "\\$(wc -l < {info_arg})" -ge 2 ]]
+      ;;
+    *)
+      printf 'unexpected cargo call: %s\\n' "\\$*"
+      return 99
+      ;;
+  esac
+}}
+sleep() {{ :; }}
+CARGO_REGISTRY_TOKEN=test-token publish_crate one 1.0.0 one
+'''
+            result = bash(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(artifact_calls.read_text(encoding="utf-8").count("artifact"), 3)
+            self.assertEqual(info_calls.read_text(encoding="utf-8").count("info"), 2)
+            self.assertEqual(publish_calls.read_text(encoding="utf-8").count("publish"), 1)
+            self.assertNotIn("unexpected cargo call", result.stdout)
+
+    def test_artifact_visibility_without_cargo_resolution_times_out(self):
         script = shlex.quote(bash_path(RELEASE_SCRIPT))
         command = f'''source {script}
 verify_published_artifact() {{ return 0; }}
-cargo() {{ printf 'unexpected cargo call\\n'; return 99; }}
-publish_crate one 1.0.0 one
+cargo() {{ return 1; }}
+sleep() {{ :; }}
+wait_for_published one 1.0.0
 '''
         result = bash(command)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("already on crates.io; skipping", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.count("Waiting for one 1.0.0"), 30)
+        self.assertIn("did not appear on crates.io in time", result.stderr)
+
+    def test_wait_propagates_artifact_mismatch_status_without_cargo_lookup(self):
+        script = shlex.quote(bash_path(RELEASE_SCRIPT))
+        command = f'''source {script}
+verify_published_artifact() {{ return 12; }}
+cargo() {{ printf 'unexpected cargo call\\n'; return 0; }}
+wait_for_published one 1.0.0
+'''
+        result = bash(command)
+        self.assertEqual(result.returncode, 12, result.stderr)
         self.assertNotIn("unexpected cargo call", result.stdout)
 
     def test_publish_rejects_checksum_mismatch_before_cargo(self):
@@ -179,7 +262,7 @@ cargo() {{ printf 'unexpected cargo call\\n'; return 0; }}
 publish_crate one 1.0.0 one
 '''
         result = bash(command)
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 12)
         self.assertIn("checksum mismatch", result.stderr)
         self.assertNotIn("unexpected cargo call", result.stdout)
 

@@ -126,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let abi_decoded: PublicMessage = sacp_cbor_abi::decode(
         &abi_bytes,
         DecodeLimits::for_bytes(abi_bytes.len()),
+        &mut (),
     )?;
     assert_eq!(abi_decoded, public);
 

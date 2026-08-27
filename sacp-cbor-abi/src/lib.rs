@@ -44,6 +44,14 @@ pub mod __private {
 
     use super::{UnknownFields, UnknownVariant};
 
+    /// Convert one core decode failure into the active ABI context's error domain.
+    pub fn decode_error<C: super::AbiDecodeContext + ?Sized>(
+        code: sacp_cbor::ErrorCode,
+        offset: usize,
+    ) -> C::Error {
+        C::Error::from(sacp_cbor::CborError::new(code, offset))
+    }
+
     /// Decode and validate a nonzero ABI field or variant ID.
     pub fn decode_abi_id(
         value: sacp_cbor::query::CborValueRef<'_>,
@@ -123,12 +131,124 @@ pub trait AbiEncode {
     fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
 }
 
-/// Decode a public ABI value.
-pub trait AbiDecode<'de>: Sized {
+/// Identifies the semantic owner of an admitted ABI value.
+///
+/// ABI field-set and enum framing arrays are deliberately absent: callers budget the values their
+/// model owns, not the numeric IDs and arrays used to frame those values on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiDecodeLocation {
+    /// A value decoded directly at the root entry point.
+    Root,
+    /// A declared struct field or named enum-variant field.
+    Field {
+        /// Stable ABI type ID of the containing declaration.
+        type_id: &'static str,
+        /// Variant ID for a named enum payload, or `None` for a struct field.
+        variant_id: Option<u32>,
+        /// Stable numeric field ID.
+        field_id: u32,
+    },
+    /// An unknown field retained by a preserve-policy declaration.
+    UnknownField {
+        /// Stable ABI type ID of the containing declaration.
+        type_id: &'static str,
+        /// Variant ID for a named enum payload, or `None` for a struct field.
+        variant_id: Option<u32>,
+        /// Unknown numeric field ID observed on the wire.
+        field_id: u32,
+    },
+    /// An unknown enum variant retained by a preserve-policy declaration.
+    UnknownVariant {
+        /// Stable ABI type ID of the enum declaration.
+        type_id: &'static str,
+        /// Unknown numeric variant ID observed on the wire.
+        variant_id: u32,
+    },
+}
+
+/// A length-bearing semantic value observed before its first owned allocation or payload copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiDecodeValue {
+    /// A `Vec<T>` value. `items` is the declared array length.
+    Sequence {
+        /// Header byte offset.
+        offset: usize,
+        /// Declared element count.
+        items: usize,
+    },
+    /// A UTF-8 text value. `bytes` is the declared payload length.
+    Text {
+        /// Header byte offset.
+        offset: usize,
+        /// Declared UTF-8 byte length.
+        bytes: usize,
+    },
+    /// A byte-string value. `bytes` is the declared payload length.
+    Bytes {
+        /// Header byte offset.
+        offset: usize,
+        /// Declared byte length.
+        bytes: usize,
+    },
+    /// A complete canonical value that will be copied into an owned witness.
+    Canonical {
+        /// Header byte offset.
+        offset: usize,
+        /// Complete encoded byte length.
+        bytes: usize,
+    },
+    /// One retained unknown field, observed before storage reservation and payload ownership.
+    UnknownField {
+        /// Field-ID byte offset.
+        offset: usize,
+    },
+    /// One retained unknown variant, observed before payload ownership.
+    UnknownVariant {
+        /// Variant-ID byte offset.
+        offset: usize,
+    },
+}
+
+/// Caller-owned admission context for ABI decoding.
+///
+/// One mutable context is threaded through the entire recursive decode. Hooks run after the core
+/// canonical grammar and structural limits have admitted a header, but before the corresponding
+/// owned reservation or payload copy. A hook error aborts and poisons the single-pass decode.
+/// Payload truncation or invalid UTF-8 can still fail after admission, so a stateful context belongs
+/// to that decode transaction and must be discarded or rolled back when decoding returns an error.
+pub trait AbiDecodeContext {
+    /// Error returned by the complete decode transaction.
+    type Error: From<CborError>;
+
+    /// Admit one semantic value before ownership is allocated or copied.
+    fn admit(
+        &mut self,
+        location: AbiDecodeLocation,
+        value: AbiDecodeValue,
+    ) -> Result<(), Self::Error>;
+}
+
+impl AbiDecodeContext for () {
+    type Error = CborError;
+
+    #[inline]
+    fn admit(
+        &mut self,
+        _location: AbiDecodeLocation,
+        _value: AbiDecodeValue,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Decode a public ABI value through one caller-owned admission context.
+pub trait AbiDecode<'de, C: AbiDecodeContext + ?Sized>: Sized {
     /// Decode `Self` from a streaming decoder.
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError>;
+        context: &mut C,
+        location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error>;
 }
 
 /// Exposes the public ABI schema for a type.
@@ -597,29 +717,35 @@ pub fn encode_to_vec<T: AbiEncode>(value: &T) -> Result<Vec<u8>, CborError> {
     Ok(encode_to_canonical(value)?.into_bytes())
 }
 
-/// Validate and decode an ABI value.
-pub fn decode<'de, T: AbiDecode<'de>>(
+/// Validate and decode an ABI value through one caller-owned context.
+pub fn decode<'de, T, C>(
     bytes: &'de [u8],
     limits: DecodeLimits,
-) -> Result<T, CborError> {
+    context: &mut C,
+) -> Result<T, C::Error>
+where
+    C: AbiDecodeContext + ?Sized,
+    T: AbiDecode<'de, C>,
+{
     let mut decoder = Decoder::<true>::new_checked(bytes, limits)?;
-    let value = T::abi_decode(&mut decoder)?;
-    if decoder.position() != bytes.len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
-    }
+    let value = T::abi_decode(&mut decoder, context, AbiDecodeLocation::Root)?;
+    let _ = decoder.finish()?;
     Ok(value)
 }
 
-/// Decode an ABI value from an already validated canonical CBOR witness.
-pub fn decode_canonical<'de, T: AbiDecode<'de>>(
+/// Decode an ABI value from an already validated canonical witness through one caller-owned context.
+pub fn decode_canonical<'de, T, C>(
     cbor: CanonicalCborRef<'de>,
-) -> Result<T, CborError> {
+    context: &mut C,
+) -> Result<T, C::Error>
+where
+    C: AbiDecodeContext + ?Sized,
+    T: AbiDecode<'de, C>,
+{
     let mut decoder =
         Decoder::<false>::new_trusted(cbor, DecodeLimits::for_bytes(cbor.as_bytes().len()))?;
-    let value = T::abi_decode(&mut decoder)?;
-    if decoder.position() != cbor.as_bytes().len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
-    }
+    let value = T::abi_decode(&mut decoder, context, AbiDecodeLocation::Root)?;
+    let _ = decoder.finish()?;
     Ok(value)
 }
 
@@ -697,9 +823,13 @@ pub fn assert_abi_vector<T: AbiEncode>(name: &str, value: &T, expected_hex: &str
     assert_eq!(actual, expected_hex, "{name}");
 }
 
-/// Assert that ABI decoding rejects bytes with the expected error code.
-pub fn assert_abi_rejects<'de, T: AbiDecode<'de>>(bytes: &'de [u8], expected: ErrorCode) {
-    match decode::<T>(bytes, DecodeLimits::for_bytes(bytes.len())) {
+/// Assert that ABI decoding rejects bytes with the expected core error code.
+pub fn assert_abi_rejects<'de, T, C>(bytes: &'de [u8], expected: ErrorCode, context: &mut C)
+where
+    C: AbiDecodeContext<Error = CborError> + ?Sized,
+    T: AbiDecode<'de, C>,
+{
+    match decode::<T, C>(bytes, DecodeLimits::for_bytes(bytes.len()), context) {
         Ok(_) => panic!("decode unexpectedly succeeded"),
         Err(err) => assert_eq!(err.code, expected),
     }
@@ -1170,11 +1300,13 @@ macro_rules! passthrough_abi {
                 }
             }
 
-            impl<'de> AbiDecode<'de> for $ty {
+            impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for $ty {
                 fn abi_decode<const CHECKED: bool>(
                     decoder: &mut Decoder<'de, CHECKED>,
-                ) -> Result<Self, CborError> {
-                    CborDecode::decode(decoder)
+                    _context: &mut C,
+                    _location: AbiDecodeLocation,
+                ) -> Result<Self, C::Error> {
+                    CborDecode::decode(decoder).map_err(C::Error::from)
                 }
             }
 
@@ -1198,9 +1330,6 @@ passthrough_abi!(
     i16 => TypeRef::I16,
     i32 => TypeRef::I32,
     i64 => TypeRef::I64,
-    String => TypeRef::Text,
-    Bytes => TypeRef::Bytes,
-    CanonicalCbor => TypeRef::CanonicalCbor,
 );
 
 impl AbiEncode for &str {
@@ -1209,15 +1338,54 @@ impl AbiEncode for &str {
     }
 }
 
-impl<'de> AbiDecode<'de> for &'de str {
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for &'de str {
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError> {
-        CborDecode::decode(decoder)
+        _context: &mut C,
+        _location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        CborDecode::decode(decoder).map_err(C::Error::from)
     }
 }
 
 impl AbiTypeRef for &str {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::Text
+    }
+}
+
+impl AbiEncode for String {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for String {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+        context: &mut C,
+        location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        let offset = decoder.position();
+        let value = decoder.decode_text_with_guard(|header| {
+            context.admit(
+                location,
+                AbiDecodeValue::Text {
+                    offset: header.header_offset(),
+                    bytes: header.declared_len(),
+                },
+            )
+        })?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(value.len())
+            .map_err(|_| C::Error::from(CborError::new(ErrorCode::AllocationFailed, offset)))?;
+        owned.push_str(value);
+        Ok(owned)
+    }
+}
+
+impl AbiTypeRef for String {
     fn abi_type_ref() -> TypeRef {
         TypeRef::Text
     }
@@ -1229,7 +1397,54 @@ impl AbiEncode for BytesRef<'_> {
     }
 }
 
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for BytesRef<'de> {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+        _context: &mut C,
+        _location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        CborDecode::decode(decoder).map_err(C::Error::from)
+    }
+}
+
 impl AbiTypeRef for BytesRef<'_> {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::Bytes
+    }
+}
+
+impl AbiEncode for Bytes {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for Bytes {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+        context: &mut C,
+        location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        let offset = decoder.position();
+        let value = decoder.decode_bytes_with_guard(|header| {
+            context.admit(
+                location,
+                AbiDecodeValue::Bytes {
+                    offset: header.header_offset(),
+                    bytes: header.declared_len(),
+                },
+            )
+        })?;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(value.len())
+            .map_err(|_| C::Error::from(CborError::new(ErrorCode::AllocationFailed, offset)))?;
+        owned.extend_from_slice(value);
+        Ok(Self::new(owned))
+    }
+}
+
+impl AbiTypeRef for Bytes {
     fn abi_type_ref() -> TypeRef {
         TypeRef::Bytes
     }
@@ -1241,15 +1456,52 @@ impl AbiEncode for CanonicalCborRef<'_> {
     }
 }
 
-impl<'de> AbiDecode<'de> for CanonicalCborRef<'de> {
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCborRef<'de> {
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError> {
-        CborDecode::decode(decoder)
+        _context: &mut C,
+        _location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        CborDecode::decode(decoder).map_err(C::Error::from)
     }
 }
 
 impl AbiTypeRef for CanonicalCborRef<'_> {
+    fn abi_type_ref() -> TypeRef {
+        TypeRef::CanonicalCbor
+    }
+}
+
+impl AbiEncode for CanonicalCbor {
+    fn abi_encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        CborEncode::encode(self, enc)
+    }
+}
+
+impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCbor {
+    fn abi_decode<const CHECKED: bool>(
+        decoder: &mut Decoder<'de, CHECKED>,
+        context: &mut C,
+        location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        let value_offset = core::cell::Cell::new(0);
+        let value = decoder.decode_canonical_with_guard(|header| {
+            value_offset.set(header.header_offset());
+            context.admit(
+                location,
+                AbiDecodeValue::Canonical {
+                    offset: header.header_offset(),
+                    bytes: header.encoded_len(),
+                },
+            )
+        })?;
+        value
+            .to_owned_with_offset(value_offset.get())
+            .map_err(C::Error::from)
+    }
+}
+
+impl AbiTypeRef for CanonicalCbor {
     fn abi_type_ref() -> TypeRef {
         TypeRef::CanonicalCbor
     }
@@ -1261,11 +1513,13 @@ impl<const N: usize> AbiEncode for [u8; N] {
     }
 }
 
-impl<'de, const N: usize> AbiDecode<'de> for [u8; N] {
+impl<'de, C: AbiDecodeContext + ?Sized, const N: usize> AbiDecode<'de, C> for [u8; N] {
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError> {
-        CborDecode::decode(decoder)
+        _context: &mut C,
+        _location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
+        CborDecode::decode(decoder).map_err(C::Error::from)
     }
 }
 
@@ -1286,16 +1540,33 @@ impl<T: AbiEncode> AbiEncode for Vec<T> {
     }
 }
 
-impl<'de, T: AbiDecode<'de>> AbiDecode<'de> for Vec<T> {
+impl<'de, T, C> AbiDecode<'de, C> for Vec<T>
+where
+    C: AbiDecodeContext + ?Sized,
+    T: AbiDecode<'de, C>,
+{
     fn abi_decode<const CHECKED: bool>(
         decoder: &mut Decoder<'de, CHECKED>,
-    ) -> Result<Self, CborError> {
+        context: &mut C,
+        location: AbiDecodeLocation,
+    ) -> Result<Self, C::Error> {
         let array_off = decoder.position();
-        let mut array = decoder.array()?;
+        let array = decoder.array()?;
+        let mut array = array.admit_with(|header| {
+            context.admit(
+                location,
+                AbiDecodeValue::Sequence {
+                    offset: header.header_offset(),
+                    items: header.declared_len(),
+                },
+            )
+        })?;
         let mut out = Vec::new();
         out.try_reserve_exact(array.remaining())
-            .map_err(|_| CborError::new(ErrorCode::AllocationFailed, array_off))?;
-        while let Some(value) = array.decode_next(AbiDecode::abi_decode)? {
+            .map_err(|_| C::Error::from(CborError::new(ErrorCode::AllocationFailed, array_off)))?;
+        while let Some(value) =
+            array.decode_next_with(|decoder| T::abi_decode(decoder, context, location))?
+        {
             out.push(value);
         }
         Ok(out)

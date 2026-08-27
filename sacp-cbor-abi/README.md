@@ -13,7 +13,7 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 ```toml
 [dependencies]
 sacp-cbor = "0.18"
-sacp-cbor-abi = "0.7"
+sacp-cbor-abi = "0.8"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,7 +21,7 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.7", default-features = false }
+sacp-cbor-abi = { version = "0.8", default-features = false }
 ```
 
 ## Struct ABI
@@ -51,7 +51,12 @@ let value = Transfer {
 };
 
 let bytes = encode_to_vec(&value)?;
-let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()))?;
+let mut context = ();
+let decoded: Transfer = decode(
+    &bytes,
+    DecodeLimits::for_bytes(bytes.len()),
+    &mut context,
+)?;
 assert_eq!(decoded, value);
 
 let wire_hash = Transfer::schema().wire_hash()?;
@@ -74,6 +79,20 @@ For the `Transfer` value above, `memo: None` is omitted and the wire bytes repre
 Field IDs and variant IDs are nonzero `u32` values. Field-set IDs must be strictly increasing on the
 wire; zero, duplicate, decreasing, and odd-length field-set arrays are rejected.
 
+## Context-aware owned admission
+
+`decode` and `decode_canonical` require one explicit `AbiDecodeContext`, threaded through every
+recursive field and element. `admit` receives a stable type/variant/field location and a typed value
+event after canonical headers, lengths, and core limits succeed but before the first owned
+reservation or payload copy. This lets a protocol enforce aggregate record and byte budgets in the
+same decode pass without a preflight traversal or a temporary ABI object tree.
+
+Use `&mut ()` when the core `DecodeLimits` are the complete policy. A custom context chooses which
+semantic locations to charge and returns its own typed error through `type Error: From<CborError>`.
+Borrowed `&str`, `BytesRef`, and `CanonicalCborRef` fields are zero-copy and do not emit owned
+admission events. Truncated or invalid payloads can fail after an admission event, so a stateful
+context is transaction state and must be discarded or rolled back when decoding returns an error.
+
 ## Zero-copy views
 
 `#[derive(CborAbi)]` also generates a borrowed `TypeView<'a>` for read-heavy paths:
@@ -88,7 +107,7 @@ assert_eq!(view.memo()?, None);
 let raw_amount = view.amount_raw()?;
 assert_eq!(raw_amount.as_bytes(), &[0x19, 0x13, 0x88]); // 5000
 
-let owned_again = view.to_owned()?;
+let owned_again = view.to_owned(&mut context)?;
 assert_eq!(owned_again, value);
 ```
 

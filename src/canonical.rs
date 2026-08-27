@@ -64,10 +64,24 @@ impl<'a> CanonicalCborRef<'a> {
     ///
     /// Returns `CborError` on allocation failure.
     pub fn to_owned(self) -> Result<CanonicalCbor, CborError> {
+        self.to_owned_with_offset(0)
+    }
+
+    /// Copy into an owned [`CanonicalCbor`], reporting allocation failure at `offset`.
+    ///
+    /// This is useful when the canonical reference denotes a nested value and diagnostics must
+    /// retain its absolute input position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` on allocation failure.
+    #[cfg(feature = "alloc")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+    pub fn to_owned_with_offset(self, offset: usize) -> Result<CanonicalCbor, CborError> {
         use crate::alloc_util::try_vec_from_slice;
 
         Ok(CanonicalCbor {
-            bytes: try_vec_from_slice(self.bytes, 0)?,
+            bytes: try_vec_from_slice(self.bytes, offset)?,
         })
     }
 }

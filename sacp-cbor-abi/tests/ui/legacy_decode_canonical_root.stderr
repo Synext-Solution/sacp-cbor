@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/ui/legacy_decode_canonical_root.rs:6:18
+  |
+6 |     let _: u64 = sacp_cbor_abi::decode_canonical(canonical).unwrap();
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^----------- argument #2 of type `&mut _` is missing
+  |
+note: function defined here
+ --> src/lib.rs
+  |
+  | pub fn decode_canonical<'de, T, C>(
+  |        ^^^^^^^^^^^^^^^^
+help: provide the argument
+  |
+6 |     let _: u64 = sacp_cbor_abi::decode_canonical(canonical, /* context */).unwrap();
+  |                                                           +++++++++++++++

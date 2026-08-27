@@ -665,9 +665,12 @@ fn bench_abi_decode_owned(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(bytes.len() as u64));
         group.bench_function(BenchmarkId::new("abi-owned", data.name), |b| {
             b.iter(|| {
-                let out: AbiBenchMessage =
-                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                        .unwrap();
+                let out: AbiBenchMessage = sacp_cbor_abi::decode(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box(out);
             })
         });
@@ -678,9 +681,12 @@ fn bench_abi_decode_owned(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(bytes.len() as u64));
     group.bench_function(BenchmarkId::new("abi-owned", flat16.name), |b| {
         b.iter(|| {
-            let out: AbiFlat16 =
-                sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                    .unwrap();
+            let out: AbiFlat16 = sacp_cbor_abi::decode(
+                black_box(bytes),
+                DecodeLimits::for_bytes(bytes.len()),
+                &mut (),
+            )
+            .unwrap();
             black_box(out);
         })
     });
@@ -833,18 +839,23 @@ fn bench_abi_view_access(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("abi-owned-trusted", data.name), |b| {
             b.iter(|| {
-                let out: AbiBenchMessage =
-                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
-                        .unwrap();
+                let out: AbiBenchMessage = sacp_cbor_abi::decode_canonical(
+                    black_box(data.canon.as_canonical_ref()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box((&out.id, &out.kind, out.seq, &out.route));
             })
         });
 
         group.bench_function(BenchmarkId::new("abi-owned", data.name), |b| {
             b.iter(|| {
-                let out: AbiBenchMessage =
-                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                        .unwrap();
+                let out: AbiBenchMessage = sacp_cbor_abi::decode(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box((&out.id, &out.kind, out.seq, &out.route));
             })
         });
@@ -861,27 +872,35 @@ fn bench_abi_unknown_preserve(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("ignore", data.name), |b| {
             b.iter(|| {
-                let out: AbiUnknownIgnore =
-                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                        .unwrap();
+                let out: AbiUnknownIgnore = sacp_cbor_abi::decode(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box(out.value);
             })
         });
 
         group.bench_function(BenchmarkId::new("preserve-owned", data.name), |b| {
             b.iter(|| {
-                let out: AbiUnknownPreserve =
-                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                        .unwrap();
+                let out: AbiUnknownPreserve = sacp_cbor_abi::decode(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box(out.unknown.len());
             })
         });
 
         group.bench_function(BenchmarkId::new("preserve-owned-trusted", data.name), |b| {
             b.iter(|| {
-                let out: AbiUnknownPreserve =
-                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
-                        .unwrap();
+                let out: AbiUnknownPreserve = sacp_cbor_abi::decode_canonical(
+                    black_box(data.canon.as_canonical_ref()),
+                    &mut (),
+                )
+                .unwrap();
                 black_box(out.unknown.len());
             })
         });
@@ -1076,9 +1095,11 @@ fn bench_abi_enum_access(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("owned-trusted", data.name), |b| {
             b.iter(|| {
-                let out: AbiBenchCommand =
-                    sacp_cbor_abi::decode_canonical(black_box(data.canon.as_canonical_ref()))
-                        .unwrap();
+                let out: AbiBenchCommand = sacp_cbor_abi::decode_canonical(
+                    black_box(data.canon.as_canonical_ref()),
+                    &mut (),
+                )
+                .unwrap();
                 match &out {
                     AbiBenchCommand::Route { id, seq, .. } => {
                         black_box(id);
@@ -1096,9 +1117,12 @@ fn bench_abi_enum_access(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("owned", data.name), |b| {
             b.iter(|| {
-                let out: AbiBenchCommand =
-                    sacp_cbor_abi::decode(black_box(bytes), DecodeLimits::for_bytes(bytes.len()))
-                        .unwrap();
+                let out: AbiBenchCommand = sacp_cbor_abi::decode(
+                    black_box(bytes),
+                    DecodeLimits::for_bytes(bytes.len()),
+                    &mut (),
+                )
+                .unwrap();
                 match &out {
                     AbiBenchCommand::Route { id, seq, .. } => {
                         black_box(id);

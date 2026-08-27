@@ -1,10 +1,10 @@
 mod wire {
     pub mod abi {
         pub use sacp_cbor_abi::{
-            __private, decode, decode_canonical, encode_to_vec, AbiDecode, AbiEncode,
-            AbiFieldSetRef, AbiType, AbiTypeRef, AbiView, AbiViewField, CborAbi, FieldDef,
-            FieldPresence, FieldSetDef, Schema, TypeDef, TypeRef, UnknownField, UnknownFieldPolicy,
-            UnknownFieldRef, UnknownFields,
+            __private, decode, decode_canonical, encode_to_vec, AbiDecode, AbiDecodeContext,
+            AbiDecodeLocation, AbiDecodeValue, AbiEncode, AbiFieldSetRef, AbiType, AbiTypeRef,
+            AbiView, AbiViewField, CborAbi, FieldDef, FieldPresence, FieldSetDef, Schema, TypeDef,
+            TypeRef, UnknownField, UnknownFieldPolicy, UnknownFieldRef, UnknownFields,
         };
     }
 
@@ -36,8 +36,12 @@ struct Transfer {
 #[test]
 fn facade_abi_derive_roundtrips() {
     let bytes = [0x84, 0x01, 0x05, 0x02, 0xf5];
-    let decoded: Transfer =
-        decode(&bytes, sacp_cbor::DecodeLimits::for_bytes(bytes.len())).unwrap();
+    let decoded: Transfer = decode(
+        &bytes,
+        sacp_cbor::DecodeLimits::for_bytes(bytes.len()),
+        &mut (),
+    )
+    .unwrap();
     assert_eq!(decoded.amount, 5);
     assert_eq!(decoded.unknown.len(), 1);
     assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
