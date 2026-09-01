@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.18.2 workspace release
+
+Published crates:
+
+- `sacp-cbor` 0.18.2
+- `sacp-cbor-derive` 0.18.2
+- `sacp-cbor-schema` 0.2.2
+- `sacp-cbor-abi` 0.9.0
+- `sacp-cbor-abi-derive` 0.6.0
+
+The ABI protocol profile remains `SACP_CBOR_ABI/1`.
+
+### `sacp-cbor`
+
+- Added guarded value and definite-array adapters that preserve a caller-defined typed error domain.
+  Callback failure, sink failure, underfill, overfill, and swallowed inner failures all poison the
+  encoder, while impossible declared lengths and limit failures are rejected before projection or
+  output.
+- Added `FanoutSink`, which drives two sinks in one encoding pass and reports which branch failed.
+- The encoder now keeps its first 32 container frames inline and migrates fallibly only for unusually
+  deep values. Ordinary encoding and bignum magnitude emission no longer allocate intermediate
+  storage.
+- These core changes are additive; existing core encoding and decoding entry points retain their
+  signatures and wire behavior.
+
+### `sacp-cbor-derive`
+
+- Version-only release required by the root crate's exact companion dependency.
+
+### `sacp-cbor-schema`
+
+- Dependency-only patch release tracking the exact `sacp-cbor` 0.18.2 runtime.
+
+### `sacp-cbor-abi`
+
+- **Breaking:** schema ownership is separated from Rust storage. Derived types expose one static,
+  allocation-free `Schema`; protocol sequences are represented by `wire::Sequence<W>` instead of a
+  Rust `Vec<T>` schema node. Existing sequence data bytes remain unchanged, while sequence-bearing
+  schema hashes intentionally change from the old carrier-named normal form.
+- **Breaking:** ABI encoding entry points are sink-generic and require explicit `EncodeLimits`.
+  `AbiEncodeError` preserves projection, exact-sequence contract, core profile, and owned sink
+  failures without collapsing them into a generic CBOR error.
+- The same derived schema owner can encode its owned `Vec<T>` fields, borrowed slices, exact indexed
+  projections, or source-driven projections without materializing a wire DTO. Generated projection
+  traits expose semantic field and variant methods; business adapters never provide numeric wire
+  IDs.
+- Exact sequence sources declare their length independently of iteration. Underfill and overfill are
+  checked transactionally, including when a source swallows an inner error; ordinary `Iterator` and
+  `ExactSizeIterator` types are deliberately not admitted by blanket implementation.
+- Static schema canonicalization and hashing stream directly to caller sinks and SHA-256. The static
+  hot path contains no schema-side `String`, `Vec`, or `Box` construction.
+- **Breaking:** runtime validation now borrows static descriptors through `RuntimeSchema::new`; the
+  allocation-backed `compile_runtime_schema` layer is removed. Caller-prepared workspaces remain
+  reusable and stack-safe.
+- **Breaking:** string-based `#[abi(ty = "...")]` schema overrides are removed because they could
+  declare an identity that the codec did not prove. Derived schema, codec, view, and projection code
+  now share one parsed owner model.
+- The runtime is now genuinely `no_std` with allocation-backed owned values when default features are
+  disabled; the default `std` feature adds standard error integration.
+
+### `sacp-cbor-abi-derive`
+
+- **Breaking:** generated code targets the static schema and storage-independent projection APIs in
+  `sacp-cbor-abi` 0.9. Struct fields and enum variants are selected through generated semantic
+  interfaces, and owned encoding delegates to the same generated projection driver.
+- Generated schemas use only static descriptors, and protocol IDs, presence rules, unknown policies,
+  codec paths, views, and projection adapters are emitted from one validated derive model.
+- Removed string type-identity override parsing and added compile-time rejection for legacy override
+  syntax and iterator-based sequence misuse.
+
 ## 0.18.1 workspace release
 
 Published crates:

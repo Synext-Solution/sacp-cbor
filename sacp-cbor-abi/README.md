@@ -13,7 +13,7 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 ```toml
 [dependencies]
 sacp-cbor = "0.18"
-sacp-cbor-abi = "0.8"
+sacp-cbor-abi = "0.9"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,7 +21,7 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.8", default-features = false }
+sacp-cbor-abi = { version = "0.9", default-features = false }
 ```
 
 ## Struct ABI
