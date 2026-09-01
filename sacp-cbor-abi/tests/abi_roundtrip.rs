@@ -1,9 +1,14 @@
 use sacp_cbor::bytes::Bytes;
-use sacp_cbor::{CanonicalCbor, DecodeLimits, ErrorCode};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, EncodeError, EncodeLimits, ErrorCode};
 use sacp_cbor_abi::{
-    assert_abi_rejects, assert_abi_vector, decode, encode_to_vec, AbiDeleteMode, AbiFieldSetRef,
-    AbiPatchValue, AbiSetMode, AbiType, CborAbi, CompatibilityClass, UnknownFields, UnknownVariant,
+    assert_abi_rejects, assert_abi_vector, decode, encode_to_vec, AbiDeleteMode, AbiEncodeError,
+    AbiFieldSetRef, AbiPatchValue, AbiSetMode, AbiType, CborAbi, CompatibilityClass, UnknownFields,
+    UnknownVariant,
 };
+
+fn encode_limits() -> EncodeLimits {
+    EncodeLimits::for_bytes(4096)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
 #[abi(type_id = "ledger.Transfer", version = 1)]
@@ -62,22 +67,6 @@ struct VectorPayload {
     items: Vec<u64>,
     #[abi(id = 2)]
     label: String,
-}
-
-type AccountAlias = u64;
-
-#[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
-#[abi(type_id = "ledger.Override", version = 1)]
-struct OverrideA {
-    #[abi(id = 1, ty = "ledger.AccountId")]
-    from: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
-#[abi(type_id = "ledger.Override", version = 1)]
-struct OverrideB {
-    #[abi(id = 1, ty = "ledger.AccountId")]
-    from: AccountAlias,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
@@ -153,9 +142,14 @@ fn struct_abi_uses_sorted_numeric_ids() {
         amount: 50,
         memo: Some(String::from("ok")),
     };
-    assert_abi_vector("transfer-basic", &value, "880101020203183204626f6b");
+    assert_abi_vector(
+        "transfer-basic",
+        &value,
+        "880101020203183204626f6b",
+        encode_limits(),
+    );
 
-    let bytes = encode_to_vec(&value).unwrap();
+    let bytes = encode_to_vec(&value, encode_limits()).unwrap();
     let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded, value);
 }
@@ -168,30 +162,31 @@ fn optional_none_is_omitted() {
         amount: 50,
         memo: None,
     };
-    assert_abi_vector("transfer-no-memo", &value, "8601010202031832");
+    assert_abi_vector(
+        "transfer-no-memo",
+        &value,
+        "8601010202031832",
+        encode_limits(),
+    );
 }
 
 #[test]
 fn wire_hash_ignores_metadata_and_full_hash_includes_it() {
     assert_eq!(
-        Transfer::schema().wire_hash().unwrap(),
-        TransferRenamed::schema().wire_hash().unwrap()
+        Transfer::schema().wire_hash(encode_limits()).unwrap(),
+        TransferRenamed::schema()
+            .wire_hash(encode_limits())
+            .unwrap()
     );
     assert_ne!(
-        Transfer::schema().full_hash().unwrap(),
-        TransferRenamed::schema().full_hash().unwrap()
+        Transfer::schema().full_hash(encode_limits()).unwrap(),
+        TransferRenamed::schema()
+            .full_hash(encode_limits())
+            .unwrap()
     );
 
-    let report = sacp_cbor_abi::diff(&Transfer::schema(), &TransferRenamed::schema());
+    let report = sacp_cbor_abi::diff(Transfer::schema(), TransferRenamed::schema());
     assert_eq!(report.bidirectional, CompatibilityClass::Compatible);
-}
-
-#[test]
-fn type_override_keeps_schema_identity_stable() {
-    assert_eq!(
-        OverrideA::schema().wire_hash().unwrap(),
-        OverrideB::schema().wire_hash().unwrap()
-    );
 }
 
 #[test]
@@ -219,7 +214,7 @@ fn generated_view_accessors_are_zero_copy() {
         }])
         .unwrap(),
     };
-    let bytes = encode_to_vec(&value).unwrap();
+    let bytes = encode_to_vec(&value, encode_limits()).unwrap();
     let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let view = ViewPayloadView::from_canonical(canon.as_canonical_ref()).unwrap();
 
@@ -251,7 +246,7 @@ fn generated_view_integer_accessors_preserve_bignum_semantics() {
         amount: u64::MAX,
         memo: None,
     };
-    let bytes = encode_to_vec(&value).unwrap();
+    let bytes = encode_to_vec(&value, encode_limits()).unwrap();
     let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
     let view = TransferView::from_canonical(canon.as_canonical_ref()).unwrap();
 
@@ -291,7 +286,7 @@ fn unknown_fields_can_be_ignored_or_preserved() {
         decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded.value, 5);
     assert_eq!(decoded.unknown.len(), 1);
-    assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
+    assert_eq!(encode_to_vec(&decoded, encode_limits()).unwrap(), bytes);
 }
 
 #[test]
@@ -313,8 +308,12 @@ fn unknown_field_collisions_are_rejected_on_encode() {
     }])
     .unwrap();
     let value = Preserving { value: 5, unknown };
-    let err = encode_to_vec(&value).unwrap_err();
-    assert_eq!(err.code, ErrorCode::DuplicateMapKey);
+    let err = encode_to_vec(&value, encode_limits()).unwrap_err();
+    assert!(matches!(
+        err,
+        AbiEncodeError::Encode(EncodeError::Cbor(error))
+            if error.code == ErrorCode::DuplicateMapKey
+    ));
 }
 
 #[test]
@@ -323,6 +322,7 @@ fn enum_abi_preserves_unknown_variants() {
         "decision-accepted",
         &Decision::Accepted { id: 7 },
         "8201820107",
+        encode_limits(),
     );
     assert_abi_vector(
         "decision-unknown",
@@ -331,6 +331,7 @@ fn enum_abi_preserves_unknown_variants() {
             payload: canon(&[0xf5]),
         }),
         "8209f5",
+        encode_limits(),
     );
 
     let decoded: Decision =
@@ -339,7 +340,10 @@ fn enum_abi_preserves_unknown_variants() {
         decoded,
         Decision::Unknown(UnknownVariant { id: 9, .. })
     ));
-    assert_eq!(hex(&encode_to_vec(&decoded).unwrap()), "8209f5");
+    assert_eq!(
+        hex(&encode_to_vec(&decoded, encode_limits()).unwrap()),
+        "8209f5"
+    );
 }
 
 #[test]
@@ -374,7 +378,7 @@ fn generated_enum_view_validates_and_caches_payload() {
 #[test]
 fn transparent_newtype_uses_inner_wire_encoding() {
     let value = AccountId(String::from("abc"));
-    assert_abi_vector("account-id", &value, "63616263");
+    assert_abi_vector("account-id", &value, "63616263", encode_limits());
 
     let decoded: AccountId = decode(
         &[0x63, b'a', b'b', b'c'],

@@ -94,7 +94,7 @@ def main() -> None:
             raise SystemExit(f"missing cargo package archive for {name}: {archive}")
 
     source = r'''use sacp_cbor::{CborDecode, CborEncode, DecodeLimits};
-use sacp_cbor_abi::CborAbi;
+use sacp_cbor_abi::{AbiType, CborAbi};
 use sacp_cbor_schema::{
     FieldDef, FieldType, RecordDef, RecordSchema, SchemaCompileLimits,
 };
@@ -110,6 +110,27 @@ struct NativeMessage {
 struct PublicMessage {
     #[abi(id = 1)]
     id: u64,
+    #[abi(id = 2)]
+    values: Vec<u64>,
+}
+
+struct BorrowedPublicMessage<'a> {
+    id: u64,
+    values: &'a [u64],
+}
+
+impl PublicMessageAbiProjection for BorrowedPublicMessage<'_> {
+    type Error = core::convert::Infallible;
+    type FieldId<'a> = u64 where Self: 'a;
+    type FieldValues<'a> = &'a [u64] where Self: 'a;
+
+    fn id(&self) -> Result<Self::FieldId<'_>, Self::Error> {
+        Ok(self.id)
+    }
+
+    fn values(&self) -> Result<Self::FieldValues<'_>, Self::Error> {
+        Ok(self.values)
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -121,8 +142,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert_eq!(decoded, native);
 
-    let public = PublicMessage { id: 9 };
-    let abi_bytes = sacp_cbor_abi::encode_to_vec(&public)?;
+    let public = PublicMessage { id: 9, values: vec![1, 24, 256] };
+    let abi_limits = sacp_cbor::EncodeLimits::for_bytes(128);
+    let abi_bytes = sacp_cbor_abi::encode_to_vec(
+        &public,
+        abi_limits,
+    )?;
+    let borrowed = BorrowedPublicMessage { id: public.id, values: &public.values };
+    let projected = PublicMessageAbiProjected::new(&borrowed);
+    let projected_bytes = sacp_cbor_abi::encode_to_vec(&projected, abi_limits)?;
+    assert_eq!(projected_bytes, abi_bytes);
+    let encoded_len = sacp_cbor_abi::encode_to_sink(
+        &projected,
+        sacp_cbor::CountingSink::new(),
+        abi_limits,
+    )?;
+    assert_eq!(encoded_len, abi_bytes.len());
+    let _wire_hash = PublicMessage::schema().wire_hash(abi_limits)?;
     let abi_decoded: PublicMessage = sacp_cbor_abi::decode(
         &abi_bytes,
         DecodeLimits::for_bytes(abi_bytes.len()),

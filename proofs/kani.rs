@@ -17,6 +17,18 @@ struct TwoByteSink {
     len: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CallerError {
+    Encode(EncodeError<CborError>),
+    Refused,
+}
+
+impl From<EncodeError<CborError>> for CallerError {
+    fn from(error: EncodeError<CborError>) -> Self {
+        Self::Encode(error)
+    }
+}
+
 impl TwoByteSink {
     const fn new() -> Self {
         Self {
@@ -350,5 +362,35 @@ fn encoder_poison_is_sticky_after_text_output_limit() {
     );
     assert!(enc.is_empty());
     assert!(matches!(enc.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[kani::proof]
+fn encoder_poison_is_sticky_after_caller_error() {
+    let mut enc = Encoder::new();
+    let err = enc
+        .encode_with_caller_error(|value| {
+            value.null()?;
+            Err(CallerError::Refused)
+        })
+        .unwrap_err();
+    assert!(err == CallerError::Refused);
+    assert!(matches!(enc.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[kani::proof]
+fn impossible_array_length_is_rejected_before_callback_or_output() {
+    let mut enc = Encoder::new();
+    let mut called = false;
+    let err = enc
+        .array(usize::MAX, |_array| {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, EncodeError::Cbor(error) if error.code == ErrorCode::LengthOverflow));
+    assert!(!called);
+    assert!(enc.is_empty());
     assert!(matches!(enc.finish(), Err(EncodeError::Poisoned)));
 }

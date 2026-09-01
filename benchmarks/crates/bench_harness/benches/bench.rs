@@ -218,6 +218,133 @@ enum AbiBenchCommand {
     Unknown(sacp_cbor_abi::UnknownVariant),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, sacp_cbor_abi::CborAbi)]
+#[abi(type_id = "bench.AbiSequenceBatch", version = 1)]
+struct AbiSequenceBatch {
+    #[abi(id = 1)]
+    label: String,
+    #[abi(id = 2)]
+    values: Vec<u64>,
+}
+
+struct AbiSliceBatch<'a> {
+    label: &'a str,
+    values: &'a [u64],
+}
+
+impl AbiSequenceBatchAbiProjection for AbiSliceBatch<'_> {
+    type Error = core::convert::Infallible;
+    type FieldLabel<'a>
+        = &'a str
+    where
+        Self: 'a;
+    type FieldValues<'a>
+        = &'a [u64]
+    where
+        Self: 'a;
+
+    fn label(&self) -> Result<Self::FieldLabel<'_>, Self::Error> {
+        Ok(self.label)
+    }
+
+    fn values(&self) -> Result<Self::FieldValues<'_>, Self::Error> {
+        Ok(self.values)
+    }
+}
+
+struct AbiIndex<'a>(&'a [u64]);
+
+impl<'a> sacp_cbor_abi::ExactIndexProjection for AbiIndex<'a> {
+    type Error = core::convert::Infallible;
+    type Item = &'a u64;
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn project(&self, index: usize) -> Result<Self::Item, Self::Error> {
+        Ok(&self.0[index])
+    }
+}
+
+struct AbiIndexedBatch<'a> {
+    label: &'a str,
+    values: &'a [u64],
+}
+
+impl AbiSequenceBatchAbiProjection for AbiIndexedBatch<'_> {
+    type Error = core::convert::Infallible;
+    type FieldLabel<'a>
+        = &'a str
+    where
+        Self: 'a;
+    type FieldValues<'a>
+        = sacp_cbor_abi::ExactIndexedSequence<AbiIndex<'a>>
+    where
+        Self: 'a;
+
+    fn label(&self) -> Result<Self::FieldLabel<'_>, Self::Error> {
+        Ok(self.label)
+    }
+
+    fn values(&self) -> Result<Self::FieldValues<'_>, Self::Error> {
+        Ok(sacp_cbor_abi::exact_indexed_sequence(AbiIndex(self.values)))
+    }
+}
+
+struct AbiEmittingSource<'a>(&'a [u64]);
+
+impl sacp_cbor_abi::SequenceProjection<sacp_cbor_abi::wire::U64> for AbiEmittingSource<'_> {
+    type Error = core::convert::Infallible;
+
+    fn declared_len(&self) -> Result<usize, Self::Error> {
+        Ok(self.0.len())
+    }
+
+    fn project<S: sacp_cbor::ByteSink>(
+        &self,
+        emitter: &mut sacp_cbor_abi::SequenceEmitter<
+            '_,
+            '_,
+            S,
+            sacp_cbor_abi::wire::U64,
+            Self::Error,
+        >,
+    ) -> Result<(), sacp_cbor_abi::AbiEncodeError<S::Error, Self::Error>> {
+        for value in self.0 {
+            emitter.emit(value)?;
+        }
+        Ok(())
+    }
+}
+
+struct AbiEmittingBatch<'a> {
+    label: &'a str,
+    values: &'a [u64],
+}
+
+impl AbiSequenceBatchAbiProjection for AbiEmittingBatch<'_> {
+    type Error = core::convert::Infallible;
+    type FieldLabel<'a>
+        = &'a str
+    where
+        Self: 'a;
+    type FieldValues<'a>
+        = sacp_cbor_abi::ProjectedSequence<AbiEmittingSource<'a>>
+    where
+        Self: 'a;
+
+    fn label(&self) -> Result<Self::FieldLabel<'_>, Self::Error> {
+        Ok(self.label)
+    }
+
+    fn values(&self) -> Result<Self::FieldValues<'_>, Self::Error> {
+        Ok(sacp_cbor_abi::projected_sequence(AbiEmittingSource(
+            self.values,
+        )))
+    }
+}
+
 struct AbiWorkload {
     name: &'static str,
     canon: sacp_cbor::CanonicalCbor,
@@ -227,30 +354,36 @@ static ABI_MESSAGE_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
 static ABI_FLAT16_WORKLOAD: OnceLock<AbiWorkload> = OnceLock::new();
 static ABI_UNKNOWN_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
 static ABI_COMMAND_WORKLOADS: OnceLock<Vec<AbiWorkload>> = OnceLock::new();
-static ABI_MESSAGE_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
-static ABI_MESSAGE_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
-    OnceLock::new();
-static ABI_UNKNOWN_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
-static ABI_UNKNOWN_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
-    OnceLock::new();
-static ABI_NAMED_CHILD_SCHEMA: OnceLock<&'static sacp_cbor_abi::Schema> = OnceLock::new();
-static ABI_NAMED_CHILD_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeSchema<'static>> = OnceLock::new();
-static ABI_NAMED_ROOT_RUNTIME: OnceLock<sacp_cbor_abi::RuntimeFieldSetSchema<'static>> =
-    OnceLock::new();
 static ABI_NAMED_WORKLOAD: OnceLock<AbiWorkload> = OnceLock::new();
 
-struct AbiBenchRegistry {
-    schema: &'static sacp_cbor_abi::RuntimeSchema<'static>,
-}
+static ABI_NAMED_CHILD_SCHEMA: sacp_cbor_abi::Schema = sacp_cbor_abi::Schema::new(
+    "bench.NamedChild",
+    1,
+    sacp_cbor_abi::TypeDef::Primitive {
+        ty: sacp_cbor_abi::TypeRef::U64,
+    },
+);
 
-impl<'s> sacp_cbor_abi::AbiSchemaRegistry<'s> for AbiBenchRegistry {
-    fn resolve(
-        &'s self,
-        type_id: &str,
-        version: Option<u32>,
-    ) -> Option<&'s sacp_cbor_abi::RuntimeSchema<'s>> {
+static ABI_NAMED_ROOT_SCHEMA: sacp_cbor_abi::Schema = sacp_cbor_abi::Schema::new(
+    "bench.NamedRoot",
+    1,
+    sacp_cbor_abi::TypeDef::Struct(sacp_cbor_abi::FieldSetDef::new(
+        &[sacp_cbor_abi::FieldDef::new(
+            1,
+            "child",
+            sacp_cbor_abi::TypeRef::named("bench.NamedChild", Some(1)),
+            sacp_cbor_abi::FieldPresence::Required,
+        )],
+        sacp_cbor_abi::UnknownFieldPolicy::Reject,
+    )),
+);
+
+struct AbiBenchRegistry;
+
+impl sacp_cbor_abi::AbiSchemaRegistry for AbiBenchRegistry {
+    fn resolve(&self, type_id: &str, version: Option<u32>) -> Option<sacp_cbor_abi::RuntimeSchema> {
         if type_id == "bench.NamedChild" && version == Some(1) {
-            Some(self.schema)
+            Some(sacp_cbor_abi::RuntimeSchema::new(&ABI_NAMED_CHILD_SCHEMA))
         } else {
             None
         }
@@ -258,79 +391,32 @@ impl<'s> sacp_cbor_abi::AbiSchemaRegistry<'s> for AbiBenchRegistry {
 }
 
 fn abi_message_schema() -> &'static sacp_cbor_abi::Schema {
-    ABI_MESSAGE_SCHEMA.get_or_init(|| {
-        Box::leak(Box::new(
-            <AbiBenchMessage as sacp_cbor_abi::AbiType>::schema(),
-        ))
-    })
+    <AbiBenchMessage as sacp_cbor_abi::AbiType>::schema()
 }
 
-fn abi_message_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
-    ABI_MESSAGE_RUNTIME.get_or_init(|| {
-        match sacp_cbor_abi::compile_runtime_schema(abi_message_schema())
-            .expect("compile runtime ABI message schema")
-        {
-            sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
-            _ => unreachable!("AbiBenchMessage schema is a struct"),
-        }
-    })
+fn abi_message_runtime_schema() -> sacp_cbor_abi::RuntimeFieldSetSchema {
+    match sacp_cbor_abi::RuntimeSchema::new(abi_message_schema()) {
+        sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+        _ => unreachable!("AbiBenchMessage schema is a struct"),
+    }
 }
 
 fn abi_unknown_schema() -> &'static sacp_cbor_abi::Schema {
-    ABI_UNKNOWN_SCHEMA.get_or_init(|| {
-        Box::leak(Box::new(
-            <AbiUnknownPreserve as sacp_cbor_abi::AbiType>::schema(),
-        ))
-    })
+    <AbiUnknownPreserve as sacp_cbor_abi::AbiType>::schema()
 }
 
-fn abi_unknown_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
-    ABI_UNKNOWN_RUNTIME.get_or_init(|| {
-        match sacp_cbor_abi::compile_runtime_schema(abi_unknown_schema())
-            .expect("compile runtime ABI unknown schema")
-        {
-            sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
-            _ => unreachable!("AbiUnknownPreserve schema is a struct"),
-        }
-    })
+fn abi_unknown_runtime_schema() -> sacp_cbor_abi::RuntimeFieldSetSchema {
+    match sacp_cbor_abi::RuntimeSchema::new(abi_unknown_schema()) {
+        sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+        _ => unreachable!("AbiUnknownPreserve schema is a struct"),
+    }
 }
 
-fn abi_named_child_schema() -> &'static sacp_cbor_abi::Schema {
-    ABI_NAMED_CHILD_SCHEMA.get_or_init(|| {
-        Box::leak(Box::new(sacp_cbor_abi::Schema::new(
-            "bench.NamedChild",
-            1,
-            sacp_cbor_abi::TypeDef::Primitive {
-                ty: sacp_cbor_abi::TypeRef::U64,
-            },
-        )))
-    })
-}
-
-fn abi_named_child_runtime_schema() -> &'static sacp_cbor_abi::RuntimeSchema<'static> {
-    ABI_NAMED_CHILD_RUNTIME.get_or_init(|| {
-        sacp_cbor_abi::compile_runtime_schema(abi_named_child_schema())
-            .expect("compile named child runtime schema")
-    })
-}
-
-fn abi_named_root_runtime_schema() -> &'static sacp_cbor_abi::RuntimeFieldSetSchema<'static> {
-    ABI_NAMED_ROOT_RUNTIME.get_or_init(|| {
-        let def = Box::leak(Box::new(sacp_cbor_abi::FieldSetDef {
-            fields: vec![sacp_cbor_abi::FieldDef {
-                id: 1,
-                name: "child".to_string(),
-                ty: sacp_cbor_abi::TypeRef::Named {
-                    type_id: "bench.NamedChild".to_string(),
-                    version: Some(1),
-                },
-                presence: sacp_cbor_abi::FieldPresence::Required,
-            }],
-            unknown_fields: sacp_cbor_abi::UnknownFieldPolicy::Reject,
-        }));
-        sacp_cbor_abi::RuntimeFieldSetSchema::compile(def)
-            .expect("compile named root runtime schema")
-    })
+fn abi_named_root_runtime_schema() -> sacp_cbor_abi::RuntimeFieldSetSchema {
+    match sacp_cbor_abi::RuntimeSchema::new(&ABI_NAMED_ROOT_SCHEMA) {
+        sacp_cbor_abi::RuntimeSchema::Struct(schema) => schema,
+        _ => unreachable!("named root schema is a struct"),
+    }
 }
 
 fn abi_named_workload() -> &'static AbiWorkload {
@@ -349,8 +435,13 @@ fn abi_payload(len: usize) -> sacp_cbor::bytes::Bytes {
     sacp_cbor::bytes::Bytes::new(bytes)
 }
 
-fn abi_canon<T: sacp_cbor_abi::AbiEncode>(value: &T) -> sacp_cbor::CanonicalCbor {
-    sacp_cbor_abi::encode_to_canonical(value).expect("encode ABI workload")
+fn abi_canon<T>(value: &T) -> sacp_cbor::CanonicalCbor
+where
+    T: sacp_cbor_abi::AbiEncode,
+    T::Error: core::fmt::Debug,
+{
+    sacp_cbor_abi::encode_to_canonical(value, sacp_cbor::EncodeLimits::unbounded())
+        .expect("encode ABI workload")
 }
 
 fn abi_message_workloads() -> &'static [AbiWorkload] {
@@ -974,25 +1065,24 @@ fn bench_abi_unknown_preserve(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_abi_runtime_compile(c: &mut Criterion) {
-    let mut group = c.benchmark_group("abi_runtime_compile");
+fn bench_abi_runtime_prepare(c: &mut Criterion) {
+    let mut group = c.benchmark_group("abi_runtime_prepare");
 
-    if let sacp_cbor_abi::TypeDef::Struct(def) = &abi_message_schema().root {
-        group.bench_function(BenchmarkId::new("runtime-compile", "abi_message"), |b| {
+    if let sacp_cbor_abi::TypeDef::Struct(def) = abi_message_schema().root() {
+        group.bench_function(BenchmarkId::new("runtime-prepare", "abi_message"), |b| {
             b.iter(|| {
-                let schema = sacp_cbor_abi::RuntimeFieldSetSchema::compile(black_box(def)).unwrap();
+                let schema = sacp_cbor_abi::RuntimeFieldSetSchema::new(black_box(def));
                 black_box(schema);
             })
         });
     }
 
-    if let sacp_cbor_abi::TypeDef::Struct(def) = &abi_unknown_schema().root {
+    if let sacp_cbor_abi::TypeDef::Struct(def) = abi_unknown_schema().root() {
         group.bench_function(
-            BenchmarkId::new("runtime-compile", "unknown_preserve"),
+            BenchmarkId::new("runtime-prepare", "unknown_preserve"),
             |b| {
                 b.iter(|| {
-                    let schema =
-                        sacp_cbor_abi::RuntimeFieldSetSchema::compile(black_box(def)).unwrap();
+                    let schema = sacp_cbor_abi::RuntimeFieldSetSchema::new(black_box(def));
                     black_box(schema);
                 })
             },
@@ -1002,19 +1092,92 @@ fn bench_abi_runtime_compile(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_abi_projection_encode(c: &mut Criterion) {
+    let values: Vec<u64> = (0..4096).map(|value| value * 17).collect();
+    let owned = AbiSequenceBatch {
+        label: "projection".to_owned(),
+        values: values.clone(),
+    };
+    let slice = AbiSliceBatch {
+        label: "projection",
+        values: &values,
+    };
+    let indexed = AbiIndexedBatch {
+        label: "projection",
+        values: &values,
+    };
+    let emitting = AbiEmittingBatch {
+        label: "projection",
+        values: &values,
+    };
+    let limits = sacp_cbor::EncodeLimits::unbounded();
+    let expected =
+        sacp_cbor_abi::encode_to_sink(&owned, sacp_cbor::CountingSink::new(), limits).unwrap();
+    let mut group = c.benchmark_group("abi_projection_encode");
+    group.throughput(Throughput::Bytes(expected as u64));
+
+    group.bench_function("owned_vec", |b| {
+        b.iter(|| {
+            black_box(
+                sacp_cbor_abi::encode_to_sink(
+                    black_box(&owned),
+                    sacp_cbor::CountingSink::new(),
+                    limits,
+                )
+                .unwrap(),
+            )
+        })
+    });
+    group.bench_function("borrowed_slice", |b| {
+        b.iter(|| {
+            black_box(
+                sacp_cbor_abi::encode_to_sink(
+                    &AbiSequenceBatchAbiProjected::new(black_box(&slice)),
+                    sacp_cbor::CountingSink::new(),
+                    limits,
+                )
+                .unwrap(),
+            )
+        })
+    });
+    group.bench_function("exact_indexed", |b| {
+        b.iter(|| {
+            black_box(
+                sacp_cbor_abi::encode_to_sink(
+                    &AbiSequenceBatchAbiProjected::new(black_box(&indexed)),
+                    sacp_cbor::CountingSink::new(),
+                    limits,
+                )
+                .unwrap(),
+            )
+        })
+    });
+    group.bench_function("source_driven", |b| {
+        b.iter(|| {
+            black_box(
+                sacp_cbor_abi::encode_to_sink(
+                    &AbiSequenceBatchAbiProjected::new(black_box(&emitting)),
+                    sacp_cbor::CountingSink::new(),
+                    limits,
+                )
+                .unwrap(),
+            )
+        })
+    });
+    group.finish();
+}
+
 fn bench_abi_runtime_named(c: &mut Criterion) {
     let mut group = c.benchmark_group("abi_runtime_named");
     let runtime_schema = abi_named_root_runtime_schema();
     let data = abi_named_workload();
     let bytes = data.canon.as_bytes();
-    let registry = AbiBenchRegistry {
-        schema: abi_named_child_runtime_schema(),
-    };
+    let registry = AbiBenchRegistry;
     let limits = sacp_cbor_abi::RuntimeValidationLimits::new(16, 1_024, 1_024, 32);
     group.throughput(Throughput::Bytes(bytes.len() as u64));
 
     group.bench_function(
-        BenchmarkId::new("abi-runtime-named-registry-compiled", data.name),
+        BenchmarkId::new("abi-runtime-named-registry-static", data.name),
         |b| {
             let mut workspace = sacp_cbor_abi::RuntimeValidationWorkspace::new();
             workspace.prepare(limits).unwrap();
@@ -1502,7 +1665,8 @@ criterion_group! {
         bench_abi_view_access,
         bench_abi_unknown_preserve,
         bench_abi_enum_access,
-        bench_abi_runtime_compile,
+        bench_abi_projection_encode,
+        bench_abi_runtime_prepare,
         bench_abi_runtime_named,
         bench_patch,
         bench_appendix_a,

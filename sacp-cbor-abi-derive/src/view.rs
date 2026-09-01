@@ -1,31 +1,17 @@
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, DataEnum, DataStruct, Fields, Generics, Ident, Lifetime, Visibility};
+use syn::{Generics, Ident, Lifetime, Visibility};
 
 use crate::{
-    enum_variant_specs, named_field_specs, resolve_unknown_variant_mode, storage_ident,
-    transparent_inner, ty_generics_with_lifetime, validate_unknown_field_storage, view_type,
-    ContainerAttr, FieldSetSpec, UnknownFieldMode, UnknownVariantMode,
+    storage_ident, ty_generics_with_lifetime, view_type, ContainerAttr, FieldSetSpec,
+    TransparentInner, UnknownFieldMode, UnknownVariantMode, VariantSpec,
 };
 pub(crate) fn derive_struct_view(
     vis: &Visibility,
     name: &Ident,
     generics: &Generics,
-    data: &DataStruct,
+    field_set: &FieldSetSpec<'_>,
     attrs: &ContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    if attrs.transparent {
-        return derive_transparent_struct_view(vis, name, generics, data, attrs);
-    }
-
-    let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new(
-            data.fields.span(),
-            "field-set ABI structs must use named fields",
-        ));
-    };
-    let field_set = named_field_specs(fields)?;
-    validate_unknown_field_storage(&field_set, attrs.unknown_fields, data.fields.span())?;
-
     let view_name = format_ident!("{name}View");
     let view_lifetime: Lifetime = syn::parse_quote!('__sacp_view);
     let abi_path = &attrs.abi_path;
@@ -49,7 +35,7 @@ pub(crate) fn derive_struct_view(
     let tokens = field_set_view_tokens(
         vis,
         &view_name,
-        &field_set,
+        field_set,
         attrs.unknown_fields,
         attrs,
         Some(to_owned),
@@ -74,14 +60,13 @@ pub(crate) fn derive_struct_view(
     })
 }
 
-fn derive_transparent_struct_view(
+pub(crate) fn derive_transparent_struct_view(
     vis: &Visibility,
     name: &Ident,
     generics: &Generics,
-    data: &DataStruct,
+    inner: &TransparentInner<'_>,
     attrs: &ContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let inner = transparent_inner(data)?;
     let view_name = format_ident!("{name}View");
     let abi_path = &attrs.abi_path;
     let cbor_path = &attrs.cbor_path;
@@ -415,17 +400,10 @@ pub(crate) fn derive_enum_view(
     vis: &Visibility,
     name: &Ident,
     generics: &Generics,
-    data: &DataEnum,
+    variants: &[VariantSpec<'_>],
+    unknown_mode: UnknownVariantMode,
     attrs: &ContainerAttr,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    if data.variants.is_empty() {
-        return Err(syn::Error::new(
-            data.enum_token.span(),
-            "CborAbi does not support empty enums",
-        ));
-    }
-    let (variants, unknown_variant) = enum_variant_specs(data, attrs.unknown_fields)?;
-    let unknown_mode = resolve_unknown_variant_mode(attrs, unknown_variant.as_ref())?;
     let view_name = format_ident!("{name}View");
     let abi_path = &attrs.abi_path;
     let cbor_path = &attrs.cbor_path;
