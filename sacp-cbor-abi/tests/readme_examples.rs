@@ -1,8 +1,12 @@
-use sacp_cbor::{CanonicalCbor, DecodeLimits};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, EncodeLimits};
 use sacp_cbor_abi::{
-    compile_runtime_schema, decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass,
-    NoNamedSchemas, RuntimeSchema, UnknownFields, UnknownVariant,
+    decode, encode_to_vec, AbiType, CborAbi, CompatibilityClass, NoNamedSchemas, RuntimeSchema,
+    UnknownFields, UnknownVariant,
 };
+
+fn encode_limits() -> EncodeLimits {
+    EncodeLimits::for_bytes(4096)
+}
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
 #[abi(type_id = "ledger.Transfer", version = 1)]
@@ -107,7 +111,7 @@ fn stable_public_abi_readme_examples_match_api() {
         memo: None,
     };
 
-    let bytes = encode_to_vec(&value).unwrap();
+    let bytes = encode_to_vec(&value, encode_limits()).unwrap();
     let decoded: Transfer = decode(&bytes, DecodeLimits::for_bytes(bytes.len()), &mut ()).unwrap();
     assert_eq!(decoded, value);
     assert_eq!(
@@ -115,8 +119,8 @@ fn stable_public_abi_readme_examples_match_api() {
         [0x86, 0x01, 0x19, 0x03, 0xe9, 0x02, 0x19, 0x07, 0xd2, 0x03, 0x19, 0x13, 0x88]
     );
 
-    let wire_hash = Transfer::schema().wire_hash().unwrap();
-    let full_hash = Transfer::schema().full_hash().unwrap();
+    let wire_hash = Transfer::schema().wire_hash(encode_limits()).unwrap();
+    let full_hash = Transfer::schema().full_hash(encode_limits()).unwrap();
     assert_ne!(wire_hash, full_hash);
 
     let canon = CanonicalCbor::from_slice(&bytes, DecodeLimits::for_bytes(bytes.len())).unwrap();
@@ -126,8 +130,7 @@ fn stable_public_abi_readme_examples_match_api() {
     assert_eq!(view.amount_raw().unwrap().as_bytes(), &[0x19, 0x13, 0x88]);
     assert_eq!(view.to_owned(&mut ()).unwrap(), value);
 
-    let schema = Transfer::schema();
-    let RuntimeSchema::Struct(runtime) = compile_runtime_schema(&schema).unwrap() else {
+    let RuntimeSchema::Struct(runtime) = RuntimeSchema::new(Transfer::schema()) else {
         unreachable!("Transfer schema is a struct")
     };
     let limits = sacp_cbor_abi::RuntimeValidationLimits::new(8, 64, 64, 16);
@@ -154,7 +157,7 @@ fn stable_public_abi_readme_examples_match_api() {
 
 #[test]
 fn stable_public_abi_readme_schema_and_facade_examples_match_api() {
-    let report = sacp_cbor_abi::diff(&TransferV1::schema(), &TransferV2::schema());
+    let report = sacp_cbor_abi::diff(TransferV1::schema(), TransferV2::schema());
     assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
     assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
     assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
@@ -163,7 +166,7 @@ fn stable_public_abi_readme_schema_and_facade_examples_match_api() {
         transfer_id: String::from("tx-1"),
         priority: 7,
     };
-    let bytes = encode_to_vec(&command).unwrap();
+    let bytes = encode_to_vec(&command, encode_limits()).unwrap();
     assert_eq!(
         bytes,
         [0x82, 0x01, 0x84, 0x01, 0x64, b't', b'x', b'-', b'1', 0x02, 0x07]
@@ -178,7 +181,7 @@ fn stable_public_abi_readme_schema_and_facade_examples_match_api() {
         },
         unknown: UnknownFields::empty(),
     };
-    let envelope_bytes = encode_to_vec(&envelope).unwrap();
+    let envelope_bytes = encode_to_vec(&envelope, encode_limits()).unwrap();
     let envelope_canon = CanonicalCbor::from_slice(
         &envelope_bytes,
         DecodeLimits::for_bytes(envelope_bytes.len()),
@@ -191,7 +194,7 @@ fn stable_public_abi_readme_schema_and_facade_examples_match_api() {
 
     let facade = FacadeTransfer { amount: 9 };
     assert_eq!(
-        wire::abi::encode_to_vec(&facade).unwrap(),
+        wire::abi::encode_to_vec(&facade, encode_limits()).unwrap(),
         [0x82, 0x01, 0x09]
     );
 }

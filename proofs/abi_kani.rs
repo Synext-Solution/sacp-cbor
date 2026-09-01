@@ -1,5 +1,5 @@
-use crate::runtime::validate_sorted_schema_ids;
 use crate::view::{validate_abi_id_value, validate_sorted_query_ids};
+use crate::{TypeAtom, TypeRef};
 use sacp_cbor::{CborError, ErrorCode};
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
@@ -54,15 +54,24 @@ fn sorted_query_ids_accepts_exact_strict_nonzero_order_for_len3() {
 }
 
 #[kani::proof]
-#[kani::unwind(4)]
-fn runtime_schema_ids_accept_exact_strict_nonzero_order_for_len3() {
-    let ids = [kani::any::<u32>(), kani::any::<u32>(), kani::any::<u32>()];
-    let actual = validate_sorted_schema_ids(&ids);
-    let valid = ids[0] != 0 && ids[1] != 0 && ids[2] != 0 && ids[0] < ids[1] && ids[1] < ids[2];
-
-    if valid {
-        assert!(actual.is_ok());
-    } else {
-        assert!(actual.is_err());
+#[kani::unwind(5)]
+fn protocol_sequence_depth_roundtrips_without_a_collection_type() {
+    let depth: u32 = kani::any();
+    kani::assume(depth <= 3);
+    let mut ty = TypeRef::U64;
+    let mut wrapped = 0;
+    while wrapped < depth {
+        ty = TypeRef::sequence(ty);
+        wrapped += 1;
     }
+    assert!(ty.sequence_depth() == depth);
+    assert!(ty.terminal() == TypeAtom::U64);
+
+    let mut peeled = 0;
+    while let Some(item) = ty.sequence_item() {
+        ty = item;
+        peeled += 1;
+    }
+    assert!(peeled == depth);
+    assert!(ty == TypeRef::U64);
 }

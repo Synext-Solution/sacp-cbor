@@ -5,7 +5,7 @@ error[E0107]: trait takes 1 generic argument but 0 generic arguments were suppli
   |                                   ^^^^^^^^^ expected 1 generic argument
   |
 note: trait defined here, with 1 generic parameter: `C`
- --> src/lib.rs
+ --> src/decode_abi.rs
   |
   | pub trait AbiDecode<'de, C: AbiDecodeContext + ?Sized>: Sized {
   |           ^^^^^^^^^      -

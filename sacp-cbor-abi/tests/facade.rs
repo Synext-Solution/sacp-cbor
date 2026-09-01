@@ -1,22 +1,16 @@
 mod wire {
     pub mod abi {
-        pub use sacp_cbor_abi::{
-            __private, decode, decode_canonical, encode_to_vec, AbiDecode, AbiDecodeContext,
-            AbiDecodeLocation, AbiDecodeValue, AbiEncode, AbiFieldSetRef, AbiType, AbiTypeRef,
-            AbiView, AbiViewField, CborAbi, FieldDef, FieldPresence, FieldSetDef, Schema, TypeDef,
-            TypeRef, UnknownField, UnknownFieldPolicy, UnknownFieldRef, UnknownFields,
-        };
+        pub use sacp_cbor_abi::*;
     }
 
     pub mod cbor {
         pub use sacp_cbor::{
-            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, EncodeResult, ErrorCode,
-            ValueEncoder,
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, ErrorCode, ValueEncoder,
         };
     }
 }
 
-use wire::abi::{decode, encode_to_vec, CborAbi, UnknownFields};
+use wire::abi::{decode, encode_to_vec, CborAbi, EncodeLimits, UnknownFields};
 
 #[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
 #[abi(
@@ -44,7 +38,10 @@ fn facade_abi_derive_roundtrips() {
     .unwrap();
     assert_eq!(decoded.amount, 5);
     assert_eq!(decoded.unknown.len(), 1);
-    assert_eq!(encode_to_vec(&decoded).unwrap(), bytes);
+    assert_eq!(
+        encode_to_vec(&decoded, EncodeLimits::for_bytes(64)).unwrap(),
+        bytes
+    );
 
     let canon = sacp_cbor::CanonicalCbor::from_slice(
         &bytes,
