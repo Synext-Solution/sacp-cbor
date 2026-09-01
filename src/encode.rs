@@ -77,6 +77,69 @@ impl<E> std::error::Error for EncodeError<E> where E: std::error::Error + 'stati
 /// Result returned by a sink-generic encoding operation.
 pub type EncodeResult<T, S> = Result<T, EncodeError<<S as ByteSink>::Error>>;
 
+/// Identifies which child of a [`FanoutSink`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutError<L, R> {
+    /// The left sink failed before the write or finish could proceed to the right sink.
+    Left(L),
+    /// The right sink failed after the corresponding left operation succeeded.
+    Right(R),
+}
+
+impl<L: fmt::Display, R: fmt::Display> fmt::Display for FanoutError<L, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Left(error) => write!(formatter, "left fan-out sink failed: {error}"),
+            Self::Right(error) => write!(formatter, "right fan-out sink failed: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<L, R> std::error::Error for FanoutError<L, R>
+where
+    L: std::error::Error + 'static,
+    R: std::error::Error + 'static,
+{
+}
+
+/// Sink that forwards every byte chunk to two child sinks without copying it.
+///
+/// Writes and finish operations are deliberately ordered left then right. Fan-out is not atomic:
+/// either child may have side effects before returning an error, and a right-side failure happens
+/// after the matching left-side operation has succeeded. When used through [`Encoder`], any such
+/// write failure poisons the encoder, so no later write or finish is attempted. Put the sink whose
+/// failure must prevent the other side effect on the left.
+#[derive(Debug)]
+pub struct FanoutSink<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> FanoutSink<L, R> {
+    /// Create a left-then-right fan-out sink.
+    #[must_use]
+    pub const fn new(left: L, right: R) -> Self {
+        Self { left, right }
+    }
+}
+
+impl<L: ByteSink, R: ByteSink> ByteSink for FanoutSink<L, R> {
+    type Error = FanoutError<L::Error, R::Error>;
+    type Output = (L::Output, R::Output);
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.left.write(bytes).map_err(FanoutError::Left)?;
+        self.right.write(bytes).map_err(FanoutError::Right)
+    }
+
+    fn finish(self) -> Result<Self::Output, Self::Error> {
+        let left = self.left.finish().map_err(FanoutError::Left)?;
+        let right = self.right.finish().map_err(FanoutError::Right)?;
+        Ok((left, right))
+    }
+}
+
 /// Allocation-backed byte sink.
 #[derive(Debug, Default)]
 pub struct VecSink {
@@ -405,7 +468,15 @@ impl<S: ByteSink> Encoder<S> {
     where
         F: FnOnce(&mut Self) -> EncodeResult<T, S>,
     {
-        self.ensure_healthy()?;
+        self.attempt_with_caller_error(operation)
+    }
+
+    fn attempt_with_caller_error<T, E, F>(&mut self, operation: F) -> Result<T, E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut Self) -> Result<T, E>,
+    {
+        self.ensure_healthy().map_err(E::from)?;
         match operation(self) {
             Ok(value) => Ok(value),
             Err(error) => {
@@ -419,32 +490,24 @@ impl<S: ByteSink> Encoder<S> {
         self.poisoned = true;
     }
 
-    #[cfg(feature = "serde")]
     pub(crate) fn guarded_value<E, F>(&mut self, operation: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
         F: FnOnce(&mut Self) -> Result<(), E>,
     {
-        self.ensure_healthy().map_err(E::from)?;
-        let before = self.slot_state();
-        match operation(self) {
-            Ok(()) => {
-                self.ensure_healthy().map_err(E::from)?;
-                if self.consumed_exactly_one(before) {
-                    Ok(())
-                } else {
-                    self.poisoned = true;
-                    Err(E::from(format_error(
-                        ErrorCode::MalformedCanonical,
-                        self.written,
-                    )))
-                }
+        self.attempt_with_caller_error(|encoder| {
+            let before = encoder.slot_state();
+            operation(encoder)?;
+            encoder.ensure_healthy().map_err(E::from)?;
+            if encoder.consumed_exactly_one(before) {
+                Ok(())
+            } else {
+                Err(E::from(format_error(
+                    ErrorCode::MalformedCanonical,
+                    encoder.written,
+                )))
             }
-            Err(error) => {
-                self.poisoned = true;
-                Err(error)
-            }
-        }
+        })
     }
 
     fn write_chunks(&mut self, chunks: &[&[u8]]) -> EncodeResult<(), S> {
@@ -627,6 +690,31 @@ impl<S: ByteSink> Encoder<S> {
             return Err(format_error(ErrorCode::DepthLimitExceeded, self.written));
         }
         try_reserve(&mut self.stack, 1, self.written).map_err(EncodeError::Cbor)
+    }
+
+    fn preflight_array(&self, len: usize) -> EncodeResult<(usize, [u8; 9], usize), S> {
+        self.ensure_healthy()?;
+        self.check_array_len(len)?;
+        let items = self.checked_items(len)?;
+        if self.stack.len() >= self.limits.max_depth {
+            return Err(format_error(ErrorCode::DepthLimitExceeded, self.written));
+        }
+        self.check_value_slot()?;
+        let length = u64::try_from(len)
+            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
+        let (header, header_len) = major_uint_header(4, length);
+        let minimum_output = self
+            .written
+            .checked_add(header_len)
+            .and_then(|value| value.checked_add(len))
+            .ok_or_else(|| format_error(ErrorCode::LengthOverflow, self.written))?;
+        if minimum_output > self.limits.max_output_bytes {
+            return Err(format_error(
+                ErrorCode::MessageLenLimitExceeded,
+                self.written,
+            ));
+        }
+        Ok((items, header, header_len))
     }
 
     fn preflight_map(&self, len: usize) -> EncodeResult<(usize, [u8; 9], usize), S> {
@@ -927,17 +1015,22 @@ impl<S: ByteSink> Encoder<S> {
     where
         F: FnOnce(&mut ValueEncoder<'_, S>) -> EncodeResult<(), S>,
     {
-        self.attempt(|encoder| {
-            let before = encoder.slot_state();
-            {
-                let mut value_encoder = ValueEncoder { encoder };
-                encode(&mut value_encoder)?;
-            }
-            encoder.ensure_healthy()?;
-            if !encoder.consumed_exactly_one(before) {
-                return Err(format_error(ErrorCode::MalformedCanonical, encoder.written));
-            }
-            Ok(())
+        self.encode_with_caller_error(encode)
+    }
+
+    /// Encode exactly one value while preserving a caller-defined error domain.
+    ///
+    /// `E` must losslessly accept core profile and owned sink errors. Any caller error, core error,
+    /// sink failure, or callback that emits other than one value poisons this encoder. This makes
+    /// the method suitable for fallible projections that must not be collapsed into a CBOR error.
+    pub fn encode_with_caller_error<E, F>(&mut self, encode: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+    {
+        self.guarded_value(|encoder| {
+            let mut value_encoder = ValueEncoder { encoder };
+            encode(&mut value_encoder)
         })
     }
 
@@ -951,23 +1044,32 @@ impl<S: ByteSink> Encoder<S> {
     where
         F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
     {
-        self.attempt(|encoder| encoder.array_inner(len, build))
+        self.array_with_caller_error(len, build)
     }
 
-    fn array_inner<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
+    /// Encode a definite-length array while preserving a caller-defined error domain.
+    ///
+    /// The declared length is preflighted before allocation or output. The callback must emit
+    /// exactly `len` elements. Any caller error, length mismatch, core error, or sink failure is
+    /// returned in `E` and poisons this encoder.
+    pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
     where
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
     {
-        self.ensure_healthy()?;
-        self.check_array_len(len)?;
-        let items = self.checked_items(len)?;
-        self.prepare_frame()?;
-        let length = u64::try_from(len)
-            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
-        let (header, header_len) = major_uint_header(4, length);
-        self.check_output_chunks(&[&header[..header_len]])?;
-        self.begin_value()?;
-        self.write_chunks(&[&header[..header_len]])?;
+        self.attempt_with_caller_error(|encoder| encoder.array_inner(len, build))
+    }
+
+    fn array_inner<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+    {
+        let (items, header, header_len) = self.preflight_array(len).map_err(E::from)?;
+        self.prepare_frame().map_err(E::from)?;
+        self.begin_value().map_err(E::from)?;
+        self.write_chunks(&[&header[..header_len]])
+            .map_err(E::from)?;
         self.items_seen = items;
         self.stack.push(Frame::Array { remaining: len });
         let frame_index = self.stack.len() - 1;
@@ -979,8 +1081,8 @@ impl<S: ByteSink> Encoder<S> {
             build(&mut array)
         };
         result?;
-        self.ensure_healthy()?;
-        self.close_container()
+        self.ensure_healthy().map_err(E::from)?;
+        self.close_container().map_err(E::from)
     }
 
     /// Encode a definite-length text-keyed map.
@@ -1026,13 +1128,8 @@ impl<S: ByteSink> Encoder<S> {
 
     #[cfg(feature = "serde")]
     fn array_header_inner(&mut self, len: usize) -> EncodeResult<(), S> {
-        self.check_array_len(len)?;
-        let items = self.checked_items(len)?;
+        let (items, header, header_len) = self.preflight_array(len)?;
         self.prepare_frame()?;
-        let length = u64::try_from(len)
-            .map_err(|_| format_error(ErrorCode::LengthOverflow, self.written))?;
-        let (header, header_len) = major_uint_header(4, length);
-        self.check_output_chunks(&[&header[..header_len]])?;
         self.begin_value()?;
         self.write_chunks(&[&header[..header_len]])?;
         self.items_seen = items;
@@ -1139,12 +1236,35 @@ impl<S: ByteSink> ValueEncoder<'_, S> {
         self.encoder.encode(value)
     }
 
+    /// Encode exactly one value while preserving a caller-defined error domain.
+    ///
+    /// Any returned caller error or core encoding failure poisons the underlying encoder.
+    pub fn encode_with_caller_error<E, F>(&mut self, encode: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+    {
+        self.encoder.encode_with_caller_error(encode)
+    }
+
     /// Encode an array.
     pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
         F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
     {
         self.encoder.array(len, build)
+    }
+
+    /// Encode an array while preserving a caller-defined error domain.
+    ///
+    /// Any returned caller error, declared-length mismatch, or core encoding failure poisons the
+    /// underlying encoder.
+    pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+    {
+        self.encoder.array_with_caller_error(len, build)
     }
 
     /// Encode a map.
@@ -1230,34 +1350,51 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     where
         F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
     {
-        self.enc.ensure_healthy()?;
+        self.value_with_caller_error(emit)
+    }
+
+    /// Emit exactly one item while preserving a caller-defined error domain.
+    ///
+    /// The callback receives the underlying encoder for low-level composition. Any returned caller
+    /// error, core error, or callback that emits other than one item poisons the encoder.
+    pub fn value_with_caller_error<E, F>(&mut self, emit: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut Encoder<S>) -> Result<(), E>,
+    {
+        self.enc.ensure_healthy().map_err(E::from)?;
         let before = match self.remaining() {
             Ok(value) => value,
             Err(error) => {
                 self.enc.poison();
-                return Err(error);
+                return Err(E::from(error));
             }
         };
         if before == 0 {
             self.enc.poison();
-            return Err(format_error(ErrorCode::ArrayLenMismatch, self.enc.written));
+            return Err(E::from(format_error(
+                ErrorCode::ArrayLenMismatch,
+                self.enc.written,
+            )));
         }
-        let result = emit(self.enc);
-        if let Err(error) = result {
+        if let Err(error) = emit(self.enc) {
             self.enc.poison();
             return Err(error);
         }
-        self.enc.ensure_healthy()?;
+        self.enc.ensure_healthy().map_err(E::from)?;
         let after = match self.remaining() {
             Ok(value) => value,
             Err(error) => {
                 self.enc.poison();
-                return Err(error);
+                return Err(E::from(error));
             }
         };
         if after.checked_add(1) != Some(before) {
             self.enc.poison();
-            return Err(format_error(ErrorCode::ArrayLenMismatch, self.enc.written));
+            return Err(E::from(format_error(
+                ErrorCode::ArrayLenMismatch,
+                self.enc.written,
+            )));
         }
         Ok(())
     }
@@ -1275,12 +1412,35 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
         self.enc.encode_with(emit)
     }
 
+    /// Encode exactly one item while preserving a caller-defined error domain.
+    ///
+    /// Any returned caller error or core encoding failure poisons the underlying encoder.
+    pub fn encode_with_caller_error<E, F>(&mut self, emit: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+    {
+        self.enc.encode_with_caller_error(emit)
+    }
+
     /// Encode a nested array.
     pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
         F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
     {
         self.delegate(|encoder| encoder.array(len, build))
+    }
+
+    /// Encode a nested array while preserving a caller-defined error domain.
+    ///
+    /// Any returned caller error, declared-length mismatch, or core encoding failure poisons the
+    /// underlying encoder.
+    pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
+    where
+        E: From<EncodeError<S::Error>>,
+        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+    {
+        self.enc.array_with_caller_error(len, build)
     }
 
     /// Encode a nested map.

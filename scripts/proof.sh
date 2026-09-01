@@ -35,6 +35,8 @@ core_harnesses=(
   encoder_root_slot_accepts_exactly_one_value
   encoder_array_slot_conservation_for_one_scalar
   encoder_poison_is_sticky_after_text_output_limit
+  encoder_poison_is_sticky_after_caller_error
+  impossible_array_length_is_rejected_before_callback_or_output
 )
 
 abi_harnesses=(
