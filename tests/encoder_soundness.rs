@@ -41,6 +41,18 @@ fn assert_cbor<E>(error: EncodeError<E>, code: ErrorCode) {
     assert!(matches!(error, EncodeError::Cbor(error) if error.code == code));
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectionError {
+    Encode(EncodeError<sacp_cbor::CborError>),
+    Refused,
+}
+
+impl From<EncodeError<sacp_cbor::CborError>> for ProjectionError {
+    fn from(error: EncodeError<sacp_cbor::CborError>) -> Self {
+        Self::Encode(error)
+    }
+}
+
 struct EncodeZero;
 
 impl CborEncode for EncodeZero {
@@ -73,6 +85,18 @@ impl CborEncode for SwallowsInnerError {
         enc.null()?;
         let _ = enc.null();
         Ok(())
+    }
+}
+
+struct NestedArray(usize);
+
+impl CborEncode for NestedArray {
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        if self.0 == 0 {
+            enc.null()
+        } else {
+            enc.array(1, |array| array.value(&Self(self.0 - 1)))
+        }
     }
 }
 
@@ -131,6 +155,76 @@ fn controlled_value_callback_cannot_hide_a_swallowed_inner_error() {
         })
         .unwrap_err();
     assert!(matches!(error, EncodeError::Poisoned));
+}
+
+#[test]
+fn encoder_migrates_beyond_the_inline_frame_stack() {
+    let depth = 40usize;
+    let limits = EncodeLimits {
+        max_depth: depth,
+        max_total_items: depth + 1,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    encoder.encode(&NestedArray(depth)).unwrap();
+    let bytes = encoder.finish().unwrap();
+
+    let mut decode_limits = DecodeLimits::for_bytes(bytes.len());
+    decode_limits.max_depth = depth;
+    decode_limits.max_total_items = depth + 1;
+    validate_canonical(&bytes, decode_limits).unwrap();
+}
+
+#[test]
+fn caller_error_is_preserved_after_output_and_poisons_the_encoder() {
+    let mut encoder = Encoder::new();
+    let error = encoder
+        .encode_with_caller_error(|value| {
+            value.null()?;
+            Err(ProjectionError::Refused)
+        })
+        .unwrap_err();
+
+    assert_eq!(error, ProjectionError::Refused);
+    assert_eq!(encoder.as_bytes(), [0xf6]);
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn caller_error_array_underfill_is_typed_and_sticky() {
+    let mut encoder = Encoder::new();
+    let error: ProjectionError = encoder
+        .array_with_caller_error(2, |array| {
+            array.null()?;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ProjectionError::Encode(EncodeError::Cbor(error))
+            if error.code == ErrorCode::ArrayLenMismatch
+    ));
+    assert_eq!(encoder.as_bytes(), [0x82, 0xf6]);
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn impossible_array_length_fails_before_output_or_projection() {
+    let mut encoder = Encoder::new();
+    let mut projected = false;
+    let error = encoder
+        .array(usize::MAX, |_array| {
+            projected = true;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert_cbor(error, ErrorCode::LengthOverflow);
+    assert!(!projected);
+    assert!(encoder.is_empty());
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
 }
 
 #[test]

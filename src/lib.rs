@@ -181,8 +181,8 @@ pub use crate::encode::DigestSink;
 pub use crate::encode::IoSink;
 #[cfg(feature = "alloc")]
 pub use crate::encode::{
-    ByteSink, CountOverflow, CountingSink, EncodeError, EncodeResult, Encoder, ValueEncoder,
-    VecSink,
+    ByteSink, CountOverflow, CountingSink, EncodeError, EncodeResult, Encoder, FanoutError,
+    FanoutSink, ValueEncoder, VecSink,
 };
 #[cfg(feature = "derive")]
 #[cfg_attr(docsrs, doc(cfg(feature = "derive")))]

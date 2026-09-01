@@ -13,7 +13,7 @@ The examples below are mirrored by `tests/readme_examples.rs` in the repository.
 ```toml
 [dependencies]
 sacp-cbor = "0.18"
-sacp-cbor-abi = "0.8"
+sacp-cbor-abi = "0.9"
 ```
 
 The default `derive` feature exports `#[derive(CborAbi)]`. Disable default features only when using
@@ -21,13 +21,13 @@ the runtime schema/diff APIs without macro generation:
 
 ```toml
 [dependencies]
-sacp-cbor-abi = { version = "0.8", default-features = false }
+sacp-cbor-abi = { version = "0.9", default-features = false }
 ```
 
 ## Struct ABI
 
 ```rust
-use sacp_cbor::{CanonicalCbor, DecodeLimits};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, EncodeLimits};
 use sacp_cbor_abi::{decode, encode_to_vec, AbiType, CborAbi};
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
@@ -50,7 +50,8 @@ let value = Transfer {
     memo: None,
 };
 
-let bytes = encode_to_vec(&value)?;
+let encode_limits = EncodeLimits::for_bytes(4096);
+let bytes = encode_to_vec(&value, encode_limits)?;
 let mut context = ();
 let decoded: Transfer = decode(
     &bytes,
@@ -59,8 +60,8 @@ let decoded: Transfer = decode(
 )?;
 assert_eq!(decoded, value);
 
-let wire_hash = Transfer::schema().wire_hash()?;
-let full_hash = Transfer::schema().full_hash()?;
+let wire_hash = Transfer::schema().wire_hash(encode_limits)?;
+let full_hash = Transfer::schema().full_hash(encode_limits)?;
 assert_ne!(wire_hash, full_hash);
 ```
 
@@ -78,6 +79,49 @@ For the `Transfer` value above, `memo: None` is omitted and the wire bytes repre
 
 Field IDs and variant IDs are nonzero `u32` values. Field-set IDs must be strictly increasing on the
 wire; zero, duplicate, decreasing, and odd-length field-set arrays are rejected.
+
+## Storage-independent encoding and exact sequences
+
+The derived declaration owns numeric IDs, presence rules, unknown-value policy, and the static wire
+schema. Rust storage does not. Alongside ordinary owned encoding, a struct derive generates
+`TypeAbiProjection` and `TypeAbiProjected`; an enum derive additionally generates a consuming
+`TypeAbiVariantVisitor`. Business adapters implement semantic field or variant methods and never
+receive numeric IDs.
+
+For a `Vec<T>` field, the protocol type is `wire::Sequence<T::Wire>`. The same field can therefore
+be supplied by an owned `Vec<T>`, a borrowed slice, an engine-driven `ExactIndexProjection`, or a
+source-driven `SequenceProjection`. There is deliberately no `Iterator` or `ExactSizeIterator`
+blanket implementation: definite-length correctness cannot depend on advisory iterator metadata.
+
+```rust
+struct BorrowedTransfer<'a> {
+    from: u64,
+    to: u64,
+    amount: u64,
+    memo: Option<&'a str>,
+}
+
+impl TransferAbiProjection for BorrowedTransfer<'_> {
+    type Error = core::convert::Infallible;
+    type FieldFrom<'a> = u64 where Self: 'a;
+    type FieldTo<'a> = u64 where Self: 'a;
+    type FieldAmount<'a> = u64 where Self: 'a;
+    type FieldMemo<'a> = &'a str where Self: 'a;
+
+    fn from(&self) -> Result<Self::FieldFrom<'_>, Self::Error> { Ok(self.from) }
+    fn to(&self) -> Result<Self::FieldTo<'_>, Self::Error> { Ok(self.to) }
+    fn amount(&self) -> Result<Self::FieldAmount<'_>, Self::Error> { Ok(self.amount) }
+    fn memo(&self) -> Result<Option<Self::FieldMemo<'_>>, Self::Error> { Ok(self.memo) }
+}
+
+let source = BorrowedTransfer { from: 1, to: 2, amount: 3, memo: None };
+let bytes = encode_to_vec(&TransferAbiProjected::new(&source), encode_limits)?;
+```
+
+Every sequence length is checked transactionally. Underfill, overfill, projection failures, core
+limit failures, and sink failures remain typed in `AbiEncodeError` and poison the encoder. All ABI
+entry points require explicit `EncodeLimits`; `encode_to_sink` can target `CountingSink`,
+`DigestSink`, `FanoutSink`, or an application sink without staging canonical bytes in a `Vec`.
 
 ## Context-aware owned admission
 
@@ -127,16 +171,15 @@ Borrowed accessor mapping:
 ## Runtime field-set views
 
 Runtime systems can validate and inspect field-set values from a `Schema` without a generated Rust
-type. Compile the schema once, then validate many canonical messages without copying field values:
+type. `RuntimeSchema::new` is a constant-time, allocation-free view over the derive-owned static
+descriptor; there is no sorting or runtime schema compilation phase:
 
 ```rust
 use sacp_cbor_abi::{
-    compile_runtime_schema, NoNamedSchemas, RuntimeSchema, RuntimeValidationLimits,
-    RuntimeValidationWorkspace,
+    NoNamedSchemas, RuntimeSchema, RuntimeValidationLimits, RuntimeValidationWorkspace,
 };
 
-let schema = Transfer::schema();
-let runtime = match compile_runtime_schema(&schema)? {
+let runtime = match RuntimeSchema::new(Transfer::schema()) {
     RuntimeSchema::Struct(runtime) => runtime,
     _ => unreachable!("Transfer is a struct schema"),
 };
@@ -259,7 +302,7 @@ struct TransferV2 {
     unknown: UnknownFields,
 }
 
-let report = sacp_cbor_abi::diff(&TransferV1::schema(), &TransferV2::schema());
+let report = sacp_cbor_abi::diff(TransferV1::schema(), TransferV2::schema());
 assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
 assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
 assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
@@ -276,8 +319,7 @@ pub mod wire {
     }
     pub mod cbor {
         pub use sacp_cbor::{
-            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, EncodeResult, Encoder,
-            ErrorCode, ValueEncoder, encode_with_to_canonical,
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, ErrorCode, ValueEncoder,
         };
     }
 }
@@ -299,6 +341,10 @@ struct FacadeTransfer {
 
 ## API choice
 
-Use owned `encode_to_vec`, `decode`, and `decode_canonical` when business logic needs an owned Rust
-value or will re-encode the whole object. Use generated views for routing, filtering, forwarding,
-patching, and other hot paths that read only a subset of fields.
+Use owned `encode_to_vec`, `decode`, and `decode_canonical` when business logic already owns the
+declared Rust value. Use generated projections when data lives in another business model, a slice,
+an indexed source, or a source-driven stream and must not be copied into an ABI DTO. Use generated
+views for routing, filtering, forwarding, patching, and other hot paths that read only a subset of
+fields. With default features disabled, the runtime remains `no_std` with `alloc` for owned values,
+diff reports, and caller-prepared validation workspaces; static schemas and their runtime views use
+only `&'static` descriptors.

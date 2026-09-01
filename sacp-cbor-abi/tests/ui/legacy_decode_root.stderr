@@ -5,7 +5,7 @@ error[E0061]: this function takes 3 arguments but 2 arguments were supplied
   |                  ^^^^^^^^^^^^^^^^^^^^^---------------------------------------------- argument #3 of type `&mut _` is missing
   |
 note: function defined here
- --> src/lib.rs
+ --> src/decode_abi.rs
   |
   | pub fn decode<'de, T, C>(
   |        ^^^^^^

@@ -39,7 +39,10 @@ unsafe impl GlobalAlloc for TestAllocator {
 
 #[global_allocator]
 static ALLOCATOR: TestAllocator = TestAllocator;
-use sacp_cbor::{encode_to_vec, ByteSink, CountingSink, EncodeError, Encoder, ErrorCode, VecSink};
+use sacp_cbor::{
+    encode_to_vec, ByteSink, CountingSink, EncodeError, Encoder, ErrorCode, FanoutError,
+    FanoutSink, VecSink,
+};
 
 #[cfg(all(feature = "derive", feature = "sha2"))]
 use sacp_cbor::CborEncode;
@@ -132,7 +135,7 @@ fn vec_count_custom_and_io_are_byte_identical() {
 fn digest_sink_hashes_exact_canonical_bytes() {
     use sha2::{Digest, Sha256};
 
-    let value = vec![1_u8, 2, 3, 4];
+    let value = "digest input";
     let expected = encode_to_vec(&value).unwrap();
     let mut encoder = Encoder::with_sink(sacp_cbor::DigestSink::new(Sha256::new()));
     encoder.encode(&value).unwrap();
@@ -140,6 +143,22 @@ fn digest_sink_hashes_exact_canonical_bytes() {
         encoder.finish().unwrap().as_slice(),
         Sha256::digest(expected).as_slice()
     );
+}
+
+#[cfg(feature = "sha2")]
+#[test]
+fn fanout_produces_canonical_bytes_and_digest_in_one_pass() {
+    use sha2::{Digest, Sha256};
+
+    let value = "one pass";
+    let expected = encode_to_vec(&value).unwrap();
+    let sink = FanoutSink::new(VecSink::new(), sacp_cbor::DigestSink::new(Sha256::new()));
+    let mut encoder = Encoder::with_sink(sink);
+    encoder.encode(&value).unwrap();
+    let (bytes, digest) = encoder.finish().unwrap();
+
+    assert_eq!(bytes, expected);
+    assert_eq!(digest.as_slice(), Sha256::digest(&bytes).as_slice());
 }
 
 #[cfg(all(feature = "derive", feature = "sha2"))]
@@ -213,6 +232,127 @@ fn partial_payload_failure_is_never_rolled_back() {
     assert!(matches!(error, EncodeError::Sink(OwnedFailure { token }) if &*token == "write-1"));
     assert_eq!(observer.snapshot(), [0x43, 10, 11]);
     assert!(matches!(encoder.bool(true), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn fanout_left_failure_short_circuits_right_and_poisons_encoder() {
+    let left = SharedBytes::default();
+    let left_observer = SharedBytes(Rc::clone(&left.0));
+    let right = SharedBytes::default();
+    let right_observer = SharedBytes(Rc::clone(&right.0));
+    let sink = FanoutSink::new(
+        FailingSink {
+            bytes: left,
+            fail_write: Some(0),
+            calls: 0,
+            partial: 1,
+            fail_finish: false,
+        },
+        FailingSink {
+            bytes: right,
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: false,
+        },
+    );
+    let mut encoder = Encoder::with_sink(sink);
+
+    let error = encoder.text("abc").unwrap_err();
+    assert!(matches!(
+        error,
+        EncodeError::Sink(FanoutError::Left(OwnedFailure { token })) if &*token == "write-0"
+    ));
+    assert_eq!(left_observer.snapshot(), [0x63]);
+    assert!(right_observer.snapshot().is_empty());
+    assert_eq!(encoder.len(), 0);
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn fanout_right_failure_follows_left_success_and_poisons_encoder() {
+    let left = SharedBytes::default();
+    let left_observer = SharedBytes(Rc::clone(&left.0));
+    let right = SharedBytes::default();
+    let right_observer = SharedBytes(Rc::clone(&right.0));
+    let sink = FanoutSink::new(
+        FailingSink {
+            bytes: left,
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: false,
+        },
+        FailingSink {
+            bytes: right,
+            fail_write: Some(0),
+            calls: 0,
+            partial: 0,
+            fail_finish: false,
+        },
+    );
+    let mut encoder = Encoder::with_sink(sink);
+
+    let error = encoder.text("abc").unwrap_err();
+    assert!(matches!(
+        error,
+        EncodeError::Sink(FanoutError::Right(OwnedFailure { token })) if &*token == "write-0"
+    ));
+    assert_eq!(left_observer.snapshot(), [0x63]);
+    assert!(right_observer.snapshot().is_empty());
+    assert_eq!(encoder.len(), 0);
+    assert!(matches!(encoder.null(), Err(EncodeError::Poisoned)));
+    assert!(matches!(encoder.finish(), Err(EncodeError::Poisoned)));
+}
+
+#[test]
+fn fanout_finish_preserves_the_failing_child_error() {
+    let mut left_fails = Encoder::with_sink(FanoutSink::new(
+        FailingSink {
+            bytes: SharedBytes::default(),
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: true,
+        },
+        FailingSink {
+            bytes: SharedBytes::default(),
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: false,
+        },
+    ));
+    left_fails.null().unwrap();
+    assert!(matches!(
+        left_fails.finish(),
+        Err(EncodeError::Sink(FanoutError::Left(OwnedFailure { token })))
+            if &*token == "finish"
+    ));
+
+    let mut right_fails = Encoder::with_sink(FanoutSink::new(
+        FailingSink {
+            bytes: SharedBytes::default(),
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: false,
+        },
+        FailingSink {
+            bytes: SharedBytes::default(),
+            fail_write: None,
+            calls: 0,
+            partial: 0,
+            fail_finish: true,
+        },
+    ));
+    right_fails.null().unwrap();
+    assert!(matches!(
+        right_fails.finish(),
+        Err(EncodeError::Sink(FanoutError::Right(OwnedFailure { token })))
+            if &*token == "finish"
+    ));
 }
 
 #[test]

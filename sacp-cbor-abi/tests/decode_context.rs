@@ -1,5 +1,7 @@
 use sacp_cbor::bytes::{Bytes, BytesRef};
-use sacp_cbor::{CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, ErrorCode};
+use sacp_cbor::{
+    CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, EncodeLimits, ErrorCode,
+};
 use sacp_cbor_abi::{
     decode, AbiDecodeContext, AbiDecodeLocation, AbiDecodeValue, CborAbi, UnknownFields,
 };
@@ -110,13 +112,16 @@ impl AbiDecodeContext for UnitBudget {
 }
 
 fn envelope_bytes() -> Vec<u8> {
-    sacp_cbor_abi::encode_to_vec(&Envelope {
-        entries: vec![Entry::Item {
-            names: vec![Name("a".to_owned()), Name("bc".to_owned())],
-            blob: Bytes::new(vec![1, 2, 3]),
-        }],
-        title: "root".to_owned(),
-    })
+    sacp_cbor_abi::encode_to_vec(
+        &Envelope {
+            entries: vec![Entry::Item {
+                names: vec![Name("a".to_owned()), Name("bc".to_owned())],
+                blob: Bytes::new(vec![1, 2, 3]),
+            }],
+            title: "root".to_owned(),
+        },
+        EncodeLimits::for_bytes(256),
+    )
     .unwrap()
 }
 

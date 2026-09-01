@@ -1,0 +1,5 @@
+error: unsupported `abi(...)` field attribute
+ --> tests/ui/string_wire_override.rs:6:19
+  |
+6 |     #[abi(id = 1, ty = "ui.AccountId")]
+  |                   ^^

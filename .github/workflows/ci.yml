@@ -36,6 +36,7 @@ jobs:
           cargo +1.85.0 check --locked -p sacp-cbor --all-features
           cargo +1.75.0 check --locked -p sacp-cbor-derive
           cargo +1.85.0 check --locked -p sacp-cbor-abi --no-default-features
+          cargo +1.85.0 check --locked -p sacp-cbor-abi --no-default-features --features derive
           cargo +1.85.0 check --locked -p sacp-cbor-abi
           cargo +1.75.0 check --locked -p sacp-cbor-abi-derive
           cargo +1.85.0 check --locked -p sacp-cbor-schema --no-default-features
@@ -102,7 +103,9 @@ jobs:
         run: cargo build -p sacp-cbor --no-default-features --features sha2
 
       - name: Build ABI (no default features)
-        run: cargo build -p sacp-cbor-abi --no-default-features
+        run: |
+          cargo build -p sacp-cbor-abi --no-default-features
+          cargo build -p sacp-cbor-abi --no-default-features --features derive
 
       - name: Build schema (no default features)
         run: cargo build -p sacp-cbor-schema --no-default-features
@@ -202,3 +205,6 @@ jobs:
 
       - name: Miri unsafe-feature query smoke
         run: cargo miri test --no-default-features --features unsafe --test query unsafe_value_ref_malformed_ranges_return_query_errors
+
+      - name: Miri ABI runtime workspace reuse
+        run: cargo miri test -p sacp-cbor-abi --test runtime_miri
