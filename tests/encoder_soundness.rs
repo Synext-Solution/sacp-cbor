@@ -88,6 +88,18 @@ impl CborEncode for SwallowsInnerError {
     }
 }
 
+struct NestedArray(usize);
+
+impl CborEncode for NestedArray {
+    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+        if self.0 == 0 {
+            enc.null()
+        } else {
+            enc.array(1, |array| array.value(&Self(self.0 - 1)))
+        }
+    }
+}
+
 #[test]
 fn empty_encoder_finish_is_error() {
     let err = Encoder::new().finish().unwrap_err();
@@ -143,6 +155,24 @@ fn controlled_value_callback_cannot_hide_a_swallowed_inner_error() {
         })
         .unwrap_err();
     assert!(matches!(error, EncodeError::Poisoned));
+}
+
+#[test]
+fn encoder_migrates_beyond_the_inline_frame_stack() {
+    let depth = 40usize;
+    let limits = EncodeLimits {
+        max_depth: depth,
+        max_total_items: depth + 1,
+        ..EncodeLimits::unbounded()
+    };
+    let mut encoder = Encoder::with_limits(limits).unwrap();
+    encoder.encode(&NestedArray(depth)).unwrap();
+    let bytes = encoder.finish().unwrap();
+
+    let mut decode_limits = DecodeLimits::for_bytes(bytes.len());
+    decode_limits.max_depth = depth;
+    decode_limits.max_total_items = depth + 1;
+    validate_canonical(&bytes, decode_limits).unwrap();
 }
 
 #[test]

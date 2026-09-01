@@ -711,7 +711,7 @@ renames, module moves, and private Rust refactors.
 The ABI layer is opt-in:
 
 ```rust
-use sacp_cbor::{DecodeLimits, CanonicalCbor};
+use sacp_cbor::{CanonicalCbor, DecodeLimits, EncodeLimits};
 use sacp_cbor_abi::{decode, encode_to_vec, AbiType, CborAbi};
 
 #[derive(Debug, PartialEq, Eq, CborAbi)]
@@ -734,7 +734,8 @@ let value = Transfer {
     memo: None,
 };
 
-let bytes = encode_to_vec(&value)?;
+let encode_limits = EncodeLimits::for_bytes(4096);
+let bytes = encode_to_vec(&value, encode_limits)?;
 let mut context = ();
 let decoded: Transfer = decode(
     &bytes,
@@ -743,8 +744,8 @@ let decoded: Transfer = decode(
 )?;
 assert_eq!(decoded, value);
 
-let wire_hash = Transfer::schema().wire_hash()?;
-let full_hash = Transfer::schema().full_hash()?;
+let wire_hash = Transfer::schema().wire_hash(encode_limits)?;
+let full_hash = Transfer::schema().full_hash(encode_limits)?;
 assert_ne!(wire_hash, full_hash);
 ```
 
@@ -766,6 +767,22 @@ Field IDs and variant IDs must be nonzero `u32` values. On the wire, ABI field-s
 strictly increasing; duplicate, decreasing, zero, and odd-length field-set arrays are rejected.
 Required `Option<T>` fields are rejected at derive time; optional fields must be declared with
 `#[abi(optional)]` and are omitted when `None`.
+
+### Storage-independent encoding
+
+The derive owns wire IDs and policies once and also generates semantic projection traits. The same
+schema can encode its ordinary owned Rust value or a borrowing/business adapter through
+`TypeAbiProjected`, without constructing an ABI DTO. A protocol sequence is
+`wire::Sequence<W>`, not `Vec<T>`: owned vectors, slices, exact indexed projections, and
+source-driven projections are valid carriers for the same wire field. There is intentionally no
+`Iterator`/`ExactSizeIterator` blanket contract. Declared sequence lengths are checked, and
+underfill, overfill, business projection errors, limit failures, and sink failures are typed and
+sticky. `encode_to_sink`, `encode_to_vec`, and `encode_to_canonical` all require explicit
+`EncodeLimits`.
+
+Derived schemas use `&'static` descriptors with no schema-side `String`, `Vec`, or `Box`.
+`RuntimeSchema::new(Type::schema())` is an allocation-free view over that descriptor; it does not
+sort or compile a second schema representation.
 
 ### Context-aware owned admission
 
@@ -908,7 +925,7 @@ struct TransferV2 {
     unknown: UnknownFields,
 }
 
-let report = sacp_cbor_abi::diff(&TransferV1::schema(), &TransferV2::schema());
+let report = sacp_cbor_abi::diff(TransferV1::schema(), TransferV2::schema());
 assert_eq!(report.new_reads_old, CompatibilityClass::Compatible);
 assert_eq!(report.old_reads_new, CompatibilityClass::Compatible);
 assert_eq!(report.old_preserves_new, CompatibilityClass::Compatible);
@@ -926,7 +943,7 @@ pub mod wire {
     }
     pub mod cbor {
         pub use sacp_cbor::{
-            CanonicalCbor, CborDecode, CborError, Decoder, Encoder, ErrorCode,
+            ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, ErrorCode, ValueEncoder,
         };
     }
 }
@@ -946,9 +963,9 @@ struct FacadeTransfer {
 }
 ```
 
-Use the owned path (`encode_to_vec`, `decode`, `decode_canonical`) for business logic and re-encode.
-Use the generated view path for routing, filtering, forwarding, and patching where only a subset of
-fields is needed.
+Use the owned path when business logic already owns the declared type, generated projections when
+the data lives in another storage model, and generated views for routing, filtering, forwarding,
+and patching where only a subset of fields is needed.
 
 ---
 
@@ -1229,6 +1246,8 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 - `Decoder::decode_canonical_with_guard` exposes a validated encoded length before caller ownership
 - `sacp_cbor_abi::decode(bytes, limits, context) -> Result<T, C::Error>`
 - `sacp_cbor_abi::decode_canonical(canon_ref, context) -> Result<T, C::Error>`
+- `sacp_cbor_abi::encode_to_sink(&value, sink, limits) -> Result<S::Output, AbiEncodeError<...>>`
+- `sacp_cbor_abi::encode_to_vec(&value, limits) -> Result<Vec<u8>, AbiEncodeError<...>>`
 - `sacp_cbor_abi::AbiDecodeContext::admit(location, value)` observes owned semantic lengths after core structural
   admission and before the first corresponding reservation or copy
 - `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)

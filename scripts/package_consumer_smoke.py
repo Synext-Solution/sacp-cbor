@@ -122,7 +122,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(decoded, native);
 
     let public = PublicMessage { id: 9 };
-    let abi_bytes = sacp_cbor_abi::encode_to_vec(&public)?;
+    let abi_bytes = sacp_cbor_abi::encode_to_vec(
+        &public,
+        sacp_cbor::EncodeLimits::for_bytes(64),
+    )?;
     let abi_decoded: PublicMessage = sacp_cbor_abi::decode(
         &abi_bytes,
         DecodeLimits::for_bytes(abi_bytes.len()),

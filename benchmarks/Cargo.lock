@@ -828,6 +828,7 @@ version = "0.18.1"
 dependencies = [
  "sacp-cbor-derive",
  "serde",
+ "sha2",
 ]
 
 [[package]]

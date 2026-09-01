@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 serde = { version = "1", features = ["derive"] }
 sacp-cbor = { path = "..", default-features = false, features = ["std", "derive", "collections", "edit", "serde", "sha2", "cde"] }
 sacp-cbor-schema = { path = "../sacp-cbor-schema" }
+sacp-cbor-abi = { path = "../sacp-cbor-abi" }
 
 [[bin]]
 name = "validate_only"
@@ -58,6 +59,12 @@ doc = false
 [[bin]]
 name = "cde_bridge"
 path = "fuzz_targets/cde_bridge.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "abi_projection"
+path = "fuzz_targets/abi_projection.rs"
 test = false
 doc = false
 
