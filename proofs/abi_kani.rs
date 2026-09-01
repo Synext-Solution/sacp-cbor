@@ -1,6 +1,10 @@
 use crate::view::{validate_abi_id_value, validate_sorted_query_ids};
-use crate::{TypeAtom, TypeRef};
-use sacp_cbor::{CborError, ErrorCode};
+use crate::{
+    encode_to_sink, projected_sequence, wire, AbiEncode, AbiEncodeAs, AbiEncodeError,
+    SequenceContractError, SequenceEmitter, SequenceProjection, TypeAtom, TypeRef,
+};
+use core::convert::Infallible;
+use sacp_cbor::{ByteSink, CborError, CountingSink, EncodeLimits, ErrorCode, ValueEncoder};
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
     match actual {
@@ -74,4 +78,90 @@ fn protocol_sequence_depth_roundtrips_without_a_collection_type() {
     }
     assert!(peeled == depth);
     assert!(ty == TypeRef::U64);
+}
+
+#[derive(Clone, Copy)]
+struct BoundedSequenceSource {
+    declared: usize,
+    actual: usize,
+    swallow_emit_errors: bool,
+}
+
+impl SequenceProjection<wire::U8> for BoundedSequenceSource {
+    type Error = Infallible;
+
+    fn declared_len(&self) -> Result<usize, Self::Error> {
+        Ok(self.declared)
+    }
+
+    fn project<S: ByteSink>(
+        &self,
+        emitter: &mut SequenceEmitter<'_, '_, S, wire::U8, Self::Error>,
+    ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
+        let mut emitted = 0;
+        while emitted < self.actual {
+            let result = emitter.emit(&0_u8);
+            if !self.swallow_emit_errors {
+                result?;
+            }
+            emitted += 1;
+        }
+        Ok(())
+    }
+}
+
+struct BoundedSequenceRoot(BoundedSequenceSource);
+
+impl AbiEncode for BoundedSequenceRoot {
+    type Error = Infallible;
+
+    fn abi_encode<S: ByteSink>(
+        &self,
+        encoder: &mut ValueEncoder<'_, S>,
+    ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
+        projected_sequence(self.0).abi_encode_as(encoder)
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(5)]
+fn exact_sequence_encoding_succeeds_if_and_only_if_cardinality_matches() {
+    let declared: usize = kani::any();
+    let actual: usize = kani::any();
+    let swallow_emit_errors: bool = kani::any();
+    kani::assume(declared <= 3);
+    kani::assume(actual <= 3);
+
+    let result = encode_to_sink(
+        &BoundedSequenceRoot(BoundedSequenceSource {
+            declared,
+            actual,
+            swallow_emit_errors,
+        }),
+        CountingSink::new(),
+        EncodeLimits::unbounded(),
+    );
+
+    if declared == actual {
+        assert!(result.is_ok());
+    } else {
+        assert!(result.is_err());
+        if actual < declared {
+            assert!(matches!(
+                result,
+                Err(AbiEncodeError::Sequence(SequenceContractError::Underfill {
+                    declared: expected,
+                    emitted,
+                })) if expected == declared && emitted == actual
+            ));
+        } else if !swallow_emit_errors {
+            assert!(matches!(
+                result,
+                Err(AbiEncodeError::Sequence(SequenceContractError::Overfill {
+                    declared: expected,
+                    attempted,
+                })) if expected == declared && attempted == declared + 1
+            ));
+        }
+    }
 }

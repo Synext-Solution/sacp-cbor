@@ -135,7 +135,7 @@ fn vec_count_custom_and_io_are_byte_identical() {
 fn digest_sink_hashes_exact_canonical_bytes() {
     use sha2::{Digest, Sha256};
 
-    let value = vec![1_u8, 2, 3, 4];
+    let value = "digest input";
     let expected = encode_to_vec(&value).unwrap();
     let mut encoder = Encoder::with_sink(sacp_cbor::DigestSink::new(Sha256::new()));
     encoder.encode(&value).unwrap();
