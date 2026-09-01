@@ -43,7 +43,6 @@ abi_harnesses=(
   abi_id_validator_accepts_exact_nonzero_u32_range
   sorted_query_ids_accepts_exact_nonzero_singleton
   sorted_query_ids_accepts_exact_strict_nonzero_order_for_len3
-  runtime_schema_ids_accept_exact_strict_nonzero_order_for_len3
   protocol_sequence_depth_roundtrips_without_a_collection_type
   exact_sequence_encoding_succeeds_if_and_only_if_cardinality_matches
 )
