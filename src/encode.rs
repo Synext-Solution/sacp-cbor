@@ -318,6 +318,7 @@ pub(crate) fn major_uint_header(major: u8, value: u64) -> ([u8; 9], usize) {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Frame {
     Array {
         remaining: usize,
@@ -326,6 +327,99 @@ enum Frame {
         remaining_pairs: usize,
         pending_value: bool,
     },
+}
+
+const INLINE_ENCODER_FRAMES: usize = 32;
+
+/// Container stack with an allocation-free common path.
+///
+/// Schema hashing and ordinary ABI projections stay within the inline prefix. Exceptionally deep
+/// values retain the existing fallible heap-growth behavior after the prefix is exhausted.
+struct EncoderFrameStack {
+    inline: [Frame; INLINE_ENCODER_FRAMES],
+    len: usize,
+    heap: Option<Vec<Frame>>,
+}
+
+impl EncoderFrameStack {
+    const fn new() -> Self {
+        Self {
+            inline: [Frame::Array { remaining: 0 }; INLINE_ENCODER_FRAMES],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn prepare_push(&mut self, offset: usize) -> Result<(), CborError> {
+        if let Some(heap) = &mut self.heap {
+            return try_reserve(heap, 1, offset);
+        }
+        if self.len < INLINE_ENCODER_FRAMES {
+            return Ok(());
+        }
+
+        let mut heap = Vec::new();
+        try_reserve(&mut heap, self.len + 1, offset)?;
+        heap.extend_from_slice(&self.inline[..self.len]);
+        self.heap = Some(heap);
+        Ok(())
+    }
+
+    fn push_prepared(&mut self, frame: Frame) {
+        if let Some(heap) = &mut self.heap {
+            debug_assert!(heap.len() < heap.capacity());
+            heap.push(frame);
+            self.len = heap.len();
+        } else {
+            debug_assert!(self.len < INLINE_ENCODER_FRAMES);
+            self.inline[self.len] = frame;
+            self.len += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<Frame> {
+        if let Some(heap) = &mut self.heap {
+            let frame = heap.pop();
+            self.len = heap.len();
+            frame
+        } else if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.inline[self.len])
+        }
+    }
+
+    fn last(&self) -> Option<&Frame> {
+        if let Some(heap) = &self.heap {
+            heap.last()
+        } else {
+            self.inline.get(self.len.checked_sub(1)?)
+        }
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Frame> {
+        if let Some(heap) = &mut self.heap {
+            heap.last_mut()
+        } else {
+            self.inline.get_mut(self.len.checked_sub(1)?)
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&Frame> {
+        self.heap.as_ref().map_or_else(
+            || self.inline[..self.len].get(index),
+            |heap| heap.get(index),
+        )
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -347,7 +441,7 @@ pub struct Encoder<S: ByteSink = VecSink> {
     sink: S,
     written: usize,
     root_remaining: u8,
-    stack: Vec<Frame>,
+    stack: EncoderFrameStack,
     limits: EncodeLimits,
     items_seen: usize,
     poisoned: bool,
@@ -408,7 +502,7 @@ impl<S: ByteSink> Encoder<S> {
             sink,
             written: 0,
             root_remaining: 1,
-            stack: Vec::new(),
+            stack: EncoderFrameStack::new(),
             limits,
             items_seen: 0,
             poisoned: false,
@@ -689,7 +783,9 @@ impl<S: ByteSink> Encoder<S> {
         if self.stack.len() >= self.limits.max_depth {
             return Err(format_error(ErrorCode::DepthLimitExceeded, self.written));
         }
-        try_reserve(&mut self.stack, 1, self.written).map_err(EncodeError::Cbor)
+        self.stack
+            .prepare_push(self.written)
+            .map_err(EncodeError::Cbor)
     }
 
     fn preflight_array(&self, len: usize) -> EncodeResult<(usize, [u8; 9], usize), S> {
@@ -762,7 +858,7 @@ impl<S: ByteSink> Encoder<S> {
     }
 
     #[cfg(feature = "serde")]
-    pub(crate) fn container_depth(&self) -> usize {
+    pub(crate) const fn container_depth(&self) -> usize {
         self.stack.len()
     }
 
@@ -935,9 +1031,9 @@ impl<S: ByteSink> Encoder<S> {
                         .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?,
                 );
             }
-            let magnitude = crate::int::magnitude_from_u128(value)
-                .map_err(|code| format_error(code, encoder.written))?;
-            encoder.write_bignum_value(false, &magnitude)
+            let magnitude = value.to_be_bytes();
+            let first = (value.leading_zeros() / 8) as usize;
+            encoder.write_bignum_value(false, &magnitude[first..])
         })
     }
 
@@ -960,9 +1056,9 @@ impl<S: ByteSink> Encoder<S> {
                 u128::try_from(value)
                     .map_err(|_| format_error(ErrorCode::LengthOverflow, encoder.written))?
             };
-            let magnitude = crate::int::magnitude_from_u128(magnitude_value)
-                .map_err(|code| format_error(code, encoder.written))?;
-            encoder.write_bignum_value(negative, &magnitude)
+            let magnitude = magnitude_value.to_be_bytes();
+            let first = (magnitude_value.leading_zeros() / 8) as usize;
+            encoder.write_bignum_value(negative, &magnitude[first..])
         })
     }
 
@@ -1071,7 +1167,7 @@ impl<S: ByteSink> Encoder<S> {
         self.write_chunks(&[&header[..header_len]])
             .map_err(E::from)?;
         self.items_seen = items;
-        self.stack.push(Frame::Array { remaining: len });
+        self.stack.push_prepared(Frame::Array { remaining: len });
         let frame_index = self.stack.len() - 1;
         let result = {
             let mut array = ArrayEncoder {
@@ -1102,7 +1198,7 @@ impl<S: ByteSink> Encoder<S> {
         self.begin_value()?;
         self.write_chunks(&[&header[..header_len]])?;
         self.items_seen = items;
-        self.stack.push(Frame::Map {
+        self.stack.push_prepared(Frame::Map {
             remaining_pairs: len,
             pending_value: false,
         });
@@ -1133,7 +1229,7 @@ impl<S: ByteSink> Encoder<S> {
         self.begin_value()?;
         self.write_chunks(&[&header[..header_len]])?;
         self.items_seen = items;
-        self.stack.push(Frame::Array { remaining: len });
+        self.stack.push_prepared(Frame::Array { remaining: len });
         Ok(())
     }
 
@@ -1149,7 +1245,7 @@ impl<S: ByteSink> Encoder<S> {
         self.begin_value()?;
         self.write_chunks(&[&header[..header_len]])?;
         self.items_seen = items;
-        self.stack.push(Frame::Map {
+        self.stack.push_prepared(Frame::Map {
             remaining_pairs: len,
             pending_value: false,
         });
