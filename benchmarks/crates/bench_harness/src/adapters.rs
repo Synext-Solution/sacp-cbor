@@ -188,8 +188,8 @@ pub fn encode_sacp_stream(value: &BenchValue) -> Result<Vec<u8>, String> {
     enc.finish().map_err(|err| err.to_string())
 }
 
-fn encode_bench_value<S: sacp_cbor::ByteSink>(
-    enc: &mut sacp_cbor::ValueEncoder<'_, S>,
+fn encode_bench_value<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver>(
+    enc: &mut sacp_cbor::ValueEncoder<'_, S, O>,
     v: &BenchValue,
 ) -> sacp_cbor::EncodeResult<(), S> {
     match v {
@@ -210,8 +210,8 @@ fn encode_bench_value<S: sacp_cbor::ByteSink>(
     }
 }
 
-fn encode_bench_array<S: sacp_cbor::ByteSink>(
-    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+fn encode_bench_array<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver>(
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
     items: &[BenchValue],
 ) -> sacp_cbor::EncodeResult<(), S> {
     for item in items {
@@ -220,8 +220,8 @@ fn encode_bench_array<S: sacp_cbor::ByteSink>(
     Ok(())
 }
 
-fn encode_bench_value_in_array<S: sacp_cbor::ByteSink>(
-    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+fn encode_bench_value_in_array<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver>(
+    a: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
     v: &BenchValue,
 ) -> sacp_cbor::EncodeResult<(), S> {
     match v {

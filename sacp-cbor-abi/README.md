@@ -122,6 +122,9 @@ Every sequence length is checked transactionally. Underfill, overfill, projectio
 limit failures, and sink failures remain typed in `AbiEncodeError` and poison the encoder. All ABI
 entry points require explicit `EncodeLimits`; `encode_to_sink` can target `CountingSink`,
 `DigestSink`, `FanoutSink`, or an application sink without staging canonical bytes in a `Vec`.
+`encode_to_sink_with_observer` and `encode_to_vec_with_observer` thread one statically dispatched
+`WorkObserver` through sizing, projection, and output. Observer cancellation is terminal: already
+confirmed sink bytes remain, while the encoder is poisoned and cannot be finished.
 
 ## Context-aware owned admission
 
@@ -130,6 +133,9 @@ recursive field and element. `admit` receives a stable type/variant/field locati
 event after canonical headers, lengths, and core limits succeed but before the first owned
 reservation or payload copy. This lets a protocol enforce aggregate record and byte budgets in the
 same decode pass without a preflight traversal or a temporary ABI object tree.
+Use `decode_with_observer` or `decode_canonical_with_observer` when the same traversal must also be
+cooperatively interruptible. Cancellation converts from `CborError` through the context's error
+type, returns no partial owned value, and does not roll back earlier context side effects.
 
 Use `&mut ()` when the core `DecodeLimits` are the complete policy. A custom context chooses which
 semantic locations to charge and returns its own typed error through `type Error: From<CborError>`.
@@ -167,6 +173,12 @@ Borrowed accessor mapping:
 - `Vec<T>` fields return `AbiArrayView<'a, T>`.
 - Nested ABI types return their generated nested views.
 - `Option<T>` is represented by field presence and returns `Option<T::View>`.
+
+For cooperatively observed zero-copy traversal, create one `WorkSession`, use the generated
+`from_canonical_with_session` and `*_with_session` accessors, then drive each sequence through
+`AbiArrayView::cursor()` and `AbiArrayViewCursor::next_with_session(&mut session)`. A cursor stores
+its iteration state, not the session borrow, so an outer sequence of records can enter a record's
+nested fields and inner cursors with the same shared cadence.
 
 ## Runtime field-set views
 
@@ -320,6 +332,7 @@ pub mod wire {
     pub mod cbor {
         pub use sacp_cbor::{
             ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, ErrorCode, ValueEncoder,
+            WorkObserver,
         };
     }
 }

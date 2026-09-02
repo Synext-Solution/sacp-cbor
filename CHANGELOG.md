@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased stability work
+
+No crate or workspace package version is changed by this work.
+
+### `sacp-cbor`
+
+- **Breaking:** encoding and decoding traits, encoder/decoder state machines, and their guarded
+  adapters now carry one statically dispatched `WorkObserver`. The observation plumbing itself is
+  allocation-free, with no trait objects or per-byte observer callbacks; ordinary entry points use
+  the zero-sized `NoopWorkObserver`.
+- Added deterministic observed entry points for canonical validation, typed decode, canonical-trusted
+  decode, vector/canonical encoding, and sink-generic encoding. Enabled transactions issue an
+  initial zero checkpoint, report completed engine work in deltas of at most
+  `WORK_CHECKPOINT_INTERVAL`, and flush a final non-zero remainder before success.
+- Added caller-owned `WorkSession<O>` with consuming `finish(self)`, plus session-aware borrowed
+  array-query traversal, so multiple lazy operations can preserve one initial checkpoint, cadence,
+  and final remainder. The cadence covers engine-owned metered work and bounds completed-work
+  deltas, not wall-clock time inside a caller callback or one `ByteSink::write` call; those remain
+  cooperative opaque boundaries.
+- Observer cancellation is normalized to `ErrorCode::WorkCancelled`. Decoder cancellation preserves
+  the first sticky error and cannot be resumed. Encoder cancellation poisons the encoder, does not
+  call sink `finish`, and does not roll back already confirmed sink output; a sink may also retain
+  unconfirmed physical side effects under its existing failure contract.
+- Canonical walks, raw canonical accounting, typed and prepared decode traversal, array/map batch
+  traversal, derived tagged-enum sub-value decoding, structural encode steps, and observer-enabled
+  sink writes now use the same work model. Targeted canonical, byte-loop, decode, derive, encode,
+  ABI-projection, and borrowed-view tests reject only after one full interval, demonstrating
+  cancellation after loop entry rather than only at admission.
+
+### `sacp-cbor-abi`
+
+- **Breaking:** ABI encode/decode and projection traits propagate the core static observer through
+  owned values, derived codecs, exact-indexed sequences, source-driven sequence emitters, and
+  `CountingSink` sizing. Encode cancellation remains a core encode error rather than being
+  collapsed into projection, sequence-contract, or sink failure; ABI decode cancellation
+  originates as `CborError(ErrorCode::WorkCancelled)` before conversion through
+  `AbiDecodeContext::Error::from`.
+- Added the observed ABI entry points `encode_to_sink_with_observer`,
+  `encode_to_vec_with_observer`, `decode_with_observer`, and
+  `decode_canonical_with_observer`.
+- Source-driven projections are observed at engine-owned `SequenceEmitter::emit` boundaries. Code
+  executing inside caller callbacks or between emitter calls remains cooperative caller work and
+  cannot be preempted by the CBOR engine.
+- For a generated record view's sequence field, the observed manifest path is
+  `*View::from_canonical_with_session` to a generated field `*_with_session` and then
+  `AbiArrayView::cursor` / `AbiArrayViewCursor::next_with_session`. The cursor stores no session and
+  borrows it only for one step, so the same caller-owned cadence can enter an outer sequence record,
+  traverse that record's nested `*_with_session` field and cursor, then return to the outer cursor.
+  Record scans, value-boundary traversal, and lazy zero-copy sequence walks share that state;
+  ordinary view and `iter` methods remain the `NoopWorkObserver` path.
+
 ## 0.18.2 workspace release
 
 Published crates:

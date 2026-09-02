@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::{
     CanonicalCbor, CanonicalCborRef, CborDecode, CborError, DecodeLimits, Decoder, ErrorCode,
+    NoopWorkObserver, WorkObserver,
 };
 
 /// Identifies the semantic owner of an admitted ABI value.
@@ -111,8 +112,8 @@ impl AbiDecodeContext for () {
 /// Decode a public ABI value through one caller-owned admission context.
 pub trait AbiDecode<'de, C: AbiDecodeContext + ?Sized>: Sized {
     /// Decode `Self` from a streaming decoder.
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         context: &mut C,
         location: AbiDecodeLocation,
     ) -> Result<Self, C::Error>;
@@ -214,7 +215,26 @@ where
     C: AbiDecodeContext + ?Sized,
     T: AbiDecode<'de, C>,
 {
-    let mut decoder = Decoder::<true>::new_checked(bytes, limits)?;
+    decode_with_observer(bytes, limits, context, NoopWorkObserver)
+}
+
+/// Validate and decode an ABI value through one caller-owned context and work observer.
+///
+/// Cancellation is reported through the context's core-error conversion and never returns a
+/// partial owned value. Admission-context side effects completed before cancellation are not
+/// rolled back.
+pub fn decode_with_observer<'de, T, C, O>(
+    bytes: &'de [u8],
+    limits: DecodeLimits,
+    context: &mut C,
+    observer: O,
+) -> Result<T, C::Error>
+where
+    C: AbiDecodeContext + ?Sized,
+    T: AbiDecode<'de, C>,
+    O: WorkObserver,
+{
+    let mut decoder = Decoder::<true, O>::new_checked_observed(bytes, limits, observer)?;
     let value = T::abi_decode(&mut decoder, context, AbiDecodeLocation::Root)?;
     let _ = decoder.finish()?;
     Ok(value)
@@ -229,8 +249,29 @@ where
     C: AbiDecodeContext + ?Sized,
     T: AbiDecode<'de, C>,
 {
-    let mut decoder =
-        Decoder::<false>::new_trusted(cbor, DecodeLimits::for_bytes(cbor.as_bytes().len()))?;
+    decode_canonical_with_observer(cbor, context, NoopWorkObserver)
+}
+
+/// Decode an ABI value from a canonical witness through a caller-owned work observer.
+///
+/// Cancellation is reported through the context's core-error conversion and never returns a
+/// partial owned value. Admission-context side effects completed before cancellation are not
+/// rolled back.
+pub fn decode_canonical_with_observer<'de, T, C, O>(
+    cbor: CanonicalCborRef<'de>,
+    context: &mut C,
+    observer: O,
+) -> Result<T, C::Error>
+where
+    C: AbiDecodeContext + ?Sized,
+    T: AbiDecode<'de, C>,
+    O: WorkObserver,
+{
+    let mut decoder = Decoder::<false, O>::new_trusted_observed(
+        cbor,
+        DecodeLimits::for_bytes(cbor.as_bytes().len()),
+        observer,
+    )?;
     let value = T::abi_decode(&mut decoder, context, AbiDecodeLocation::Root)?;
     let _ = decoder.finish()?;
     Ok(value)
@@ -240,8 +281,8 @@ macro_rules! passthrough_decode {
     ($($ty:ty),* $(,)?) => {
         $(
             impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for $ty {
-                fn abi_decode<const CHECKED: bool>(
-                    decoder: &mut Decoder<'de, CHECKED>,
+                fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+                    decoder: &mut Decoder<'de, CHECKED, O>,
                     _context: &mut C,
                     _location: AbiDecodeLocation,
                 ) -> Result<Self, C::Error> {
@@ -255,8 +296,8 @@ macro_rules! passthrough_decode {
 passthrough_decode!((), bool, u8, u16, u32, u64, i8, i16, i32, i64);
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for &'de str {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         _context: &mut C,
         _location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -265,8 +306,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for &'de str {
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for String {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         context: &mut C,
         location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -290,8 +331,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for String {
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for BytesRef<'de> {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         _context: &mut C,
         _location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -300,8 +341,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for BytesRef<'de> {
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for Bytes {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         context: &mut C,
         location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -325,8 +366,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for Bytes {
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCborRef<'de> {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         _context: &mut C,
         _location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -335,8 +376,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCborRef<'
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCbor {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         context: &mut C,
         location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -358,8 +399,8 @@ impl<'de, C: AbiDecodeContext + ?Sized> AbiDecode<'de, C> for CanonicalCbor {
 }
 
 impl<'de, C: AbiDecodeContext + ?Sized, const N: usize> AbiDecode<'de, C> for [u8; N] {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         _context: &mut C,
         _location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {
@@ -372,8 +413,8 @@ where
     C: AbiDecodeContext + ?Sized,
     T: AbiDecode<'de, C>,
 {
-    fn abi_decode<const CHECKED: bool>(
-        decoder: &mut Decoder<'de, CHECKED>,
+    fn abi_decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
         context: &mut C,
         location: AbiDecodeLocation,
     ) -> Result<Self, C::Error> {

@@ -166,6 +166,18 @@ enum AdjacentExample {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, CborEncode, CborDecode)]
+#[cbor(tag = "kind")]
+enum LargeInternalPayload {
+    Values { values: Vec<u64> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CborEncode, CborDecode)]
+#[cbor(tag = "kind", content = "payload")]
+enum LargeAdjacentPayload {
+    Values(Vec<u64>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, CborEncode, CborDecode)]
 #[serde(rename_all = "snake_case")]
 #[cbor(rename_all = "snake_case")]
@@ -334,6 +346,28 @@ fn adjacent_tagged_enums_match_serde_json_shape() {
             }
         }),
     );
+}
+
+#[test]
+fn tagged_second_pass_inherits_explicit_container_limits() {
+    const ITEMS: usize = (1 << 16) + 1;
+    let values: Vec<u64> = (0..ITEMS as u64).collect();
+
+    let internal = LargeInternalPayload::Values {
+        values: values.clone(),
+    };
+    let internal_bytes = encode_to_vec(&internal).unwrap();
+    let mut internal_limits = DecodeLimits::for_bytes(internal_bytes.len());
+    internal_limits.max_array_len = ITEMS;
+    let internal_decoded: LargeInternalPayload = decode(&internal_bytes, internal_limits).unwrap();
+    assert_eq!(internal_decoded, internal);
+
+    let adjacent = LargeAdjacentPayload::Values(values);
+    let adjacent_bytes = encode_to_vec(&adjacent).unwrap();
+    let mut adjacent_limits = DecodeLimits::for_bytes(adjacent_bytes.len());
+    adjacent_limits.max_array_len = ITEMS;
+    let adjacent_decoded: LargeAdjacentPayload = decode(&adjacent_bytes, adjacent_limits).unwrap();
+    assert_eq!(adjacent_decoded, adjacent);
 }
 
 #[test]

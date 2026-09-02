@@ -31,7 +31,8 @@
 
 use core::cmp::Ordering;
 
-use crate::ErrorCode;
+use crate::work::{WorkMeter, WorkObserver};
+use crate::{ErrorCode, WorkCancelled};
 
 /// Maximum safe integer (2^53-1).
 ///
@@ -163,6 +164,48 @@ pub(crate) fn cmp_len_then_bytes(a: &[u8], b: &[u8]) -> Ordering {
             Ordering::Equal
         }
         other => other,
+    }
+}
+
+/// Compare byte slices lexicographically while charging only completed comparison chunks.
+pub(crate) fn cmp_bytes_observed<O: WorkObserver>(
+    a: &[u8],
+    b: &[u8],
+    meter: &mut WorkMeter<O>,
+) -> Result<Ordering, WorkCancelled> {
+    if !O::ENABLED {
+        return Ok(a.cmp(b));
+    }
+
+    let shared_len = a.len().min(b.len());
+    let mut completed = 0usize;
+    while completed < shared_len {
+        let chunk_len = meter.next_chunk(shared_len - completed);
+        let end = completed + chunk_len;
+        let mut index = completed;
+        while index < end {
+            let order = a[index].cmp(&b[index]);
+            index += 1;
+            if order != Ordering::Equal {
+                meter.complete(index - completed)?;
+                return Ok(order);
+            }
+        }
+        meter.complete(chunk_len)?;
+        completed = end;
+    }
+    Ok(a.len().cmp(&b.len()))
+}
+
+/// Compare encoded map keys by canonical length-then-bytes order with an observed byte loop.
+pub(crate) fn cmp_encoded_key_bytes_observed<O: WorkObserver>(
+    a: &[u8],
+    b: &[u8],
+    meter: &mut WorkMeter<O>,
+) -> Result<Ordering, WorkCancelled> {
+    match a.len().cmp(&b.len()) {
+        Ordering::Equal => cmp_bytes_observed(a, b, meter),
+        other => Ok(other),
     }
 }
 

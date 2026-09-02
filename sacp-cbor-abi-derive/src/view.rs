@@ -56,6 +56,18 @@ pub(crate) fn derive_struct_view(
                     value,
                 )
             }
+
+            #[inline]
+            fn view_field_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self::View, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <#view_name<'__sacp_view> as #abi_path::AbiView<'__sacp_view>>::
+                    view_from_value_with_session(value, session)
+            }
         }
     })
 }
@@ -76,6 +88,10 @@ pub(crate) fn derive_transparent_struct_view(
     let inner_ty = view_type(inner.ty, &view_lifetime);
     let validate_invariants = quote! {
         let _ = <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field(value)?;
+    };
+    let validate_invariants_with_session = quote! {
+        let _ = <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::
+            view_field_with_session(value, session)?;
     };
 
     Ok(quote! {
@@ -100,6 +116,34 @@ pub(crate) fn derive_transparent_struct_view(
             }
 
             #[inline]
+            pub fn from_canonical_with_session<__O>(
+                cbor: #abi_path::__private::sacp_cbor::CanonicalCborRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_canonical_with_session(
+                    cbor,
+                    session,
+                )
+            }
+
+            #[inline]
+            pub fn from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                    value,
+                    session,
+                )
+            }
+
+            #[inline]
             pub fn raw_value(
                 &self,
             ) -> #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view> {
@@ -114,6 +158,21 @@ pub(crate) fn derive_transparent_struct_view(
                 #cbor_path::CborError,
             > {
                 <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field(self.raw)
+            }
+
+            #[inline]
+            pub fn inner_with_session<__O>(
+                &self,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<
+                <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::View,
+                #cbor_path::CborError,
+            >
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <#inner_ty as #abi_path::AbiViewField<'__sacp_view>>::
+                    view_field_with_session(self.raw, session)
             }
 
             #[inline]
@@ -146,6 +205,18 @@ pub(crate) fn derive_transparent_struct_view(
             }
 
             #[inline]
+            fn view_from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                #validate_invariants_with_session
+                ::core::result::Result::Ok(Self { raw: value })
+            }
+
+            #[inline]
             fn raw_value(
                 &self,
             ) -> #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view> {
@@ -165,6 +236,18 @@ pub(crate) fn derive_transparent_struct_view(
                 <#view_name<'__sacp_view> as #abi_path::AbiView<'__sacp_view>>::view_from_value(
                     value,
                 )
+            }
+
+            #[inline]
+            fn view_field_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self::View, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <#view_name<'__sacp_view> as #abi_path::AbiView<'__sacp_view>>::
+                    view_from_value_with_session(value, session)
             }
         }
     })
@@ -237,6 +320,7 @@ fn field_set_view_tokens(
     let accessors = field_set.fields.iter().map(|field| {
         let ident = field.ident;
         let raw_ident = format_ident!("{ident}_raw");
+        let observed_ident = format_ident!("{ident}_with_session");
         let storage = storage_ident(field.ident);
         let wire_ty = view_type(field.wire_ty, &view_lifetime);
         if field.optional {
@@ -264,6 +348,27 @@ fn field_set_view_tokens(
                 > {
                     self.#storage
                         .map(<#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field)
+                        .transpose()
+                }
+
+                #[inline]
+                pub fn #observed_ident<__O>(
+                    &self,
+                    session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+                ) -> ::core::result::Result<
+                    ::core::option::Option<
+                        <#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::View
+                    >,
+                    #cbor_path::CborError,
+                >
+                where
+                    __O: #abi_path::__private::sacp_cbor::WorkObserver,
+                {
+                    self.#storage
+                        .map(|value| {
+                            <#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::
+                                view_field_with_session(value, session)
+                        })
                         .transpose()
                 }
             }
@@ -294,6 +399,21 @@ fn field_set_view_tokens(
                     <#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::view_field(
                         self.#raw_ident()?,
                     )
+                }
+
+                #[inline]
+                pub fn #observed_ident<__O>(
+                    &self,
+                    session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+                ) -> ::core::result::Result<
+                    <#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::View,
+                    #cbor_path::CborError,
+                >
+                where
+                    __O: #abi_path::__private::sacp_cbor::WorkObserver,
+                {
+                    <#wire_ty as #abi_path::AbiViewField<'__sacp_view>>::
+                        view_field_with_session(self.#raw_ident()?, session)
                 }
             }
         }
@@ -347,6 +467,34 @@ fn field_set_view_tokens(
             }
 
             #[inline]
+            pub fn from_canonical_with_session<__O>(
+                cbor: #abi_path::__private::sacp_cbor::CanonicalCborRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_canonical_with_session(
+                    cbor,
+                    session,
+                )
+            }
+
+            #[inline]
+            pub fn from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                    value,
+                    session,
+                )
+            }
+
+            #[inline]
             pub fn raw_value(
                 &self,
             ) -> #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view> {
@@ -370,8 +518,51 @@ fn field_set_view_tokens(
             fn view_from_value(
                 value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
             ) -> ::core::result::Result<Self, #cbor_path::CborError> {
+                let mut __abi_session = #abi_path::__private::sacp_cbor::WorkSession::new(
+                    #abi_path::__private::sacp_cbor::NoopWorkObserver,
+                ).map_err(|_| #cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::WorkCancelled,
+                    value.offset(),
+                ))?;
+                let __abi_view =
+                    <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                        value,
+                        &mut __abi_session,
+                    )?;
+                __abi_session.finish().map_err(|_| #cbor_path::CborError::new(
+                    #cbor_path::ErrorCode::WorkCancelled,
+                    value.offset(),
+                ))?;
+                ::core::result::Result::Ok(__abi_view)
+            }
+
+            #[inline]
+            fn view_from_canonical_with_session<__O>(
+                cbor: #abi_path::__private::sacp_cbor::CanonicalCborRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                    cbor.root(),
+                    session,
+                )
+            }
+
+            #[inline]
+            fn view_from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
                 #(#storage_decls)*
-                let __abi_fields = #abi_path::AbiFieldSetRef::scan(value, |__abi_entry| {
+                let __abi_fields = #abi_path::AbiFieldSetRef::scan_with_session(
+                    value,
+                    session,
+                    |__abi_entry| {
                     match __abi_entry.id {
                         #(#match_arms)*
                         #unknown_arm
@@ -483,6 +674,33 @@ pub(crate) fn derive_enum_view(
             quote! {
                 #id => {
                     let __abi_view = #payload_view_name::from_value(__abi_payload)?;
+                    __abi_payload_view = ::core::option::Option::Some(
+                        #payload_cache_name::#variant_ident(__abi_view),
+                    );
+                }
+            }
+        }
+    });
+    let known_observed_validation_arms = variants.iter().map(|variant| {
+        let id = variant.id;
+        if variant.unit {
+            quote! {
+                #id => {
+                    <() as #abi_path::AbiViewField<'__sacp_view>>::view_field_with_session(
+                        __abi_payload,
+                        session,
+                    )?;
+                }
+            }
+        } else {
+            let payload_view_name = variant_payload_view_name(name, variant.ident);
+            let variant_ident = variant.ident;
+            quote! {
+                #id => {
+                    let __abi_view = #payload_view_name::from_value_with_session(
+                        __abi_payload,
+                        session,
+                    )?;
                     __abi_payload_view = ::core::option::Option::Some(
                         #payload_cache_name::#variant_ident(__abi_view),
                     );
@@ -604,6 +822,34 @@ pub(crate) fn derive_enum_view(
             }
 
             #[inline]
+            pub fn from_canonical_with_session<__O>(
+                cbor: #abi_path::__private::sacp_cbor::CanonicalCborRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_canonical_with_session(
+                    cbor,
+                    session,
+                )
+            }
+
+            #[inline]
+            pub fn from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                    value,
+                    session,
+                )
+            }
+
+            #[inline]
             pub fn raw_value(
                 &self,
             ) -> #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view> {
@@ -673,6 +919,62 @@ pub(crate) fn derive_enum_view(
             }
 
             #[inline]
+            fn view_from_canonical_with_session<__O>(
+                cbor: #abi_path::__private::sacp_cbor::CanonicalCborRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <Self as #abi_path::AbiView<'__sacp_view>>::view_from_value_with_session(
+                    cbor.root(),
+                    session,
+                )
+            }
+
+            #[inline]
+            fn view_from_value_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                let __abi_array = value.array()?;
+                if __abi_array.len() != 2 {
+                    return Err(#cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
+                        value.offset(),
+                    ));
+                }
+                let mut __abi_iter = __abi_array.iter();
+                let __abi_id_value = __abi_iter
+                    .next_with_session(session)
+                    .ok_or_else(|| #cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
+                        value.offset(),
+                    ))??;
+                let __abi_id = #abi_path::__private::decode_abi_id(__abi_id_value)?;
+                let __abi_payload = __abi_iter
+                    .next_with_session(session)
+                    .ok_or_else(|| #cbor_path::CborError::new(
+                        #cbor_path::ErrorCode::ArrayLenMismatch,
+                        value.offset(),
+                    ))??;
+                #payload_cache_decl
+                match __abi_id {
+                    #(#known_observed_validation_arms)*
+                    #unknown_validation_arm
+                }
+                ::core::result::Result::Ok(Self {
+                    raw: value,
+                    variant_id: __abi_id,
+                    payload: __abi_payload,
+                    #payload_cache_init
+                })
+            }
+
+            #[inline]
             fn raw_value(
                 &self,
             ) -> #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view> {
@@ -692,6 +994,18 @@ pub(crate) fn derive_enum_view(
                 <#view_name<'__sacp_view> as #abi_path::AbiView<'__sacp_view>>::view_from_value(
                     value,
                 )
+            }
+
+            #[inline]
+            fn view_field_with_session<__O>(
+                value: #abi_path::__private::sacp_cbor::query::CborValueRef<'__sacp_view>,
+                session: &mut #abi_path::__private::sacp_cbor::WorkSession<__O>,
+            ) -> ::core::result::Result<Self::View, #cbor_path::CborError>
+            where
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            {
+                <#view_name<'__sacp_view> as #abi_path::AbiView<'__sacp_view>>::
+                    view_from_value_with_session(value, session)
             }
         }
     })

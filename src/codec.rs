@@ -2,7 +2,7 @@
 
 #[cfg(feature = "alloc")]
 use crate::encode::{ByteSink, EncodeResult, ValueEncoder};
-use crate::{CborError, Decoder};
+use crate::{CborError, Decoder, WorkObserver};
 
 /// Decode a value from a streaming decoder.
 pub trait CborDecode<'de>: Sized {
@@ -12,7 +12,9 @@ pub trait CborDecode<'de>: Sized {
     ///
     /// Returns an error if the CBOR value does not match the expected type or violates profile
     /// constraints.
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError>;
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError>;
 }
 
 #[cfg(feature = "alloc")]
@@ -23,5 +25,8 @@ pub trait CborEncode {
     /// # Errors
     ///
     /// Returns an error if encoding fails.
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S>;
 }

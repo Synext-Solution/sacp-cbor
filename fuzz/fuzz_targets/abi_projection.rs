@@ -3,7 +3,7 @@
 use core::convert::Infallible;
 
 use libfuzzer_sys::fuzz_target;
-use sacp_cbor::{ByteSink, EncodeLimits, ValueEncoder};
+use sacp_cbor::{ByteSink, EncodeLimits, ValueEncoder, WorkObserver};
 use sacp_cbor_abi::{
     projected_sequence, wire, AbiEncode, AbiEncodeAs, AbiEncodeError, SequenceContractError,
     SequenceEmitter, SequenceProjection,
@@ -21,9 +21,9 @@ impl SequenceProjection<wire::U8> for Source<'_> {
         Ok(self.declared)
     }
 
-    fn project<S: ByteSink>(
+    fn project<S: ByteSink, O: WorkObserver>(
         &self,
-        emitter: &mut SequenceEmitter<'_, '_, S, wire::U8, Self::Error>,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, wire::U8, Self::Error>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         for item in self.items {
             emitter.emit(item)?;
@@ -40,9 +40,9 @@ where
 {
     type Error = Infallible;
 
-    fn abi_encode<S: ByteSink>(
+    fn abi_encode<S: ByteSink, O: WorkObserver>(
         &self,
-        encoder: &mut ValueEncoder<'_, S>,
+        encoder: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         self.0.abi_encode_as(encoder)
     }

@@ -13,9 +13,10 @@ use crate::alloc_util;
 use crate::bytes::BytesRef;
 use crate::canonical::CanonicalCborRef;
 use crate::codec::CborDecode;
-use crate::profile::{validate_f64_bits, MAX_SAFE_INTEGER};
+use crate::profile::{cmp_bytes_observed, validate_f64_bits, MAX_SAFE_INTEGER};
 use crate::query::{peek_kind_at, BigIntRef, CborKind, CborValueRef, IntegerRef};
 use crate::wire::{self, Cursor};
+use crate::work::{NoopWorkObserver, WorkMeter, WorkObserver};
 use crate::{CborError, DecodeLimits, ErrorCode, ValidationOptions};
 
 #[cfg(feature = "alloc")]
@@ -40,10 +41,11 @@ impl<K, V> MapEntries<K, V> {
 }
 
 /// Streaming decoder over canonical CBOR bytes.
-pub struct Decoder<'de, const CHECKED: bool> {
+pub struct Decoder<'de, const CHECKED: bool, O: WorkObserver = NoopWorkObserver> {
     cursor: Cursor<'de>,
     limits: DecodeLimits,
     options: ValidationOptions,
+    work: WorkMeter<O>,
     depth: usize,
     items_seen: usize,
     /// Values fully consumed at depth 0 — exactly 1 for a witnessable pass.
@@ -62,8 +64,8 @@ pub struct Decoder<'de, const CHECKED: bool> {
 ///
 /// Dropping the guard before all declared elements are consumed poisons the parent decoder. Later
 /// operations on that decoder return the stored malformed-canonical error.
-pub struct ArrayDecoder<'a, 'de, const CHECKED: bool> {
-    decoder: &'a mut Decoder<'de, CHECKED>,
+pub struct ArrayDecoder<'a, 'de, const CHECKED: bool, O: WorkObserver = NoopWorkObserver> {
+    decoder: &'a mut Decoder<'de, CHECKED, O>,
     header_offset: usize,
     remaining: usize,
     entered: bool,
@@ -75,8 +77,8 @@ pub struct ArrayDecoder<'a, 'de, const CHECKED: bool> {
 /// Dropping the guard before all declared entries are consumed, or while a key is waiting for its
 /// value, poisons the parent decoder. Later operations on that decoder return the stored
 /// malformed-canonical error.
-pub struct MapDecoder<'a, 'de, const CHECKED: bool> {
-    decoder: &'a mut Decoder<'de, CHECKED>,
+pub struct MapDecoder<'a, 'de, const CHECKED: bool, O: WorkObserver = NoopWorkObserver> {
+    decoder: &'a mut Decoder<'de, CHECKED, O>,
     remaining: usize,
     entered: bool,
     pending_value: bool,
@@ -179,15 +181,23 @@ impl TraversalWorkspace {
 /// The session is invariant in its fresh brand and cannot escape or be transferred to another
 /// decoder. Container state remains private inside its caller-owned workspace.
 #[cfg(feature = "alloc")]
-pub struct TraversalSession<'decoder, 'de, 'brand, const CHECKED: bool> {
-    decoder: &'decoder mut Decoder<'de, CHECKED>,
+pub struct TraversalSession<
+    'decoder,
+    'de,
+    'brand,
+    const CHECKED: bool,
+    O: WorkObserver = NoopWorkObserver,
+> {
+    decoder: &'decoder mut Decoder<'de, CHECKED, O>,
     workspace: &'decoder mut TraversalWorkspace,
     brand: PhantomData<fn(&'brand mut ()) -> &'brand mut ()>,
 }
 
 #[cfg(feature = "alloc")]
-impl<'de, const CHECKED: bool> core::ops::Deref for TraversalSession<'_, 'de, '_, CHECKED> {
-    type Target = Decoder<'de, CHECKED>;
+impl<'de, const CHECKED: bool, O: WorkObserver> core::ops::Deref
+    for TraversalSession<'_, 'de, '_, CHECKED, O>
+{
+    type Target = Decoder<'de, CHECKED, O>;
 
     fn deref(&self) -> &Self::Target {
         self.decoder
@@ -195,14 +205,16 @@ impl<'de, const CHECKED: bool> core::ops::Deref for TraversalSession<'_, 'de, '_
 }
 
 #[cfg(feature = "alloc")]
-impl<const CHECKED: bool> core::ops::DerefMut for TraversalSession<'_, '_, '_, CHECKED> {
+impl<const CHECKED: bool, O: WorkObserver> core::ops::DerefMut
+    for TraversalSession<'_, '_, '_, CHECKED, O>
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.decoder
     }
 }
 
 #[cfg(feature = "alloc")]
-impl<'de, const CHECKED: bool> TraversalSession<'_, 'de, '_, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> TraversalSession<'_, 'de, '_, CHECKED, O> {
     /// Enter an array in this branded session.
     ///
     /// # Errors
@@ -562,7 +574,7 @@ pub struct MapKey<'de> {
     pub encoded_range: Range<usize>,
 }
 
-impl<const CHECKED: bool> Drop for ArrayDecoder<'_, '_, CHECKED> {
+impl<const CHECKED: bool, O: WorkObserver> Drop for ArrayDecoder<'_, '_, CHECKED, O> {
     fn drop(&mut self) {
         if self.entered {
             self.decoder.exit_container();
@@ -576,7 +588,7 @@ impl<const CHECKED: bool> Drop for ArrayDecoder<'_, '_, CHECKED> {
     }
 }
 
-impl<const CHECKED: bool> Drop for MapDecoder<'_, '_, CHECKED> {
+impl<const CHECKED: bool, O: WorkObserver> Drop for MapDecoder<'_, '_, CHECKED, O> {
     fn drop(&mut self) {
         if self.entered {
             self.decoder.exit_container();
@@ -590,14 +602,14 @@ impl<const CHECKED: bool> Drop for MapDecoder<'_, '_, CHECKED> {
     }
 }
 
-impl<'de> Decoder<'de, true> {
+impl<'de> Decoder<'de, true, NoopWorkObserver> {
     /// Construct a decoder that enforces canonical constraints while decoding.
     ///
     /// # Errors
     ///
     /// Returns `MessageLenLimitExceeded` if `bytes` exceeds the input limit.
     pub const fn new_checked(bytes: &'de [u8], limits: DecodeLimits) -> Result<Self, CborError> {
-        Self::new_with(bytes, limits, ValidationOptions::new())
+        Self::new_noop_with(bytes, limits, ValidationOptions::new())
     }
 
     /// Construct a checked decoder that additionally enforces the given
@@ -612,11 +624,50 @@ impl<'de> Decoder<'de, true> {
         limits: DecodeLimits,
         options: ValidationOptions,
     ) -> Result<Self, CborError> {
-        Self::new_with(bytes, limits, options)
+        Self::new_noop_with(bytes, limits, options)
     }
 }
 
-impl<'de> Decoder<'de, false> {
+impl<'de, O: WorkObserver> Decoder<'de, true, O> {
+    /// Construct an observed decoder that enforces canonical constraints while decoding.
+    ///
+    /// The observer is owned by the decoder and receives its initial zero-work checkpoint before
+    /// decoding begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::WorkCancelled`] when the observer rejects the initial checkpoint,
+    /// `MessageLenLimitExceeded` when `bytes` exceeds the input limit, or `InvalidLimits` for an
+    /// invalid limit set.
+    pub fn new_checked_observed(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        observer: O,
+    ) -> Result<Self, CborError> {
+        Self::new_with(bytes, limits, ValidationOptions::new(), observer)
+    }
+
+    /// Construct an observed checked decoder under explicit restriction options.
+    ///
+    /// The observer is owned by the decoder and receives its initial zero-work checkpoint before
+    /// decoding begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::WorkCancelled`] when the observer rejects the initial checkpoint,
+    /// `MessageLenLimitExceeded` when `bytes` exceeds the input limit, or `InvalidLimits` for an
+    /// invalid limit set.
+    pub fn new_checked_with_observer(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+        observer: O,
+    ) -> Result<Self, CborError> {
+        Self::new_with(bytes, limits, options, observer)
+    }
+}
+
+impl<'de> Decoder<'de, false, NoopWorkObserver> {
     /// Construct a decoder over canonical bytes with the provided limits.
     ///
     /// This assumes the input is already canonical.
@@ -628,11 +679,53 @@ impl<'de> Decoder<'de, false> {
         canon: CanonicalCborRef<'de>,
         limits: DecodeLimits,
     ) -> Result<Self, CborError> {
-        Self::new_with(canon.as_bytes(), limits, ValidationOptions::new())
+        Self::new_noop_with(canon.as_bytes(), limits, ValidationOptions::new())
     }
 }
 
-impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
+impl<'de, const CHECKED: bool> Decoder<'de, CHECKED, NoopWorkObserver> {
+    const fn new_noop_with(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+    ) -> Result<Self, CborError> {
+        if let Err(error) = limits.validate() {
+            return Err(error);
+        }
+        if bytes.len() > limits.max_input_bytes {
+            return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
+        }
+        Ok(Self::from_parts(
+            bytes,
+            limits,
+            options,
+            WorkMeter::new(NoopWorkObserver),
+        ))
+    }
+}
+
+impl<'de, O: WorkObserver> Decoder<'de, false, O> {
+    /// Construct an observed decoder over an existing canonical witness.
+    ///
+    /// The observer is owned by the decoder and receives its initial zero-work checkpoint before
+    /// decoding begins. Canonical grammar checks are omitted, while decode limits and completion
+    /// protocol checks remain active.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::WorkCancelled`] when the observer rejects the initial checkpoint,
+    /// `MessageLenLimitExceeded` when the witness exceeds the input limit, or `InvalidLimits` for
+    /// an invalid limit set.
+    pub fn new_trusted_observed(
+        canon: CanonicalCborRef<'de>,
+        limits: DecodeLimits,
+        observer: O,
+    ) -> Result<Self, CborError> {
+        Self::new_with(canon.as_bytes(), limits, ValidationOptions::new(), observer)
+    }
+}
+
+impl<'de, const CHECKED: bool, O: WorkObserver> Decoder<'de, CHECKED, O> {
     /// Complete a decode pass and return the canonical witness.
     ///
     /// Succeeds only when this decoder consumed the input as **exactly one canonical item**: no
@@ -646,11 +739,10 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns the stored poison, `TrailingBytes` when input remains, or `MalformedCanonical` when
     /// the pass did not consume exactly one root value.
-    pub fn finish(self) -> Result<CanonicalCborRef<'de>, CborError> {
+    pub fn finish(mut self) -> Result<CanonicalCborRef<'de>, CborError> {
         self.check_poison()?;
         let pos = self.cursor.position();
-        let data = self.cursor.data();
-        if pos != data.len() {
+        if pos != self.cursor.data().len() {
             return Err(CborError::new(ErrorCode::TrailingBytes, pos));
         }
         if CHECKED && self.root_values != 1 {
@@ -659,7 +751,8 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         if self.active_traversal_id.is_some() {
             return Err(CborError::new(ErrorCode::MalformedCanonical, pos));
         }
-        Ok(CanonicalCborRef::new(data))
+        self.finish_work()?;
+        Ok(CanonicalCborRef::new(self.cursor.data()))
     }
 
     /// Run an explicitly-driven traversal in a fresh generative brand.
@@ -677,10 +770,11 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         f: F,
     ) -> Result<R, E>
     where
-        F: for<'brand> FnOnce(&mut TraversalSession<'_, 'de, 'brand, CHECKED>) -> Result<R, E>,
+        F: for<'brand> FnOnce(&mut TraversalSession<'_, 'de, 'brand, CHECKED, O>) -> Result<R, E>,
         E: From<CborError>,
     {
         workspace.reset();
+        self.check_poison().map_err(E::from)?;
         let mut session = TraversalSession {
             decoder: self,
             workspace,
@@ -688,7 +782,14 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         };
         let result = f(&mut session);
         match result {
-            Ok(value) if session.workspace.states.is_empty() => Ok(value),
+            Ok(value) if session.workspace.states.is_empty() => {
+                if let Some(error) = session.decoder.poison {
+                    if error.code == ErrorCode::WorkCancelled {
+                        return Err(E::from(error));
+                    }
+                }
+                Ok(value)
+            }
             Ok(_) => {
                 let error = session
                     .decoder
@@ -707,21 +808,33 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         }
     }
 
-    const fn new_with(
+    fn new_with(
         bytes: &'de [u8],
         limits: DecodeLimits,
         options: ValidationOptions,
+        observer: O,
     ) -> Result<Self, CborError> {
-        if let Err(err) = limits.validate() {
-            return Err(err);
-        }
+        limits.validate()?;
         if bytes.len() > limits.max_input_bytes {
             return Err(CborError::new(ErrorCode::MessageLenLimitExceeded, 0));
         }
-        Ok(Self {
+        let mut work = WorkMeter::new(observer);
+        work.start()
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, 0))?;
+        Ok(Self::from_parts(bytes, limits, options, work))
+    }
+
+    const fn from_parts(
+        bytes: &'de [u8],
+        limits: DecodeLimits,
+        options: ValidationOptions,
+        work: WorkMeter<O>,
+    ) -> Self {
+        Self {
             cursor: Cursor::with_pos(bytes, 0),
             limits,
             options,
+            work,
             depth: 0,
             items_seen: 0,
             root_values: 0,
@@ -733,7 +846,29 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             next_traversal_id: 0,
             poison: None,
             scratch: wire::SkipScratch::new(),
-        })
+        }
+    }
+
+    #[inline]
+    fn complete_work(&mut self, completed_units: usize) -> Result<(), CborError> {
+        if self.work.complete(completed_units).is_err() {
+            let error = CborError::new(ErrorCode::WorkCancelled, self.position());
+            self.poison_err(error);
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn finish_work(&mut self) -> Result<(), CborError> {
+        if self.work.finish().is_err() {
+            let error = CborError::new(ErrorCode::WorkCancelled, self.position());
+            self.poison_err(error);
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Record the completion of one whole value at the current depth.
@@ -813,6 +948,47 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         self.cursor.position()
     }
 
+    /// Reborrow this decoder's cooperative work state for a derived nested decode.
+    ///
+    /// This is an implementation detail used by the derive crate when an internally or
+    /// adjacently tagged enum must decode a canonical sub-value after its enclosing map has been
+    /// scanned. The opaque return type prevents generated code from depending on the meter's
+    /// representation while preserving the outer decoder's cadence and sticky cancellation state.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __reborrow_work_observer(&mut self) -> impl WorkObserver + '_ {
+        &mut self.work
+    }
+
+    /// Construct the checked second-pass decoder used by derived tagged enums.
+    ///
+    /// The outer decoder already validated `value` against the caller's limits and grammar
+    /// options. The checked path is retained because safe text decoding performs real UTF-8 work
+    /// during this pass and that work must remain observable. Reusing the caller's limits avoids
+    /// introducing an unrelated default cap, while the borrowed work meter preserves the outer
+    /// decoder's cadence and sticky cancellation state.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __derived_subvalue_decoder<'value>(
+        &mut self,
+        value: CborValueRef<'value>,
+    ) -> Result<Decoder<'value, true, impl WorkObserver + '_>, CborError> {
+        let limits = self.limits;
+        Decoder::<true, _>::new_checked_observed(value.as_bytes(), limits, &mut self.work)
+    }
+
+    /// Store and return an error from a derived nested decode.
+    ///
+    /// Derived tagged enums may finish consuming their outer container before interpreting a
+    /// retained canonical sub-value. Recording the mapped error here ensures container cleanup and
+    /// every later operation preserve that first error, including its original input offset.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __record_nested_decode_error(&mut self, error: CborError) -> CborError {
+        self.poison_err(error);
+        self.poison.unwrap_or(error)
+    }
+
     #[inline]
     pub(crate) const fn data(&self) -> &'de [u8] {
         self.cursor.data()
@@ -823,6 +999,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         self.check_poison()?;
         let off = self.cursor.position();
         let ib = self.cursor.read_u8()?;
+        self.complete_work(1)?;
         Ok((ib >> 5, ib & 0x1f, off))
     }
 
@@ -887,7 +1064,13 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
 
     #[inline]
     fn parse_text_from_header(&mut self, off: usize, ai: u8) -> Result<&'de str, CborError> {
-        wire::parse_text_from_header::<CHECKED>(&mut self.cursor, Some(&self.limits), off, ai)
+        wire::parse_text_from_header_observed::<CHECKED, _>(
+            &mut self.cursor,
+            Some(&self.limits),
+            off,
+            ai,
+            &mut self.work,
+        )
     }
 
     #[inline]
@@ -910,20 +1093,36 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     ///
     /// Returns the guard's error, or a converted decode error when the value is not canonical text,
     /// violates the configured limits, is truncated, or contains invalid UTF-8.
+    ///
+    /// With an enabled observer, checked UTF-8 validation is checkpointed in code-point-aligned
+    /// chunks. On safe builds, producing the final whole-slice `&str` then requires one opaque
+    /// standard-library conversion. That conversion is not charged twice and cannot itself be
+    /// cooperatively interrupted.
     pub fn decode_text_with_guard<E, F>(&mut self, guard: F) -> Result<&'de str, E>
     where
         E: From<CborError>,
         F: FnOnce(PayloadHeader) -> Result<(), E>,
     {
-        self.decode_payload_with_guard(PayloadKind::Text, guard, |bytes, off| {
-            if CHECKED {
-                crate::utf8::validate_utf8(bytes)
-                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))
-            } else {
-                crate::utf8::trusted(bytes)
-                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))
-            }
-        })
+        self.decode_payload_with_guard(
+            PayloadKind::Text,
+            guard,
+            |bytes, off, payload_start, work| {
+                if CHECKED {
+                    match crate::utf8::validate_utf8_as_str_observed(bytes, work) {
+                        Ok(text) => Ok(text),
+                        Err(crate::utf8::ObservedUtf8Error::Invalid) => {
+                            Err(CborError::new(ErrorCode::Utf8Invalid, off))
+                        }
+                        Err(crate::utf8::ObservedUtf8Error::Cancelled(completed)) => Err(
+                            CborError::new(ErrorCode::WorkCancelled, payload_start + completed),
+                        ),
+                    }
+                } else {
+                    crate::utf8::trusted(bytes)
+                        .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))
+                }
+            },
+        )
     }
 
     /// Decode a byte string after giving the caller one opportunity to admit its declared payload
@@ -943,7 +1142,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         E: From<CborError>,
         F: FnOnce(PayloadHeader) -> Result<(), E>,
     {
-        self.decode_payload_with_guard(PayloadKind::Bytes, guard, |bytes, _| Ok(bytes))
+        self.decode_payload_with_guard(PayloadKind::Bytes, guard, |bytes, _, _, _| Ok(bytes))
     }
 
     fn decode_payload_with_guard<T, E, F, P>(
@@ -955,7 +1154,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     where
         E: From<CborError>,
         F: FnOnce(PayloadHeader) -> Result<(), E>,
-        P: FnOnce(&'de [u8], usize) -> Result<T, CborError>,
+        P: FnOnce(&'de [u8], usize, usize, &mut WorkMeter<O>) -> Result<T, CborError>,
     {
         if let Err(err) = self.check_poison() {
             return Err(E::from(err));
@@ -989,10 +1188,17 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             return Err(err);
         }
 
+        let payload_start = self.cursor.position();
         let result = self
             .cursor
             .read_exact(header.declared_len)
-            .and_then(|bytes| parse(bytes, header.header_offset));
+            .and_then(|bytes| parse(bytes, header.header_offset, payload_start, &mut self.work));
+        if let Err(error) = result {
+            if error.code == ErrorCode::WorkCancelled {
+                self.cursor.set_position(error.offset);
+            }
+            return self.seal_value(Err(error)).map_err(E::from);
+        }
         self.seal_value(result).map_err(E::from)
     }
 
@@ -1082,10 +1288,20 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         if len > self.limits.max_text_len {
             return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
         }
+        let payload_start = self.cursor.position();
         let bytes = self.cursor.read_exact(len)?;
         if CHECKED {
-            crate::utf8::validate_utf8(bytes)
-                .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?;
+            match crate::utf8::validate_utf8_observed(bytes, &mut self.work) {
+                Ok(()) => {}
+                Err(crate::utf8::ObservedUtf8Error::Invalid) => {
+                    return Err(CborError::new(ErrorCode::Utf8Invalid, off));
+                }
+                Err(crate::utf8::ObservedUtf8Error::Cancelled(completed)) => {
+                    let position = payload_start + completed;
+                    self.cursor.set_position(position);
+                    return Err(CborError::new(ErrorCode::WorkCancelled, position));
+                }
+            }
         }
         Ok(())
     }
@@ -1325,7 +1541,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// # Errors
     ///
     /// Returns `ExpectedArray` if the next value is not an array, or a limit error.
-    pub fn array(&mut self) -> Result<ArrayDecoder<'_, 'de, CHECKED>, CborError> {
+    pub fn array(&mut self) -> Result<ArrayDecoder<'_, 'de, CHECKED, O>, CborError> {
         self.require_claimed_traversal_slot()?;
         let header_offset = self.position();
         let entry = self.array_entry();
@@ -1362,7 +1578,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// # Errors
     ///
     /// Returns `ExpectedMap` if the next value is not a map, or a limit error.
-    pub fn map(&mut self) -> Result<MapDecoder<'_, 'de, CHECKED>, CborError> {
+    pub fn map(&mut self) -> Result<MapDecoder<'_, 'de, CHECKED, O>, CborError> {
         self.require_claimed_traversal_slot()?;
         let entry = self.map_entry();
         let (len, entered) = self.seal_step(entry)?;
@@ -1460,7 +1676,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             self.exit_container();
             self.note_value_end();
         }
-        Ok(())
+        self.complete_work(1)
     }
 
     /// Enter a map without borrowing this decoder for the container lifetime.
@@ -1517,10 +1733,12 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             let key = self.parse_text_from_header(off, ai)?;
             let key_end = self.position();
             if CHECKED {
-                wire::check_map_key_order(
+                wire::check_map_key_order_observed(
                     self.data(),
                     &mut traversal.prev_key_range,
                     key_start,
+                    key_end,
+                    &mut self.work,
                     key_end,
                 )?;
             }
@@ -1594,7 +1812,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
             self.exit_container();
             self.note_value_end();
         }
-        Ok(())
+        self.complete_work(1)
     }
 
     #[cfg(feature = "alloc")]
@@ -1639,6 +1857,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         if had_pending {
             self.active_traversal_slot = None;
             self.active_traversal_slot_depth = None;
+            self.complete_work(1)?;
         }
         Ok(())
     }
@@ -1651,6 +1870,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
         if had_pending {
             self.active_traversal_slot = None;
             self.active_traversal_slot_depth = None;
+            self.complete_work(1)?;
         }
         Ok(())
     }
@@ -1705,12 +1925,13 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     /// Returns a decode error if the value is malformed or violates limits.
     pub fn skip_value(&mut self) -> Result<(), CborError> {
         self.check_poison()?;
-        let result = wire::skip_one_value_with_scratch::<CHECKED>(
+        let result = wire::skip_one_value_with_scratch_observed::<CHECKED, O>(
             &mut self.cursor,
             wire::WalkPolicy::new(Some(&self.limits), self.options),
             &mut self.items_seen,
             self.depth,
             &mut self.scratch,
+            &mut self.work,
         );
         self.seal_value(result)
     }
@@ -1759,7 +1980,7 @@ impl<'de, const CHECKED: bool> Decoder<'de, CHECKED> {
     }
 }
 
-impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> ArrayDecoder<'_, 'de, CHECKED, O> {
     /// Admit this array using its already-decoded header metadata.
     ///
     /// This consumes and returns the guard so admission cannot be accidentally separated from the
@@ -1776,6 +1997,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         E: From<CborError>,
         F: FnOnce(ContainerHeader) -> Result<(), E>,
     {
+        self.decoder.check_poison().map_err(E::from)?;
         if !self.admission_open {
             let error = CborError::new(ErrorCode::MalformedCanonical, self.header_offset);
             self.decoder.poison_err(error);
@@ -1816,12 +2038,14 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if decoding fails.
     pub fn next_value<T: CborDecode<'de>>(&mut self) -> Result<Option<T>, CborError> {
+        self.decoder.check_poison()?;
         if self.remaining == 0 {
             return Ok(None);
         }
         self.admission_open = false;
         let value = T::decode(self.decoder)?;
         self.remaining -= 1;
+        self.decoder.complete_work(1)?;
         Ok(Some(value))
     }
 
@@ -1832,7 +2056,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     /// Returns an error if decoding fails.
     pub fn decode_next<F, T>(&mut self, f: F) -> Result<Option<T>, CborError>
     where
-        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, CborError>,
+        F: FnOnce(&mut Decoder<'de, CHECKED, O>) -> Result<T, CborError>,
     {
         self.decode_next_with(f)
     }
@@ -1850,9 +2074,10 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     /// malformed.
     pub fn decode_next_with<F, T, E>(&mut self, f: F) -> Result<Option<T>, E>
     where
-        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, E>,
+        F: FnOnce(&mut Decoder<'de, CHECKED, O>) -> Result<T, E>,
         E: From<CborError>,
     {
+        self.decoder.check_poison().map_err(E::from)?;
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -1860,6 +2085,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         match f(self.decoder) {
             Ok(value) => {
                 self.remaining -= 1;
+                self.decoder.complete_work(1).map_err(E::from)?;
                 Ok(Some(value))
             }
             Err(err) => {
@@ -1876,12 +2102,14 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if skipping fails.
     pub fn skip_remaining(&mut self) -> Result<(), CborError> {
+        self.decoder.check_poison()?;
         if self.remaining > 0 {
             self.admission_open = false;
         }
         while self.remaining > 0 {
             self.decoder.skip_value()?;
             self.remaining -= 1;
+            self.decoder.complete_work(1)?;
         }
         Ok(())
     }
@@ -1908,6 +2136,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
             let result = self.decoder.consume_scalar_raw(kind);
             self.decoder.seal_value(result)?;
             self.remaining -= 1;
+            self.decoder.complete_work(1)?;
         }
         Ok(())
     }
@@ -1936,6 +2165,7 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
         let result = self.decoder.consume_scalar_raw(kind);
         self.decoder.seal_value(result)?;
         self.remaining -= 1;
+        self.decoder.complete_work(1)?;
         Ok(Some(start..self.decoder.position()))
     }
 
@@ -1970,7 +2200,15 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
             self.remaining -= 1;
             let end = self.decoder.position();
             if let Some(prev_range) = prev {
-                let order = data[prev_range].cmp(&data[start..end]);
+                let Ok(order) = cmp_bytes_observed(
+                    &data[prev_range],
+                    &data[start..end],
+                    &mut self.decoder.work,
+                ) else {
+                    let error = CborError::new(ErrorCode::WorkCancelled, end);
+                    self.decoder.poison_err(error);
+                    return Err(error);
+                };
                 if order != core::cmp::Ordering::Less {
                     let code = if order == core::cmp::Ordering::Equal {
                         ErrorCode::DuplicateElement
@@ -1983,12 +2221,13 @@ impl<'de, const CHECKED: bool> ArrayDecoder<'_, 'de, CHECKED> {
                 }
             }
             prev = Some(start..end);
+            self.decoder.complete_work(1)?;
         }
         Ok(())
     }
 }
 
-impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> MapDecoder<'_, 'de, CHECKED, O> {
     /// Remaining entries in the map.
     #[inline]
     #[must_use]
@@ -2011,6 +2250,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if decoding fails or the map is malformed.
     pub fn next_key_ref(&mut self) -> Result<Option<MapKey<'de>>, CborError> {
+        self.decoder.check_poison()?;
         // Pending-state misuse is detected before any byte is consumed —
         // recoverable, never sticky.
         if self.pending_value {
@@ -2038,10 +2278,12 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
         let key = self.decoder.parse_text_from_header(off, ai)?;
         let key_end = self.decoder.position();
         if CHECKED {
-            wire::check_map_key_order(
+            wire::check_map_key_order_observed(
                 self.decoder.data(),
                 &mut self.prev_key_range,
                 key_start,
+                key_end,
+                &mut self.decoder.work,
                 key_end,
             )?;
         }
@@ -2069,7 +2311,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     /// Returns an error if decoding fails or the map is malformed.
     pub fn decode_value<F, T>(&mut self, f: F) -> Result<T, CborError>
     where
-        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, CborError>,
+        F: FnOnce(&mut Decoder<'de, CHECKED, O>) -> Result<T, CborError>,
     {
         self.decode_value_with(f)
     }
@@ -2087,9 +2329,10 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     /// malformed.
     pub fn decode_value_with<F, T, E>(&mut self, f: F) -> Result<T, E>
     where
-        F: FnOnce(&mut Decoder<'de, CHECKED>) -> Result<T, E>,
+        F: FnOnce(&mut Decoder<'de, CHECKED, O>) -> Result<T, E>,
         E: From<CborError>,
     {
+        self.decoder.check_poison().map_err(E::from)?;
         if !self.pending_value {
             // Detected before any byte is consumed — recoverable.
             let err = CborError::new(ErrorCode::MalformedCanonical, self.decoder.position());
@@ -2099,6 +2342,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
             Ok(value) => {
                 self.pending_value = false;
                 self.remaining -= 1;
+                self.decoder.complete_work(1).map_err(E::from)?;
                 Ok(value)
             }
             Err(err) => {
@@ -2118,6 +2362,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if no key is pending or if skipping fails.
     pub fn skip_value(&mut self) -> Result<(), CborError> {
+        self.decoder.check_poison()?;
         if !self.pending_value {
             // Detected before any byte is consumed — recoverable.
             return Err(CborError::new(
@@ -2128,6 +2373,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
         self.decoder.skip_value()?;
         self.pending_value = false;
         self.remaining -= 1;
+        self.decoder.complete_work(1)?;
         Ok(())
     }
 
@@ -2150,6 +2396,7 @@ impl<'de, const CHECKED: bool> MapDecoder<'_, 'de, CHECKED> {
     ///
     /// Returns an error if skipping fails or the map is malformed.
     pub fn skip_remaining(&mut self) -> Result<(), CborError> {
+        self.decoder.check_poison()?;
         while self.remaining > 0 {
             if !self.pending_value {
                 let _ = self.next_key_ref()?;
@@ -2169,11 +2416,33 @@ pub fn decode<'de, T: CborDecode<'de>>(
     bytes: &'de [u8],
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let mut decoder = Decoder::<true>::new_checked(bytes, limits)?;
+    decode_with_observer(bytes, limits, NoopWorkObserver)
+}
+
+/// Validate canonical CBOR and decode a value through a caller-provided work observer.
+///
+/// The observer is owned for the duration of the operation. Successful decoding flushes the final
+/// completed-work remainder before returning the value.
+/// Checked text validation is chunked. When `T` requires a whole borrowed `&str`, safe builds still
+/// require one final opaque standard-library slice-to-string conversion; it is not charged twice
+/// and cannot itself be cooperatively interrupted.
+///
+/// # Errors
+///
+/// Returns an error if the input is not exactly one canonical CBOR value, decoding fails, a limit
+/// is exceeded, or the observer requests cancellation.
+pub fn decode_with_observer<'de, T, O>(
+    bytes: &'de [u8],
+    limits: DecodeLimits,
+    observer: O,
+) -> Result<T, CborError>
+where
+    T: CborDecode<'de>,
+    O: WorkObserver,
+{
+    let mut decoder = Decoder::<true, O>::new_checked_observed(bytes, limits, observer)?;
     let value = T::decode(&mut decoder)?;
-    if decoder.position() != bytes.len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
-    }
+    let _ = decoder.finish()?;
     Ok(value)
 }
 
@@ -2186,29 +2455,56 @@ pub fn decode_canonical<'de, T: CborDecode<'de>>(
     canon: CanonicalCborRef<'de>,
     limits: DecodeLimits,
 ) -> Result<T, CborError> {
-    let mut decoder = Decoder::<false>::new_trusted(canon, limits)?;
+    decode_canonical_with_observer(canon, limits, NoopWorkObserver)
+}
+
+/// Decode one value from canonical bytes through a caller-provided work observer.
+///
+/// The observer is owned for the duration of the operation. Successful decoding flushes the final
+/// completed-work remainder before returning the value.
+/// When `T` requires a whole borrowed `&str`, safe builds perform an opaque standard-library
+/// slice-to-string conversion that cannot itself be cooperatively interrupted.
+///
+/// # Errors
+///
+/// Returns an error if the witness does not contain exactly one decoded value, decoding fails, a
+/// limit is exceeded, or the observer requests cancellation.
+pub fn decode_canonical_with_observer<'de, T, O>(
+    canon: CanonicalCborRef<'de>,
+    limits: DecodeLimits,
+    observer: O,
+) -> Result<T, CborError>
+where
+    T: CborDecode<'de>,
+    O: WorkObserver,
+{
+    let mut decoder = Decoder::<false, O>::new_trusted_observed(canon, limits, observer)?;
     let value = T::decode(&mut decoder)?;
-    if decoder.position() != canon.as_bytes().len() {
-        return Err(CborError::new(ErrorCode::TrailingBytes, decoder.position()));
-    }
+    let _ = decoder.finish()?;
     Ok(value)
 }
 
 impl<'de> CborDecode<'de> for () {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_null()
     }
 }
 
 #[allow(clippy::use_self)]
 impl<'de> CborDecode<'de> for bool {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_bool()
     }
 }
 
 impl<'de> CborDecode<'de> for i64 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_i128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2216,7 +2512,9 @@ impl<'de> CborDecode<'de> for i64 {
 }
 
 impl<'de> CborDecode<'de> for i32 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_i128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2224,7 +2522,9 @@ impl<'de> CborDecode<'de> for i32 {
 }
 
 impl<'de> CborDecode<'de> for i16 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_i128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2232,7 +2532,9 @@ impl<'de> CborDecode<'de> for i16 {
 }
 
 impl<'de> CborDecode<'de> for i8 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_i128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2240,7 +2542,9 @@ impl<'de> CborDecode<'de> for i8 {
 }
 
 impl<'de> CborDecode<'de> for isize {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_i128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2248,13 +2552,17 @@ impl<'de> CborDecode<'de> for isize {
 }
 
 impl<'de> CborDecode<'de> for i128 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_integer_i128()
     }
 }
 
 impl<'de> CborDecode<'de> for u64 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_u128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2262,7 +2570,9 @@ impl<'de> CborDecode<'de> for u64 {
 }
 
 impl<'de> CborDecode<'de> for u32 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_u128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2270,7 +2580,9 @@ impl<'de> CborDecode<'de> for u32 {
 }
 
 impl<'de> CborDecode<'de> for u16 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_u128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2278,7 +2590,9 @@ impl<'de> CborDecode<'de> for u16 {
 }
 
 impl<'de> CborDecode<'de> for u8 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_u128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2286,7 +2600,9 @@ impl<'de> CborDecode<'de> for u8 {
 }
 
 impl<'de> CborDecode<'de> for usize {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_integer_u128()?;
         Self::try_from(v).map_err(|_| CborError::new(ErrorCode::ExpectedInteger, off))
@@ -2294,14 +2610,18 @@ impl<'de> CborDecode<'de> for usize {
 }
 
 impl<'de> CborDecode<'de> for u128 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_integer_u128()
     }
 }
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for BigInt {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let (parts, off) = decoder.parse_integer_parts()?;
         match parts {
             IntegerParts::Big { negative, mag } => {
@@ -2317,7 +2637,9 @@ impl<'de> CborDecode<'de> for BigInt {
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for Integer {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let (parts, off) = decoder.parse_integer_parts()?;
         match parts {
             IntegerParts::SafePos(v) => {
@@ -2339,13 +2661,17 @@ impl<'de> CborDecode<'de> for Integer {
 }
 
 impl<'de> CborDecode<'de> for f64 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_float64()
     }
 }
 
 impl<'de> CborDecode<'de> for f32 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let v = decoder.parse_float64()?;
         if v.is_nan() {
@@ -2407,7 +2733,9 @@ impl<'de, 'a> CborDecode<'de> for &'a str
 where
     'de: 'a,
 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_text()
     }
 }
@@ -2416,7 +2744,9 @@ impl<'de, 'a> CborDecode<'de> for &'a [u8]
 where
     'de: 'a,
 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_bytes()
     }
 }
@@ -2425,19 +2755,25 @@ impl<'de, 'a> CborDecode<'de> for BytesRef<'a>
 where
     'de: 'a,
 {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_bytes().map(BytesRef::new)
     }
 }
 
 impl<'de> CborDecode<'de> for IntegerRef<'de> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         decoder.parse_integer_ref()
     }
 }
 
 impl<'de> CborDecode<'de> for CborValueRef<'de> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let start = decoder.position();
         decoder.skip_value()?;
         let end = decoder.position();
@@ -2447,7 +2783,9 @@ impl<'de> CborDecode<'de> for CborValueRef<'de> {
 
 #[cfg(feature = "alloc")]
 impl<'de, T: CborDecode<'de>> CborDecode<'de> for Option<T> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let map_off = decoder.position();
         let mut map = decoder.map()?;
         if map.remaining() != 1 {
@@ -2469,7 +2807,9 @@ impl<'de, T: CborDecode<'de>> CborDecode<'de> for Option<T> {
 
 #[cfg(feature = "collections")]
 impl<'de, T: CborDecode<'de>> CborDecode<'de> for Vec<T> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let mut array = decoder.array()?;
         let mut out = alloc_util::try_vec_with_capacity::<T>(array.remaining(), off)?;
@@ -2482,7 +2822,9 @@ impl<'de, T: CborDecode<'de>> CborDecode<'de> for Vec<T> {
 
 #[cfg(feature = "collections")]
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let mut map = decoder.map()?;
         let mut out = alloc_util::try_vec_with_capacity::<(&'de str, V)>(map.remaining(), off)?;
@@ -2495,7 +2837,9 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<&'de str, V> {
 
 #[cfg(feature = "collections")]
 impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let mut map = decoder.map()?;
         let mut out = alloc_util::try_vec_with_capacity::<(String, V)>(map.remaining(), off)?;
@@ -2510,7 +2854,9 @@ impl<'de, V: CborDecode<'de>> CborDecode<'de> for MapEntries<String, V> {
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for String {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let s = decoder.parse_text()?;
         alloc_util::try_string_from_str(s, off)
@@ -2519,7 +2865,9 @@ impl<'de> CborDecode<'de> for String {
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for Bytes {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let bytes = decoder.parse_bytes()?;
         Ok(Self::new(alloc_util::try_vec_from_slice(bytes, off)?))
@@ -2527,7 +2875,9 @@ impl<'de> CborDecode<'de> for Bytes {
 }
 
 impl<'de, const N: usize> CborDecode<'de> for [u8; N] {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let bytes = decoder.parse_bytes()?;
         if bytes.len() != N {
@@ -2540,7 +2890,9 @@ impl<'de, const N: usize> CborDecode<'de> for [u8; N] {
 }
 
 impl<'de> CborDecode<'de> for CanonicalCborRef<'de> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let start = decoder.position();
         decoder.skip_value()?;
         let end = decoder.position();
@@ -2550,7 +2902,9 @@ impl<'de> CborDecode<'de> for CanonicalCborRef<'de> {
 
 #[cfg(feature = "alloc")]
 impl<'de> CborDecode<'de> for CanonicalCbor {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         let off = decoder.position();
         let canon_ref = CanonicalCborRef::decode(decoder)?;
         let bytes = alloc_util::try_vec_from_slice(canon_ref.as_bytes(), off)?;

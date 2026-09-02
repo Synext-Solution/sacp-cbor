@@ -506,7 +506,7 @@ These wrappers live under `sacp_cbor::value` and `sacp_cbor::scalar`.
 
 ## Canonical encoding API (`alloc`)
 
-`Encoder<S>` writes one canonical root value directly into any `ByteSink`.
+`Encoder<S, O = NoopWorkObserver>` writes one canonical root value directly into any `ByteSink`.
 There is one state machine for vector, counting, digest, I/O, serde, derive,
 and custom-sink encoding. Native encoding and strict serde stream payloads
 without staging them in a temporary `Vec`; the explicitly selected serde
@@ -519,6 +519,8 @@ Create:
 - `Encoder::new()`
 - `Encoder::with_sink(sink)`
 - `Encoder::with_sink_and_limits(sink, EncodeLimits)`
+- `Encoder::with_sink_and_observer(sink, observer)`
+- `Encoder::with_sink_limits_and_observer(sink, EncodeLimits, observer)`
 - `Encoder::try_with_capacity(usize) -> Result<Encoder, CborError>`
 - `Encoder::with_limits(EncodeLimits) -> Result<Encoder, CborError>`
 - `Encoder::try_with_capacity_and_limits(usize, EncodeLimits) -> Result<Encoder, CborError>`
@@ -587,7 +589,7 @@ Signature:
 ```rust
 fn entry<F>(&mut self, key: &str, f: F) -> EncodeResult<(), S>
 where
-    F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>;
+    F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>;
 ```
 
 Properties:
@@ -644,7 +646,8 @@ The path must name a module that exposes the derive runtime API:
 pub mod cbor {
     pub use sacp_cbor::{
         ByteSink, CanonicalCbor, CborDecode, CborEncode, CborError, DecodeLimits, Decoder,
-        EncodeResult, Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
+        EncodeResult, Encoder, ErrorCode, NoopWorkObserver, ValueEncoder, WorkObserver,
+        encode_with_to_canonical,
     };
 
     pub mod query {
@@ -856,6 +859,12 @@ View accessor mapping is chosen for borrowing:
 - Nested ABI types return their generated nested views.
 - `Option<T>` is represented by field presence and returns `Option<T::View>`.
 
+Observed borrowed traversal uses one caller-owned `WorkSession`: generated
+`from_canonical_with_session` / `*_with_session` methods preserve it through record scans, and
+`AbiArrayView::cursor()` advances with `AbiArrayViewCursor::next_with_session(&mut session)`. The
+cursor does not retain the mutable session borrow, so an outer array of records can traverse each
+record's nested sequence with the same cadence before advancing the outer cursor.
+
 Named enum payload views are validated and cached during enum view construction, so repeated
 `as_route()` calls do not rescan the payload field-set. Transparent newtypes encode exactly like
 their inner type while keeping a named ABI identity. Borrowed view construction validates the wire
@@ -944,6 +953,7 @@ pub mod wire {
     pub mod cbor {
         pub use sacp_cbor::{
             ByteSink, CanonicalCbor, CborDecode, CborError, Decoder, ErrorCode, ValueEncoder,
+            WorkObserver,
         };
     }
 }
@@ -1228,6 +1238,12 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
     (queries, editing, trusted decode) ignores them, so re-validate edited output under the
     same options if you need the restriction to hold across a round trip.
 
+- `validate_canonical_observed(bytes, limits, observer)` and
+  `validate_canonical_with_observer(bytes, limits, options, observer)`
+
+  - Use one statically dispatched `WorkObserver` for cooperative interruption of the canonical
+    walk; cancellation returns `ErrorCode::WorkCancelled`.
+
 - `DecodeLimits::for_bytes(max_message_bytes) -> DecodeLimits`
 
   - Convenience baseline limits.
@@ -1240,18 +1256,26 @@ This section is intentionally exhaustive for day-to-day use. For full signatures
 
 - `decode(bytes, limits) -> Result<T, CborError>`
 - `decode_canonical(canon_ref, limits) -> Result<T, CborError>`
+- `decode_with_observer(bytes, limits, observer) -> Result<T, CborError>`
+- `decode_canonical_with_observer(canon_ref, limits, observer) -> Result<T, CborError>`
 - `Decoder::decode_text_with_guard` / `decode_bytes_with_guard` expose a core-limited declared
   payload length before reading the payload
 - `ArrayDecoder::admit_with` exposes a core-limited element count before caller allocation
 - `Decoder::decode_canonical_with_guard` exposes a validated encoded length before caller ownership
 - `sacp_cbor_abi::decode(bytes, limits, context) -> Result<T, C::Error>`
 - `sacp_cbor_abi::decode_canonical(canon_ref, context) -> Result<T, C::Error>`
+- `sacp_cbor_abi::decode_with_observer(bytes, limits, context, observer) -> Result<T, C::Error>`
+- `sacp_cbor_abi::decode_canonical_with_observer(canon_ref, context, observer) -> Result<T, C::Error>`
 - `sacp_cbor_abi::encode_to_sink(&value, sink, limits) -> Result<S::Output, AbiEncodeError<...>>`
 - `sacp_cbor_abi::encode_to_vec(&value, limits) -> Result<Vec<u8>, AbiEncodeError<...>>`
+- `sacp_cbor_abi::encode_to_sink_with_observer(&value, sink, limits, observer)`
+- `sacp_cbor_abi::encode_to_vec_with_observer(&value, limits, observer)`
 - `sacp_cbor_abi::AbiDecodeContext::admit(location, value)` observes owned semantic lengths after core structural
   admission and before the first corresponding reservation or copy
 - `encode_to_vec(&value) -> Result<Vec<u8>, CborError>` (`alloc`)
 - `encode_to_canonical(&value) -> Result<CanonicalCbor, CborError>` (`alloc`)
+- `encode_to_vec_with_observer(&value, observer) -> Result<Vec<u8>, CborError>` (`alloc`)
+- `encode_to_canonical_with_observer(&value, observer) -> Result<CanonicalCbor, CborError>` (`alloc`)
 - `CborEncode::encode` receives a `ValueEncoder`, not the underlying encoder;
   `Encoder::encode` owns slot accounting and makes every trait failure sticky.
 
@@ -1304,11 +1328,13 @@ Common trait coverage for derive-driven models includes:
 
 ### Encoding (`alloc`)
 
-- `Encoder<S: ByteSink>`
+- `Encoder<S: ByteSink, O: WorkObserver = NoopWorkObserver>`
 
   - sink-generic streaming canonical CBOR output
   - maps require canonical key order; enforced
   - first failure is returned precisely; later fallible encode/finish calls return `Poisoned`
+  - observed encoding uses static dispatch; cancellation keeps confirmed sink output and poisons
+    the encoder
 
 - `encode::ArrayEncoder`, `encode::MapEncoder`
 

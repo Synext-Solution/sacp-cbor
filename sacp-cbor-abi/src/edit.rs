@@ -1,7 +1,9 @@
 use alloc::vec::Vec;
 
 use sacp_cbor::query::CborValueRef;
-use sacp_cbor::{ByteSink, CanonicalCbor, CborError, EncodeResult, ErrorCode, ValueEncoder};
+use sacp_cbor::{
+    ByteSink, CanonicalCbor, CborError, EncodeResult, ErrorCode, ValueEncoder, WorkObserver,
+};
 
 use crate::AbiFieldSetRef;
 
@@ -116,9 +118,9 @@ impl<'a> AbiFieldSetEditor<'a> {
             pair_count: usize,
         }
         impl Edited<'_, '_> {
-            fn encode_mut<S: ByteSink>(
+            fn encode_mut<S: ByteSink, O: WorkObserver>(
                 &mut self,
-                enc: &mut ValueEncoder<'_, S>,
+                enc: &mut ValueEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 enc.array(self.pair_count * 2, |array| {
                     self.editor.emit_edited_fields(array)
@@ -190,9 +192,9 @@ impl<'a> AbiFieldSetEditor<'a> {
         }
     }
 
-    fn emit_edited_fields<S: ByteSink>(
+    fn emit_edited_fields<S: ByteSink, O: WorkObserver>(
         &mut self,
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
     ) -> EncodeResult<(), S> {
         let mut op_index = 0usize;
         for entry in self.fields.iter()? {
@@ -216,8 +218,8 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_existing_op<S: ByteSink>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    fn emit_existing_op<S: ByteSink, O: WorkObserver>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         op: &AbiFieldSetOp<'a>,
     ) -> EncodeResult<(), S> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
@@ -227,8 +229,8 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_missing_op<S: ByteSink>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    fn emit_missing_op<S: ByteSink, O: WorkObserver>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         op: &AbiFieldSetOp<'a>,
     ) -> EncodeResult<(), S> {
         if let AbiFieldSetOp::Set { id, value, .. } = op {
@@ -238,8 +240,8 @@ impl<'a> AbiFieldSetEditor<'a> {
         Ok(())
     }
 
-    fn emit_patch_value<S: ByteSink>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    fn emit_patch_value<S: ByteSink, O: WorkObserver>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         value: &AbiPatchValue<'a>,
     ) -> EncodeResult<(), S> {
         match value {

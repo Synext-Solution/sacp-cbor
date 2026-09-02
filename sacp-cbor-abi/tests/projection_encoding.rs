@@ -2,15 +2,79 @@ use core::cell::Cell;
 use core::convert::Infallible;
 
 use sacp_cbor::encode::{CountingSink, Encoder};
-use sacp_cbor::{DigestSink, EncodeError, EncodeLimits, ErrorCode, FanoutSink, VecSink};
+use sacp_cbor::{
+    DigestSink, EncodeError, EncodeLimits, ErrorCode, FanoutSink, VecSink, WorkCancelled,
+    WorkObserver, WORK_CHECKPOINT_INTERVAL,
+};
 use sacp_cbor_abi::{
-    encode_to_sink, encode_to_vec, exact_indexed_sequence, projected_sequence, wire, AbiEncode,
-    AbiEncodeError, AbiType, CborAbi, ExactIndexProjection, ExactIndexedSequence,
-    ProjectedSequence, SequenceContractError, SequenceEmitter, SequenceProjection,
+    encode_to_sink, encode_to_sink_with_observer, encode_to_vec, exact_indexed_sequence,
+    indexed_sequence, projected_sequence, wire, AbiEncode, AbiEncodeError, AbiType, CborAbi,
+    ExactIndexProjection, ExactIndexedSequence, ProjectedSequence, SequenceContractError,
+    SequenceEmitter, SequenceProjection,
 };
 
 fn limits() -> EncodeLimits {
     EncodeLimits::unbounded()
+}
+
+struct CancellationTrace {
+    calls: Cell<usize>,
+    first_completed: Cell<usize>,
+    second_completed: Cell<usize>,
+    progress_at_cancel: Cell<usize>,
+    cancelled: Cell<bool>,
+}
+
+impl CancellationTrace {
+    const fn new() -> Self {
+        Self {
+            calls: Cell::new(0),
+            first_completed: Cell::new(usize::MAX),
+            second_completed: Cell::new(usize::MAX),
+            progress_at_cancel: Cell::new(usize::MAX),
+            cancelled: Cell::new(false),
+        }
+    }
+
+    fn assert_cancelled_after_completed_interval(&self) {
+        assert_eq!(self.calls.get(), 2);
+        assert_eq!(self.first_completed.get(), 0);
+        assert_eq!(self.second_completed.get(), WORK_CHECKPOINT_INTERVAL);
+        assert!(self.cancelled.get());
+    }
+}
+
+struct CancelOnSecondCheckpoint<'a> {
+    trace: &'a CancellationTrace,
+    progress: &'a Cell<usize>,
+}
+
+impl WorkObserver for CancelOnSecondCheckpoint<'_> {
+    fn checkpoint(&mut self, completed_units: usize) -> Result<(), WorkCancelled> {
+        let call = self.trace.calls.get() + 1;
+        self.trace.calls.set(call);
+        match call {
+            1 => self.trace.first_completed.set(completed_units),
+            2 => {
+                self.trace.second_completed.set(completed_units);
+                self.trace.progress_at_cancel.set(self.progress.get());
+                self.trace.cancelled.set(true);
+                return Err(WorkCancelled);
+            }
+            _ => panic!("observer called after cancellation"),
+        }
+        Ok(())
+    }
+}
+
+fn is_work_cancelled<SinkError, ProjectionError>(
+    error: &AbiEncodeError<SinkError, ProjectionError>,
+) -> bool {
+    matches!(
+        error,
+        AbiEncodeError::Encode(EncodeError::Cbor(error))
+            if error.code == ErrorCode::WorkCancelled
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CborAbi)]
@@ -126,9 +190,9 @@ impl SequenceProjection<wire::U64> for EmittingSource<'_> {
         Ok(self.declared)
     }
 
-    fn project<S: sacp_cbor::ByteSink>(
+    fn project<S: sacp_cbor::ByteSink, O: WorkObserver>(
         &self,
-        emitter: &mut SequenceEmitter<'_, '_, S, wire::U64, Self::Error>,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, wire::U64, Self::Error>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         for value in self.values {
             let result = emitter.emit(value);
@@ -415,9 +479,9 @@ impl SequenceProjection<wire::U64> for MutatingSource<'_> {
         Ok(self.declared.get())
     }
 
-    fn project<S: sacp_cbor::ByteSink>(
+    fn project<S: sacp_cbor::ByteSink, O: WorkObserver>(
         &self,
-        emitter: &mut SequenceEmitter<'_, '_, S, wire::U64, Self::Error>,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, wire::U64, Self::Error>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         self.declared.set(1);
         for value in self.values.iter().take(self.declared.get()) {
@@ -477,6 +541,145 @@ fn impossible_sequence_length_fails_before_projection() {
     );
 }
 
+#[test]
+fn indexed_sizing_cancels_only_after_projection_loop_progress() {
+    let len = WORK_CHECKPOINT_INTERVAL * 2;
+    let projected = Cell::new(0usize);
+    let trace = CancellationTrace::new();
+    let sequence = indexed_sequence(len, |index| {
+        assert!(
+            !trace.cancelled.get(),
+            "projector called after cancellation"
+        );
+        assert_eq!(index, projected.get(), "indices must remain engine-driven");
+        projected.set(index + 1);
+        Ok::<u64, ProjectionFailure>(0)
+    });
+
+    let error = encode_to_sink_with_observer(
+        &DirectSequence(sequence),
+        CountingSink::new(),
+        limits(),
+        CancelOnSecondCheckpoint {
+            trace: &trace,
+            progress: &projected,
+        },
+    )
+    .unwrap_err();
+
+    trace.assert_cancelled_after_completed_interval();
+    assert!(projected.get() > 0, "projection loop must have started");
+    assert!(projected.get() < len, "projection loop must stop early");
+    assert_eq!(projected.get(), trace.progress_at_cancel.get());
+    assert!(matches!(
+        error,
+        AbiEncodeError::Encode(EncodeError::Cbor(error))
+            if error.code == ErrorCode::WorkCancelled && error.offset > 0
+    ));
+}
+
+struct ObservedEmittingSource<'a> {
+    len: usize,
+    attempted: &'a Cell<usize>,
+    succeeded: &'a Cell<usize>,
+    swallow_cancellation: bool,
+}
+
+impl SequenceProjection<wire::U64> for ObservedEmittingSource<'_> {
+    type Error = ProjectionFailure;
+
+    fn declared_len(&self) -> Result<usize, Self::Error> {
+        Ok(self.len)
+    }
+
+    fn project<S: sacp_cbor::ByteSink, O: WorkObserver>(
+        &self,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, wire::U64, Self::Error>,
+    ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
+        let mut swallowed = false;
+        for _ in 0..self.len {
+            self.attempted.set(self.attempted.get() + 1);
+            match emitter.emit(&0u64) {
+                Ok(()) => self.succeeded.set(self.succeeded.get() + 1),
+                Err(error)
+                    if self.swallow_cancellation && !swallowed && is_work_cancelled(&error) =>
+                {
+                    swallowed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn source_emitter_cancels_only_after_emit_loop_progress() {
+    let len = WORK_CHECKPOINT_INTERVAL * 2;
+    let attempted = Cell::new(0usize);
+    let succeeded = Cell::new(0usize);
+    let trace = CancellationTrace::new();
+    let sequence = projected_sequence(ObservedEmittingSource {
+        len,
+        attempted: &attempted,
+        succeeded: &succeeded,
+        swallow_cancellation: false,
+    });
+
+    let error = encode_to_sink_with_observer(
+        &DirectSequence(sequence),
+        CountingSink::new(),
+        limits(),
+        CancelOnSecondCheckpoint {
+            trace: &trace,
+            progress: &attempted,
+        },
+    )
+    .unwrap_err();
+
+    trace.assert_cancelled_after_completed_interval();
+    assert!(succeeded.get() > 0, "emit loop must have completed items");
+    assert_eq!(attempted.get(), succeeded.get() + 1);
+    assert!(attempted.get() < len, "emit loop must stop early");
+    assert_eq!(attempted.get(), trace.progress_at_cancel.get());
+    assert!(matches!(
+        error,
+        AbiEncodeError::Encode(EncodeError::Cbor(error))
+            if error.code == ErrorCode::WorkCancelled && error.offset > 0
+    ));
+}
+
+#[test]
+fn source_cannot_swallow_work_cancellation() {
+    let len = WORK_CHECKPOINT_INTERVAL * 2;
+    let attempted = Cell::new(0usize);
+    let succeeded = Cell::new(0usize);
+    let trace = CancellationTrace::new();
+    let sequence = projected_sequence(ObservedEmittingSource {
+        len,
+        attempted: &attempted,
+        succeeded: &succeeded,
+        swallow_cancellation: true,
+    });
+
+    let error = encode_to_sink_with_observer(
+        &DirectSequence(sequence),
+        CountingSink::new(),
+        limits(),
+        CancelOnSecondCheckpoint {
+            trace: &trace,
+            progress: &attempted,
+        },
+    )
+    .unwrap_err();
+
+    trace.assert_cancelled_after_completed_interval();
+    assert!(succeeded.get() > 0);
+    assert_eq!(attempted.get(), trace.progress_at_cancel.get() + 1);
+    assert_eq!(succeeded.get() + 2, attempted.get());
+    assert_eq!(error, AbiEncodeError::Encode(EncodeError::Poisoned));
+}
+
 struct DirectSequence<T>(T);
 
 impl<T> AbiEncode for DirectSequence<T>
@@ -485,9 +688,9 @@ where
 {
     type Error = ProjectionFailure;
 
-    fn abi_encode<S: sacp_cbor::ByteSink>(
+    fn abi_encode<S: sacp_cbor::ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut sacp_cbor::ValueEncoder<'_, S>,
+        enc: &mut sacp_cbor::ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         sacp_cbor_abi::AbiEncodeAs::<wire::Sequence<wire::U64>, Self::Error>::abi_encode_as(
             &self.0, enc,

@@ -2,7 +2,7 @@
 
 use sacp_cbor::{
     validate_canonical, ByteSink, CborEncode, DecodeLimits, EncodeError, EncodeLimits,
-    EncodeResult, Encoder, ErrorCode, ValueEncoder,
+    EncodeResult, Encoder, ErrorCode, ValueEncoder, WorkObserver,
 };
 
 #[cfg(feature = "collections")]
@@ -56,7 +56,10 @@ impl From<EncodeError<sacp_cbor::CborError>> for ProjectionError {
 struct EncodeZero;
 
 impl CborEncode for EncodeZero {
-    fn encode<S: ByteSink>(&self, _enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        _enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         Ok(())
     }
 }
@@ -64,7 +67,10 @@ impl CborEncode for EncodeZero {
 struct EncodeTwo;
 
 impl CborEncode for EncodeTwo {
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         enc.null()?;
         enc.null()
     }
@@ -73,7 +79,10 @@ impl CborEncode for EncodeTwo {
 struct EncodeFailure;
 
 impl CborEncode for EncodeFailure {
-    fn encode<S: ByteSink>(&self, _enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        _enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         Err(sacp_cbor::CborError::new(ErrorCode::PatchConflict, 0).into())
     }
 }
@@ -81,7 +90,10 @@ impl CborEncode for EncodeFailure {
 struct SwallowsInnerError;
 
 impl CborEncode for SwallowsInnerError {
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         enc.null()?;
         let _ = enc.null();
         Ok(())
@@ -91,7 +103,10 @@ impl CborEncode for SwallowsInnerError {
 struct NestedArray(usize);
 
 impl CborEncode for NestedArray {
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         if self.0 == 0 {
             enc.null()
         } else {

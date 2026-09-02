@@ -45,9 +45,9 @@ fn encode_impl(
 ) -> proc_macro2::TokenStream {
     quote! {
         impl #impl_generics #crate_path::CborEncode for #name #ty_generics #where_clause {
-            fn encode<__S: #crate_path::ByteSink>(
+            fn encode<__S: #crate_path::ByteSink, __O: #crate_path::WorkObserver>(
                 &self,
-                enc: &mut #crate_path::ValueEncoder<'_, __S>,
+                enc: &mut #crate_path::ValueEncoder<'_, __S, __O>,
             ) -> #crate_path::EncodeResult<(), __S> {
                 #body
             }

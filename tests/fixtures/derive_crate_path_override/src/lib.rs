@@ -1,8 +1,9 @@
 pub mod codec {
     pub mod cbor {
         pub use private_cbor::{
-            ByteSink, CborDecode, CborEncode, CborError, DecodeLimits, Decoder, EncodeResult,
-            Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
+            encode_with_to_canonical, ByteSink, CborDecode, CborEncode, CborError, DecodeLimits,
+            Decoder, EncodeResult, Encoder, ErrorCode, NoopWorkObserver, ValueEncoder,
+            WorkObserver,
         };
 
         pub mod query {
@@ -85,7 +86,10 @@ mod tests {
     #[test]
     fn crate_path_override_roundtrips_external_enums() {
         assert_eq!(roundtrip(External::Newtype(7u64)), External::Newtype(7));
-        assert_eq!(roundtrip(External::<u64>::Pair(3, true)), External::Pair(3, true));
+        assert_eq!(
+            roundtrip(External::<u64>::Pair(3, true)),
+            External::Pair(3, true)
+        );
         assert_eq!(
             roundtrip(External::Named { value: 11u64 }),
             External::Named { value: 11 }

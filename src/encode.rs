@@ -19,6 +19,7 @@ use crate::profile::{
 use crate::query::CborValueRef;
 use crate::scalar::F64Bits;
 use crate::wire::{self, Cursor};
+use crate::work::{NoopWorkObserver, WorkMeter, WorkObserver};
 use crate::{CborError, ErrorCode};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -437,8 +438,9 @@ enum SlotState {
 }
 
 /// Streaming canonical encoder over an arbitrary byte sink.
-pub struct Encoder<S: ByteSink = VecSink> {
+pub struct Encoder<S: ByteSink = VecSink, O: WorkObserver = NoopWorkObserver> {
     sink: S,
+    meter: WorkMeter<O>,
     written: usize,
     root_remaining: u8,
     stack: EncoderFrameStack,
@@ -447,17 +449,17 @@ pub struct Encoder<S: ByteSink = VecSink> {
     poisoned: bool,
 }
 
-impl Encoder<VecSink> {
+impl Encoder<VecSink, NoopWorkObserver> {
     /// Create a vector-backed encoder.
     #[must_use]
     pub const fn new() -> Self {
-        Self::from_parts(VecSink::new(), EncodeLimits::unbounded())
+        Self::from_parts(VecSink::new(), EncodeLimits::unbounded(), NoopWorkObserver)
     }
 
     /// Create a vector-backed encoder with limits.
     pub fn with_limits(limits: EncodeLimits) -> Result<Self, CborError> {
         limits.validate()?;
-        Ok(Self::from_parts(VecSink::new(), limits))
+        Ok(Self::from_parts(VecSink::new(), limits, NoopWorkObserver))
     }
 
     /// Create a vector-backed encoder with fallibly reserved capacity.
@@ -465,6 +467,7 @@ impl Encoder<VecSink> {
         Ok(Self::from_parts(
             VecSink::try_with_capacity(capacity)?,
             EncodeLimits::unbounded(),
+            NoopWorkObserver,
         ))
     }
 
@@ -480,9 +483,12 @@ impl Encoder<VecSink> {
         Ok(Self::from_parts(
             VecSink::try_with_capacity(capacity)?,
             limits,
+            NoopWorkObserver,
         ))
     }
+}
 
+impl<O: WorkObserver> Encoder<VecSink, O> {
     /// Borrow bytes emitted so far.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -490,16 +496,31 @@ impl Encoder<VecSink> {
     }
 }
 
-impl Default for Encoder<VecSink> {
+impl Default for Encoder<VecSink, NoopWorkObserver> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S: ByteSink> Encoder<S> {
-    const fn from_parts(sink: S, limits: EncodeLimits) -> Self {
+impl<S: ByteSink> Encoder<S, NoopWorkObserver> {
+    /// Create an encoder over `sink` with unbounded encoding limits.
+    #[must_use]
+    pub const fn with_sink(sink: S) -> Self {
+        Self::from_parts(sink, EncodeLimits::unbounded(), NoopWorkObserver)
+    }
+
+    /// Create an encoder over `sink` with explicit limits.
+    pub fn with_sink_and_limits(sink: S, limits: EncodeLimits) -> Result<Self, CborError> {
+        limits.validate()?;
+        Ok(Self::from_parts(sink, limits, NoopWorkObserver))
+    }
+}
+
+impl<S: ByteSink, O: WorkObserver> Encoder<S, O> {
+    const fn from_parts(sink: S, limits: EncodeLimits, observer: O) -> Self {
         Self {
             sink,
+            meter: WorkMeter::new(observer),
             written: 0,
             root_remaining: 1,
             stack: EncoderFrameStack::new(),
@@ -509,16 +530,29 @@ impl<S: ByteSink> Encoder<S> {
         }
     }
 
-    /// Create an encoder over `sink` with unbounded encoding limits.
-    #[must_use]
-    pub const fn with_sink(sink: S) -> Self {
-        Self::from_parts(sink, EncodeLimits::unbounded())
+    /// Create an observed encoder over `sink` with unbounded encoding limits.
+    pub fn with_sink_and_observer(sink: S, observer: O) -> Result<Self, CborError> {
+        let mut encoder = Self::from_parts(sink, EncodeLimits::unbounded(), observer);
+        encoder
+            .meter
+            .start()
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, 0))?;
+        Ok(encoder)
     }
 
-    /// Create an encoder over `sink` with explicit limits.
-    pub fn with_sink_and_limits(sink: S, limits: EncodeLimits) -> Result<Self, CborError> {
+    /// Create an observed encoder over `sink` with explicit limits.
+    pub fn with_sink_limits_and_observer(
+        sink: S,
+        limits: EncodeLimits,
+        observer: O,
+    ) -> Result<Self, CborError> {
         limits.validate()?;
-        Ok(Self::from_parts(sink, limits))
+        let mut encoder = Self::from_parts(sink, limits, observer);
+        encoder
+            .meter
+            .start()
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, 0))?;
+        Ok(encoder)
     }
 
     /// Return the number of bytes in chunks whose writes completed successfully.
@@ -540,14 +574,27 @@ impl<S: ByteSink> Encoder<S> {
     }
 
     /// Complete exactly one root item and return the sink product.
-    pub fn finish(self) -> EncodeResult<S::Output, S> {
+    pub fn finish(mut self) -> EncodeResult<S::Output, S> {
         if self.poisoned {
             return Err(EncodeError::Poisoned);
         }
         if self.root_remaining != 0 || !self.stack.is_empty() {
             return Err(format_error(ErrorCode::UnexpectedEof, self.written));
         }
+        if self.meter.finish().is_err() {
+            self.poisoned = true;
+            return Err(format_error(ErrorCode::WorkCancelled, self.written));
+        }
         self.sink.finish().map_err(EncodeError::Sink)
+    }
+
+    /// Report one completed cooperative structural or projection work unit.
+    ///
+    /// This is an observation boundary, not a resumable checkpoint. Observer cancellation is
+    /// terminal, poisons this encoder, and preserves any sink output already confirmed by prior
+    /// writes.
+    pub fn checkpoint(&mut self) -> EncodeResult<(), S> {
+        self.attempt(|encoder| encoder.complete_work(1))
     }
 
     pub(crate) const fn ensure_healthy(&self) -> EncodeResult<(), S> {
@@ -584,6 +631,13 @@ impl<S: ByteSink> Encoder<S> {
         self.poisoned = true;
     }
 
+    #[inline]
+    fn complete_work(&mut self, completed_units: usize) -> EncodeResult<(), S> {
+        self.meter
+            .complete(completed_units)
+            .map_err(|_| format_error(ErrorCode::WorkCancelled, self.written))
+    }
+
     pub(crate) fn guarded_value<E, F>(&mut self, operation: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
@@ -608,11 +662,30 @@ impl<S: ByteSink> Encoder<S> {
         self.ensure_healthy()?;
         self.check_output_chunks(chunks)?;
         for chunk in chunks {
-            if let Err(error) = self.sink.write(chunk) {
-                self.poisoned = true;
-                return Err(EncodeError::Sink(error));
+            if !O::ENABLED {
+                if let Err(error) = self.sink.write(chunk) {
+                    self.poisoned = true;
+                    return Err(EncodeError::Sink(error));
+                }
+                self.written += chunk.len();
+                continue;
             }
-            self.written += chunk.len();
+
+            let mut remaining = *chunk;
+            while !remaining.is_empty() {
+                let chunk_len = self.meter.next_chunk(remaining.len());
+                let (next, rest) = remaining.split_at(chunk_len);
+                if let Err(error) = self.sink.write(next) {
+                    self.poisoned = true;
+                    return Err(EncodeError::Sink(error));
+                }
+                self.written += next.len();
+                if let Err(error) = self.complete_work(next.len()) {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                remaining = rest;
+            }
         }
         Ok(())
     }
@@ -671,7 +744,7 @@ impl<S: ByteSink> Encoder<S> {
                 self.root_remaining = 0;
             }
         }
-        Ok(())
+        self.complete_work(1)
     }
 
     fn check_value_slot(&self) -> EncodeResult<(), S> {
@@ -937,15 +1010,16 @@ impl<S: ByteSink> Encoder<S> {
         self.write_scalar(&[&header[..header_len], text.as_bytes()])
     }
 
-    fn account_canonical_value(&self, bytes: &[u8]) -> EncodeResult<usize, S> {
+    fn account_canonical_value(&mut self, bytes: &[u8]) -> EncodeResult<usize, S> {
         let limits = self.limits.to_decode_limits(bytes.len());
         let mut cursor = Cursor::with_pos(bytes, 0);
         let mut items = self.items_seen;
-        wire::skip_one_value::<false>(
+        wire::skip_one_value_observed::<false, O>(
             &mut cursor,
             wire::WalkPolicy::new(Some(&limits), crate::ValidationOptions::new()),
             &mut items,
             self.stack.len(),
+            &mut self.meter,
         )
         .map_err(EncodeError::Cbor)?;
         if cursor.position() != bytes.len() {
@@ -985,7 +1059,7 @@ impl<S: ByteSink> Encoder<S> {
             unreachable!();
         };
         *pending_value = true;
-        Ok(())
+        self.complete_work(1)
     }
 
     #[cfg(feature = "edit")]
@@ -1109,7 +1183,7 @@ impl<S: ByteSink> Encoder<S> {
     /// and every returned failure is made sticky by this method.
     pub fn encode_with<F>(&mut self, encode: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ValueEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut ValueEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.encode_with_caller_error(encode)
     }
@@ -1122,7 +1196,7 @@ impl<S: ByteSink> Encoder<S> {
     pub fn encode_with_caller_error<E, F>(&mut self, encode: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ValueEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.guarded_value(|encoder| {
             let mut value_encoder = ValueEncoder { encoder };
@@ -1138,7 +1212,7 @@ impl<S: ByteSink> Encoder<S> {
     /// Encode a definite-length array.
     pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.array_with_caller_error(len, build)
     }
@@ -1151,7 +1225,7 @@ impl<S: ByteSink> Encoder<S> {
     pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.attempt_with_caller_error(|encoder| encoder.array_inner(len, build))
     }
@@ -1159,7 +1233,7 @@ impl<S: ByteSink> Encoder<S> {
     fn array_inner<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> Result<(), E>,
     {
         let (items, header, header_len) = self.preflight_array(len).map_err(E::from)?;
         self.prepare_frame().map_err(E::from)?;
@@ -1184,14 +1258,14 @@ impl<S: ByteSink> Encoder<S> {
     /// Encode a definite-length text-keyed map.
     pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut MapEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.attempt(|encoder| encoder.map_inner(len, build))
     }
 
     fn map_inner<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut MapEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         let (items, header, header_len) = self.preflight_map(len)?;
         self.prepare_frame()?;
@@ -1267,11 +1341,18 @@ impl<S: ByteSink> Encoder<S> {
 ///
 /// Values cannot construct this adapter or access the underlying encoder, so
 /// every trait failure is observed by [`Encoder::encode`] and becomes sticky.
-pub struct ValueEncoder<'a, S: ByteSink> {
-    encoder: &'a mut Encoder<S>,
+pub struct ValueEncoder<'a, S: ByteSink, O: WorkObserver = NoopWorkObserver> {
+    encoder: &'a mut Encoder<S, O>,
 }
 
-impl<S: ByteSink> ValueEncoder<'_, S> {
+impl<S: ByteSink, O: WorkObserver> ValueEncoder<'_, S, O> {
+    /// Report one completed cooperative projection work unit.
+    ///
+    /// This reports progress to the encoder's observer; it is not a resumable checkpoint.
+    pub fn checkpoint(&mut self) -> EncodeResult<(), S> {
+        self.encoder.checkpoint()
+    }
+
     /// Encode null.
     pub fn null(&mut self) -> EncodeResult<(), S> {
         self.encoder.null()
@@ -1338,7 +1419,7 @@ impl<S: ByteSink> ValueEncoder<'_, S> {
     pub fn encode_with_caller_error<E, F>(&mut self, encode: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ValueEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.encoder.encode_with_caller_error(encode)
     }
@@ -1346,7 +1427,7 @@ impl<S: ByteSink> ValueEncoder<'_, S> {
     /// Encode an array.
     pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.encoder.array(len, build)
     }
@@ -1358,7 +1439,7 @@ impl<S: ByteSink> ValueEncoder<'_, S> {
     pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.encoder.array_with_caller_error(len, build)
     }
@@ -1366,19 +1447,26 @@ impl<S: ByteSink> ValueEncoder<'_, S> {
     /// Encode a map.
     pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut MapEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.encoder.map(len, build)
     }
 }
 
 /// Builder for array elements.
-pub struct ArrayEncoder<'a, S: ByteSink = VecSink> {
-    enc: &'a mut Encoder<S>,
+pub struct ArrayEncoder<'a, S: ByteSink = VecSink, O: WorkObserver = NoopWorkObserver> {
+    enc: &'a mut Encoder<S, O>,
     frame_index: usize,
 }
 
-impl<S: ByteSink> ArrayEncoder<'_, S> {
+impl<S: ByteSink, O: WorkObserver> ArrayEncoder<'_, S, O> {
+    /// Report one completed cooperative projection work unit.
+    ///
+    /// This reports progress to the encoder's observer; it is not a resumable checkpoint.
+    pub fn checkpoint(&mut self) -> EncodeResult<(), S> {
+        self.enc.checkpoint()
+    }
+
     fn remaining(&self) -> EncodeResult<usize, S> {
         match self.enc.stack.get(self.frame_index) {
             Some(Frame::Array { remaining }) => Ok(*remaining),
@@ -1391,7 +1479,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
 
     fn delegate<F>(&mut self, emit: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>,
     {
         emit(self.enc)
     }
@@ -1444,7 +1532,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     /// Emit exactly one item through a callback.
     pub fn value_with<F>(&mut self, emit: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>,
     {
         self.value_with_caller_error(emit)
     }
@@ -1456,7 +1544,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     pub fn value_with_caller_error<E, F>(&mut self, emit: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut Encoder<S>) -> Result<(), E>,
+        F: FnOnce(&mut Encoder<S, O>) -> Result<(), E>,
     {
         self.enc.ensure_healthy().map_err(E::from)?;
         let before = match self.remaining() {
@@ -1503,7 +1591,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     /// Encode the next item through a controlled adapter.
     pub fn encode_with<F>(&mut self, emit: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ValueEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut ValueEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.enc.encode_with(emit)
     }
@@ -1514,7 +1602,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     pub fn encode_with_caller_error<E, F>(&mut self, emit: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ValueEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ValueEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.enc.encode_with_caller_error(emit)
     }
@@ -1522,7 +1610,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     /// Encode a nested array.
     pub fn array<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.delegate(|encoder| encoder.array(len, build))
     }
@@ -1534,7 +1622,7 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     pub fn array_with_caller_error<E, F>(&mut self, len: usize, build: F) -> Result<(), E>
     where
         E: From<EncodeError<S::Error>>,
-        F: FnOnce(&mut ArrayEncoder<'_, S>) -> Result<(), E>,
+        F: FnOnce(&mut ArrayEncoder<'_, S, O>) -> Result<(), E>,
     {
         self.enc.array_with_caller_error(len, build)
     }
@@ -1542,21 +1630,28 @@ impl<S: ByteSink> ArrayEncoder<'_, S> {
     /// Encode a nested map.
     pub fn map<F>(&mut self, len: usize, build: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut MapEncoder<'_, S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut MapEncoder<'_, S, O>) -> EncodeResult<(), S>,
     {
         self.delegate(|encoder| encoder.map(len, build))
     }
 }
 
 /// Builder for canonical text-keyed map entries.
-pub struct MapEncoder<'a, S: ByteSink = VecSink> {
-    enc: &'a mut Encoder<S>,
+pub struct MapEncoder<'a, S: ByteSink = VecSink, O: WorkObserver = NoopWorkObserver> {
+    enc: &'a mut Encoder<S, O>,
     frame_index: usize,
     previous_key: String,
     has_previous_key: bool,
 }
 
-impl<S: ByteSink> MapEncoder<'_, S> {
+impl<S: ByteSink, O: WorkObserver> MapEncoder<'_, S, O> {
+    /// Report one completed cooperative projection work unit.
+    ///
+    /// This reports progress to the encoder's observer; it is not a resumable checkpoint.
+    pub fn checkpoint(&mut self) -> EncodeResult<(), S> {
+        self.enc.checkpoint()
+    }
+
     #[cfg(feature = "collections")]
     pub(crate) const fn offset(&self) -> usize {
         self.enc.written
@@ -1578,7 +1673,7 @@ impl<S: ByteSink> MapEncoder<'_, S> {
 
     fn write_entry<F>(&mut self, key: &str, value: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>,
     {
         let (before, pending) = self.remaining()?;
         if before == 0 || pending {
@@ -1625,7 +1720,7 @@ impl<S: ByteSink> MapEncoder<'_, S> {
     /// Insert one entry. Keys must already arrive in canonical order.
     pub fn entry<F>(&mut self, key: &str, value: F) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>,
     {
         self.enc.ensure_healthy()?;
         let result = self.write_entry(key, value);
@@ -1643,7 +1738,7 @@ impl<S: ByteSink> MapEncoder<'_, S> {
         value: F,
     ) -> EncodeResult<(), S>
     where
-        F: FnOnce(&mut Encoder<S>) -> EncodeResult<(), S>,
+        F: FnOnce(&mut Encoder<S, O>) -> EncodeResult<(), S>,
     {
         self.enc.ensure_healthy()?;
         let result = self
@@ -1658,10 +1753,10 @@ impl<S: ByteSink> MapEncoder<'_, S> {
 }
 
 #[cfg(feature = "edit")]
-impl MapEncoder<'_, VecSink> {
+impl<O: WorkObserver> MapEncoder<'_, VecSink, O> {
     pub(crate) fn entry_cbor<F>(&mut self, key: &str, value: F) -> Result<(), CborError>
     where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+        F: FnOnce(&mut Encoder<VecSink, O>) -> Result<(), CborError>,
     {
         self.entry(key, |encoder| value(encoder).map_err(EncodeError::Cbor))
             .map_err(collapse_vec_error)
@@ -1673,7 +1768,7 @@ impl MapEncoder<'_, VecSink> {
         value: F,
     ) -> Result<(), CborError>
     where
-        F: FnOnce(&mut Encoder) -> Result<(), CborError>,
+        F: FnOnce(&mut Encoder<VecSink, O>) -> Result<(), CborError>,
     {
         self.entry_raw_key(key, |encoder| value(encoder).map_err(EncodeError::Cbor))
             .map_err(collapse_vec_error)

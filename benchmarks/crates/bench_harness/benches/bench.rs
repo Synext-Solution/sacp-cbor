@@ -301,12 +301,13 @@ impl sacp_cbor_abi::SequenceProjection<sacp_cbor_abi::wire::U64> for AbiEmitting
         Ok(self.0.len())
     }
 
-    fn project<S: sacp_cbor::ByteSink>(
+    fn project<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver>(
         &self,
         emitter: &mut sacp_cbor_abi::SequenceEmitter<
             '_,
             '_,
             S,
+            O,
             sacp_cbor_abi::wire::U64,
             Self::Error,
         >,

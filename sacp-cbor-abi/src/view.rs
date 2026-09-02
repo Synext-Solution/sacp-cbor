@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 
 use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::query::{ArrayIter, CborValueRef};
-use sacp_cbor::{CanonicalCbor, CanonicalCborRef, CborError, ErrorCode};
+use sacp_cbor::{CanonicalCbor, CanonicalCborRef, CborError, ErrorCode, WorkObserver, WorkSession};
 
 use crate::edit::AbiFieldSetEditor;
 
@@ -16,6 +16,28 @@ pub trait AbiView<'a>: Sized {
 
     /// Construct a view from a canonical sub-value.
     fn view_from_value(value: CborValueRef<'a>) -> Result<Self, CborError>;
+
+    /// Construct a view from a canonical witness while sharing a caller-owned work session.
+    ///
+    /// The default preserves custom view implementations that have no engine-owned loop. Derived
+    /// field-set views override this method so their validation scan contributes to `session`.
+    fn view_from_canonical_with_session<O: WorkObserver>(
+        cbor: CanonicalCborRef<'a>,
+        session: &mut WorkSession<O>,
+    ) -> Result<Self, CborError> {
+        Self::view_from_value_with_session(cbor.root(), session)
+    }
+
+    /// Construct a view from a canonical sub-value while sharing a caller-owned work session.
+    ///
+    /// The default preserves custom view implementations that have no engine-owned loop. Derived
+    /// field-set views override this method so their validation scan contributes to `session`.
+    fn view_from_value_with_session<O: WorkObserver>(
+        value: CborValueRef<'a>,
+        _session: &mut WorkSession<O>,
+    ) -> Result<Self, CborError> {
+        Self::view_from_value(value)
+    }
 
     /// Return the raw CBOR value backing this view.
     #[must_use]
@@ -29,6 +51,17 @@ pub trait AbiViewField<'a> {
 
     /// Decode or wrap one raw field value as `Self::View`.
     fn view_field(value: CborValueRef<'a>) -> Result<Self::View, CborError>;
+
+    /// Decode or wrap one field value while sharing a caller-owned work session.
+    ///
+    /// Implementations with no engine-owned loop inherit the ordinary field conversion. Derived
+    /// record views override this method and account for their field-set scan in `session`.
+    fn view_field_with_session<O: WorkObserver>(
+        value: CborValueRef<'a>,
+        _session: &mut WorkSession<O>,
+    ) -> Result<Self::View, CborError> {
+        Self::view_field(value)
+    }
 }
 
 /// One borrowed field entry in an ABI field-set array.
@@ -102,12 +135,74 @@ pub struct AbiArrayView<'a, T> {
     _marker: PhantomData<fn() -> T>,
 }
 
+/// Explicit cursor over a borrowed ABI array view.
+///
+/// The cursor never stores a [`WorkSession`]. Observed callers drive each step with
+/// [`next_with_session`](Self::next_with_session), whose short borrow lets one caller-owned session
+/// move from an outer array element into that element's nested record fields and arrays without
+/// resetting the cadence. Ordinary unobserved callers use [`AbiArrayView::iter`] instead.
+pub struct AbiArrayViewCursor<'a, T> {
+    items: ArrayIter<'a>,
+    stopped: bool,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T> AbiArrayViewCursor<'a, T>
+where
+    T: AbiViewField<'a>,
+{
+    /// Advance one item while briefly borrowing a caller-owned work session.
+    ///
+    /// Child-boundary traversal and nested record conversion use the same session. Each
+    /// successfully converted item then completes one additional work unit. Cancellation is
+    /// terminal for this cursor: traversal cancellation keeps its confirmed offset, while a
+    /// rejected post-conversion unit reports the element end.
+    pub fn next_with_session<O: WorkObserver>(
+        &mut self,
+        session: &mut WorkSession<O>,
+    ) -> Option<Result<T::View, CborError>> {
+        if self.stopped {
+            return None;
+        }
+
+        let raw = match self.items.next_with_session(session)? {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.stopped = true;
+                return Some(Err(error));
+            }
+        };
+        let view = match T::view_field_with_session(raw, session) {
+            Ok(view) => view,
+            Err(error) => {
+                if error.code == ErrorCode::WorkCancelled {
+                    self.stopped = true;
+                }
+                return Some(Err(error));
+            }
+        };
+        if session.complete(1).is_err() {
+            self.stopped = true;
+            return Some(Err(work_cancelled_at_end(raw)));
+        }
+        Some(Ok(view))
+    }
+}
+
 fn invalid_abi_value(offset: usize) -> CborError {
     CborError::new(ErrorCode::InvalidAbiValue, offset)
 }
 
 fn invalid_query(offset: usize) -> CborError {
     CborError::new(ErrorCode::InvalidQuery, offset)
+}
+
+#[inline]
+fn work_cancelled_at_end(value: CborValueRef<'_>) -> CborError {
+    CborError::new(
+        ErrorCode::WorkCancelled,
+        value.offset().saturating_add(value.byte_len()),
+    )
 }
 
 #[inline]
@@ -182,8 +277,32 @@ impl<'a> AbiFieldSetRef<'a> {
 
     /// Validate a field-set and visit each entry exactly once.
     #[inline]
-    pub fn scan<F>(raw: CborValueRef<'a>, mut visit: F) -> Result<Self, CborError>
+    pub fn scan<F>(raw: CborValueRef<'a>, visit: F) -> Result<Self, CborError>
     where
+        F: FnMut(AbiFieldEntryRef<'a>) -> Result<(), CborError>,
+    {
+        let mut session = WorkSession::new(sacp_cbor::NoopWorkObserver)
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, raw.offset()))?;
+        let fields = Self::scan_with_session(raw, &mut session, visit)?;
+        session
+            .finish()
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, raw.offset()))?;
+        Ok(fields)
+    }
+
+    /// Validate a field-set and visit each entry while sharing a caller-owned work session.
+    ///
+    /// Each successfully visited field entry completes one work unit. This method neither starts
+    /// nor finishes `session`, allowing a generated record constructor and its later lazy array
+    /// fields to use the same shared cadence.
+    #[inline]
+    pub fn scan_with_session<O, F>(
+        raw: CborValueRef<'a>,
+        session: &mut WorkSession<O>,
+        mut visit: F,
+    ) -> Result<Self, CborError>
+    where
+        O: WorkObserver,
         F: FnMut(AbiFieldEntryRef<'a>) -> Result<(), CborError>,
     {
         let fields = Self { raw };
@@ -194,11 +313,11 @@ impl<'a> AbiFieldSetRef<'a> {
 
         let mut prev = None;
         let mut iter = array.iter();
-        while let Some(id_value) = iter.next() {
+        while let Some(id_value) = iter.next_with_session(session) {
             let id_value = id_value?;
             let id = abi_field_id(id_value)?;
             let value = iter
-                .next()
+                .next_with_session(session)
                 .ok_or_else(|| CborError::new(ErrorCode::ArrayLenMismatch, raw.offset()))??;
             if let Some(prev_id) = prev {
                 if id == prev_id {
@@ -215,13 +334,26 @@ impl<'a> AbiFieldSetRef<'a> {
                 }
             }
             prev = Some(id);
-            visit(AbiFieldEntryRef {
+            let entry = AbiFieldEntryRef {
                 id,
                 id_offset: id_value.offset(),
                 value,
-            })?;
+            };
+            visit(entry)?;
+            if session.complete(1).is_err() {
+                return Err(work_cancelled_at_end(value));
+            }
         }
         Ok(fields)
+    }
+
+    /// Validate and construct a borrowed field-set while sharing a caller-owned work session.
+    #[inline]
+    pub fn from_value_with_session<O: WorkObserver>(
+        raw: CborValueRef<'a>,
+        session: &mut WorkSession<O>,
+    ) -> Result<Self, CborError> {
+        Self::scan_with_session(raw, session, |_| Ok(()))
     }
 
     /// Return the raw field-set array value.
@@ -375,6 +507,21 @@ impl<'a, T: AbiViewField<'a>> AbiArrayView<'a, T> {
             .array()?
             .iter()
             .map(|item| item.and_then(T::view_field)))
+    }
+
+    /// Create a session-driven cursor without borrowing a work session.
+    ///
+    /// Pass the same session to each [`AbiArrayViewCursor::next_with_session`] call. Because the
+    /// cursor stores its iteration state rather than the session borrow, a returned record view can
+    /// use that session for nested `*_with_session` getters and deeper cursors before the outer
+    /// cursor advances again.
+    #[inline]
+    pub fn cursor(self) -> Result<AbiArrayViewCursor<'a, T>, CborError> {
+        Ok(AbiArrayViewCursor {
+            items: self.raw.array()?.iter(),
+            stopped: false,
+            _marker: PhantomData,
+        })
     }
 }
 

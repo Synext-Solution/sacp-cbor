@@ -22,7 +22,7 @@ fn decode_impl(
 ) -> proc_macro2::TokenStream {
     quote! {
         impl #impl_generics #crate_path::CborDecode<#decode_lt> for #name #ty_generics #where_clause {
-            fn decode<const CHECKED: bool>(decoder: &mut #crate_path::Decoder<#decode_lt, CHECKED>) -> ::core::result::Result<Self, #crate_path::CborError> {
+            fn decode<const CHECKED: bool, __O: #crate_path::WorkObserver>(decoder: &mut #crate_path::Decoder<#decode_lt, CHECKED, __O>) -> ::core::result::Result<Self, #crate_path::CborError> {
                 #body
             }
         }
@@ -264,58 +264,46 @@ struct InternalVariantDecode {
 
 fn decode_raw_value(
     crate_path: &Path,
-    decode_lt: &Lifetime,
+    _decode_lt: &Lifetime,
     ty: &Type,
     raw: &Ident,
 ) -> proc_macro2::TokenStream {
     quote! {
         {
-            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
             let __result: ::core::result::Result<#ty, #crate_path::CborError> = (|| {
-                let mut __decoder = #crate_path::Decoder::<true>::new_checked(
-                    __bytes,
-                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
-                )?;
+                let mut __decoder = decoder.__derived_subvalue_decoder(#raw)?;
                 let __value = #crate_path::CborDecode::decode(&mut __decoder)?;
-                if __decoder.position() != __bytes.len() {
-                    return Err(#crate_path::CborError::new(
-                        #crate_path::ErrorCode::TrailingBytes,
-                        __decoder.position(),
-                    ));
-                }
+                let _ = __decoder.finish()?;
                 Ok(__value)
             })();
-            __result.map_err(|err| #crate_path::CborError::new(err.code, #raw.offset() + err.offset))
+            __result.map_err(|err| {
+                let __error = #crate_path::CborError::new(err.code, #raw.offset() + err.offset);
+                decoder.__record_nested_decode_error(__error)
+            })
         }
     }
 }
 
 fn decode_body_from_raw(
     crate_path: &Path,
-    decode_lt: &Lifetime,
+    _decode_lt: &Lifetime,
     raw: &Ident,
     body: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         {
-            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
             let __result: ::core::result::Result<Self, #crate_path::CborError> = (|| {
-                let mut decoder = #crate_path::Decoder::<true>::new_checked(
-                    __bytes,
-                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
-                )?;
+                let mut decoder = decoder.__derived_subvalue_decoder(#raw)?;
                 let __value = { #body }?;
-                if decoder.position() != __bytes.len() {
-                    return Err(#crate_path::CborError::new(
-                        #crate_path::ErrorCode::TrailingBytes,
-                        decoder.position(),
-                    ));
-                }
+                let _ = decoder.finish()?;
                 Ok(__value)
             })();
             __result
         }
-        .map_err(|err| #crate_path::CborError::new(err.code, #raw.offset() + err.offset))
+        .map_err(|err| {
+            let __error = #crate_path::CborError::new(err.code, #raw.offset() + err.offset);
+            decoder.__record_nested_decode_error(__error)
+        })
     }
 }
 
@@ -744,6 +732,7 @@ fn decode_enum_internal(
                         }
                     }
                 }
+                ::core::mem::drop(map);
                 let __tag = __tag.ok_or_else(|| {
                     #crate_path::CborError::new(#crate_path::ErrorCode::MissingKey, map_off)
                 })?;
@@ -785,25 +774,19 @@ fn decode_enum_adjacent(
                     &raw,
                     quote! {
                         {
-                            let __bytes: &#decode_lt [u8] = #raw.as_bytes();
                             let __result: ::core::result::Result<(), #crate_path::CborError> = (|| {
-                                let mut __decoder = #crate_path::Decoder::<true>::new_checked(
-                                    __bytes,
-                                    #crate_path::DecodeLimits::for_bytes(__bytes.len()),
-                                )?;
+                                let mut __decoder = decoder.__derived_subvalue_decoder(#raw)?;
                                 let _unit: () = #crate_path::CborDecode::decode(&mut __decoder)?;
-                                if __decoder.position() != __bytes.len() {
-                                    return Err(#crate_path::CborError::new(
-                                        #crate_path::ErrorCode::TrailingBytes,
-                                        __decoder.position(),
-                                    ));
-                                }
+                                let _ = __decoder.finish()?;
                                 Ok(())
                             })();
-                            __result.map_err(|err| #crate_path::CborError::new(
-                                err.code,
-                                #raw.offset() + err.offset,
-                            ))?;
+                            __result.map_err(|err| {
+                                let __error = #crate_path::CborError::new(
+                                    err.code,
+                                    #raw.offset() + err.offset,
+                                );
+                                decoder.__record_nested_decode_error(__error)
+                            })?;
                             Ok(Self::#ident)
                         }
                     },
@@ -913,6 +896,7 @@ fn decode_enum_adjacent(
                         }
                     }
                 }
+                ::core::mem::drop(map);
                 let __tag = __tag.ok_or_else(|| {
                     #crate_path::CborError::new(#crate_path::ErrorCode::MissingKey, map_off)
                 })?;

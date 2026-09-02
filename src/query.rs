@@ -13,7 +13,7 @@ use core::cmp::Ordering;
 use crate::canonical::CanonicalCborRef;
 use crate::profile::{checked_text_len, cmp_text_keys_canonical};
 use crate::wire;
-use crate::{CborError, ErrorCode};
+use crate::{CborError, ErrorCode, WorkObserver, WorkSession};
 
 #[cfg(feature = "alloc")]
 use crate::canonical::CanonicalCbor;
@@ -973,6 +973,37 @@ impl<'a> ArrayRef<'a> {
         Err(malformed(self.array_off))
     }
 
+    /// Return the array item at `index` while sharing a caller-owned work session.
+    ///
+    /// Boundary traversal contributes one structural work unit per visited CBOR value. The
+    /// session cadence is shared with preceding and following observed operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CborError` if the array is malformed or the observer cancels traversal.
+    #[inline]
+    pub fn get_with_session<O: WorkObserver>(
+        self,
+        index: usize,
+        session: &mut WorkSession<O>,
+    ) -> Result<Option<CborValueRef<'a>>, CborError> {
+        if index >= self.len {
+            return Ok(None);
+        }
+
+        let mut pos = self.items_start;
+        for item_index in 0..self.len {
+            let start = pos;
+            let end = value_end_with_session(self.data, start, session)?;
+            if item_index == index {
+                return Ok(Some(CborValueRef::new(self.data, start, end)));
+            }
+            pos = end;
+        }
+
+        Err(malformed(self.array_off))
+    }
+
     /// Iterates over array items in order.
     ///
     /// The iterator yields `Result` to remain robust if canonical invariants are violated.
@@ -983,6 +1014,23 @@ impl<'a> ArrayRef<'a> {
             data: self.data,
             pos: self.items_start,
             remaining: self.len,
+        }
+    }
+
+    /// Iterate over array items while sharing a caller-owned work session.
+    ///
+    /// The iterator observes the structural traversal used to locate every child boundary; it
+    /// does not start or finish `session`.
+    #[inline]
+    #[must_use]
+    pub const fn iter_with_session<'session, O: WorkObserver>(
+        self,
+        session: &'session mut WorkSession<O>,
+    ) -> ObservedArrayIter<'a, 'session, O> {
+        ObservedArrayIter {
+            items: self.iter(),
+            session,
+            stopped: false,
         }
     }
 }
@@ -1178,6 +1226,14 @@ fn value_end(data: &[u8], start: usize) -> Result<usize, CborError> {
     wire::value_end_trusted(data, start)
 }
 
+fn value_end_with_session<O: WorkObserver>(
+    data: &[u8],
+    start: usize,
+    session: &mut WorkSession<O>,
+) -> Result<usize, CborError> {
+    wire::value_end_trusted_with_session(data, start, session)
+}
+
 fn parse_map_header(data: &[u8], start: usize) -> Result<(usize, usize), CborError> {
     let mut pos = start;
     let off = start;
@@ -1370,6 +1426,39 @@ pub struct ArrayIter<'a> {
     remaining: usize,
 }
 
+impl<'a> ArrayIter<'a> {
+    /// Advance once while sharing a caller-owned work session.
+    ///
+    /// This method meters the structural traversal used to locate the next child's boundary. It
+    /// leaves `session` available to the caller between items, allowing a higher-level iterator to
+    /// account for its own successful conversion without starting a second cadence.
+    ///
+    /// An observer cancellation is returned as [`ErrorCode::WorkCancelled`] at the confirmed byte
+    /// position and permanently exhausts this iterator.
+    #[inline]
+    pub fn next_with_session<O: WorkObserver>(
+        &mut self,
+        session: &mut WorkSession<O>,
+    ) -> Option<Result<CborValueRef<'a>, CborError>> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let start = self.pos;
+        let end = match value_end_with_session(self.data, start, session) {
+            Ok(end) => end,
+            Err(error) => {
+                self.remaining = 0;
+                return Some(Err(error));
+            }
+        };
+
+        self.pos = end;
+        self.remaining -= 1;
+        Some(Ok(CborValueRef::new(self.data, start, end)))
+    }
+}
+
 impl<'a> Iterator for ArrayIter<'a> {
     type Item = Result<CborValueRef<'a>, CborError>;
 
@@ -1394,3 +1483,44 @@ impl<'a> Iterator for ArrayIter<'a> {
         Some(Ok(CborValueRef::new(self.data, start, end)))
     }
 }
+
+/// Allocation-free observed iterator over borrowed canonical array items.
+///
+/// Unlike [`ArrayIter`], this iterator meters the hidden structural walk needed to determine each
+/// child's encoded boundary. It borrows a caller-owned [`WorkSession`], preserving one fixed
+/// cadence across query, generated ABI view, and later decode or encode work. Cancellation is
+/// terminal for this iterator.
+pub struct ObservedArrayIter<'a, 'session, O: WorkObserver> {
+    items: ArrayIter<'a>,
+    session: &'session mut WorkSession<O>,
+    stopped: bool,
+}
+
+impl<'a, O: WorkObserver> Iterator for ObservedArrayIter<'a, '_, O> {
+    type Item = Result<CborValueRef<'a>, CborError>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.stopped {
+            return None;
+        }
+
+        match self.items.next_with_session(self.session) {
+            Some(Err(error)) => {
+                self.stopped = true;
+                Some(Err(error))
+            }
+            item => item,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.stopped {
+            (0, Some(0))
+        } else {
+            self.items.size_hint()
+        }
+    }
+}
+
+impl<O: WorkObserver> core::iter::FusedIterator for ObservedArrayIter<'_, '_, O> {}

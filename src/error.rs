@@ -25,6 +25,8 @@ pub enum ErrorCode {
     MapLenMismatch,
     /// An earlier encoding failure may have left sink side effects.
     EncoderPoisoned,
+    /// A cooperative work observer requested cancellation.
+    WorkCancelled,
 
     /// Nesting depth limit exceeded.
     DepthLimitExceeded,
@@ -156,6 +158,7 @@ impl fmt::Display for CborError {
             ErrorCode::ArrayLenMismatch => "array length mismatch",
             ErrorCode::MapLenMismatch => "map length mismatch",
             ErrorCode::EncoderPoisoned => "encoder poisoned by an earlier failure",
+            ErrorCode::WorkCancelled => "CBOR work cancelled by observer",
 
             ErrorCode::DepthLimitExceeded => "nesting depth limit exceeded",
             ErrorCode::TotalItemsLimitExceeded => "total items limit exceeded",

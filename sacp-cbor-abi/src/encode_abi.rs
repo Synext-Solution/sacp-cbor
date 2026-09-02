@@ -10,7 +10,7 @@ use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::encode::ArrayEncoder;
 use sacp_cbor::{
     ByteSink, CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, EncodeError, EncodeLimits,
-    Encoder, ValueEncoder, VecSink,
+    Encoder, NoopWorkObserver, ValueEncoder, VecSink, WorkObserver,
 };
 
 use crate::{TypeRef, UnknownFields, UnknownVariant};
@@ -169,9 +169,9 @@ where
 /// remain private to the generated driver.
 pub trait AbiEncodeAs<W: AbiWireType, ProjectionError> {
     /// Emit exactly one wire value.
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, ProjectionError>>;
 }
 
@@ -180,9 +180,9 @@ where
     W: AbiWireType,
     T: AbiEncodeAs<W, ProjectionError> + ?Sized,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, ProjectionError>> {
         (*self).abi_encode_as(enc)
     }
@@ -194,9 +194,9 @@ pub trait AbiEncode {
     type Error;
 
     /// Emit exactly one canonical ABI value.
-    fn abi_encode<S: ByteSink>(
+    fn abi_encode<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>>;
 }
 
@@ -206,9 +206,9 @@ where
 {
     type Error = Infallible;
 
-    fn abi_encode<S: ByteSink>(
+    fn abi_encode<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         self.abi_encode_as(enc)
     }
@@ -224,7 +224,25 @@ where
     T: AbiEncode + ?Sized,
     S: ByteSink,
 {
-    let mut encoder = Encoder::with_sink_and_limits(sink, limits)
+    let mut encoder: Encoder<S, NoopWorkObserver> = Encoder::with_sink_and_limits(sink, limits)
+        .map_err(|error| AbiEncodeError::Encode(EncodeError::Cbor(error)))?;
+    encoder.encode_with_caller_error(|enc| value.abi_encode(enc))?;
+    encoder.finish().map_err(AbiEncodeError::Encode)
+}
+
+/// Encode directly into `sink` with cooperative work observation under caller-supplied limits.
+pub fn encode_to_sink_with_observer<T, S, O>(
+    value: &T,
+    sink: S,
+    limits: EncodeLimits,
+    observer: O,
+) -> Result<S::Output, AbiEncodeError<S::Error, T::Error>>
+where
+    T: AbiEncode + ?Sized,
+    S: ByteSink,
+    O: WorkObserver,
+{
+    let mut encoder = Encoder::with_sink_limits_and_observer(sink, limits, observer)
         .map_err(|error| AbiEncodeError::Encode(EncodeError::Cbor(error)))?;
     encoder.encode_with_caller_error(|enc| value.abi_encode(enc))?;
     encoder.finish().map_err(AbiEncodeError::Encode)
@@ -236,6 +254,19 @@ pub fn encode_to_vec<T: AbiEncode + ?Sized>(
     limits: EncodeLimits,
 ) -> Result<Vec<u8>, AbiEncodeError<CborError, T::Error>> {
     encode_to_sink(value, VecSink::new(), limits)
+}
+
+/// Encode into a vector with cooperative work observation under caller-supplied limits.
+pub fn encode_to_vec_with_observer<T, O>(
+    value: &T,
+    limits: EncodeLimits,
+    observer: O,
+) -> Result<Vec<u8>, AbiEncodeError<CborError, T::Error>>
+where
+    T: AbiEncode + ?Sized,
+    O: WorkObserver,
+{
+    encode_to_sink_with_observer(value, VecSink::new(), limits, observer)
 }
 
 /// Encode into an owned canonical witness under caller-supplied limits.
@@ -260,9 +291,9 @@ macro_rules! scalar_wire {
         }
 
         impl<E> AbiEncodeAs<$wire, E> for $storage {
-            fn abi_encode_as<S: ByteSink>(
+            fn abi_encode_as<S: ByteSink, O: WorkObserver>(
                 &self,
-                enc: &mut ValueEncoder<'_, S>,
+                enc: &mut ValueEncoder<'_, S, O>,
             ) -> Result<(), AbiEncodeError<S::Error, E>> {
                 enc.$method(*self).map_err(AbiEncodeError::Encode)
             }
@@ -279,9 +310,9 @@ impl AbiRepresentation for () {
 }
 
 impl<E> AbiEncodeAs<wire::Unit, E> for () {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.null().map_err(AbiEncodeError::Encode)
     }
@@ -300,9 +331,9 @@ macro_rules! integer_wire {
         }
 
         impl<E> AbiEncodeAs<$wire, E> for $storage {
-            fn abi_encode_as<S: ByteSink>(
+            fn abi_encode_as<S: ByteSink, O: WorkObserver>(
                 &self,
-                enc: &mut ValueEncoder<'_, S>,
+                enc: &mut ValueEncoder<'_, S, O>,
             ) -> Result<(), AbiEncodeError<S::Error, E>> {
                 ($convert)(enc, *self).map_err(AbiEncodeError::Encode)
             }
@@ -314,49 +345,49 @@ integer_wire!(
     u8,
     wire::U8,
     TypeRef::U8,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_u128(u128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_u128(u128::from(value))
 );
 integer_wire!(
     u16,
     wire::U16,
     TypeRef::U16,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_u128(u128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_u128(u128::from(value))
 );
 integer_wire!(
     u32,
     wire::U32,
     TypeRef::U32,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_u128(u128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_u128(u128::from(value))
 );
 integer_wire!(
     u64,
     wire::U64,
     TypeRef::U64,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_u128(u128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_u128(u128::from(value))
 );
 integer_wire!(
     i8,
     wire::I8,
     TypeRef::I8,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_i128(i128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_i128(i128::from(value))
 );
 integer_wire!(
     i16,
     wire::I16,
     TypeRef::I16,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_i128(i128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_i128(i128::from(value))
 );
 integer_wire!(
     i32,
     wire::I32,
     TypeRef::I32,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_i128(i128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_i128(i128::from(value))
 );
 integer_wire!(
     i64,
     wire::I64,
     TypeRef::I64,
-    |enc: &mut ValueEncoder<'_, S>, value| enc.int_i128(i128::from(value))
+    |enc: &mut ValueEncoder<'_, S, O>, value| enc.int_i128(i128::from(value))
 );
 
 impl AbiWireType for wire::Text {
@@ -376,18 +407,18 @@ impl AbiRepresentation for &str {
 }
 
 impl<E> AbiEncodeAs<wire::Text, E> for str {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.text(self).map_err(AbiEncodeError::Encode)
     }
 }
 
 impl<E> AbiEncodeAs<wire::Text, E> for String {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         self.as_str().abi_encode_as(enc)
     }
@@ -406,18 +437,18 @@ impl AbiRepresentation for BytesRef<'_> {
 }
 
 impl<E> AbiEncodeAs<wire::Bytes, E> for Bytes {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.bytes(self.as_slice()).map_err(AbiEncodeError::Encode)
     }
 }
 
 impl<E> AbiEncodeAs<wire::Bytes, E> for BytesRef<'_> {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.bytes(self.as_slice()).map_err(AbiEncodeError::Encode)
     }
@@ -432,9 +463,9 @@ impl<const N: usize> AbiRepresentation for [u8; N] {
 }
 
 impl<E, const N: usize> AbiEncodeAs<wire::FixedBytes<N>, E> for [u8; N] {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.bytes(self).map_err(AbiEncodeError::Encode)
     }
@@ -453,9 +484,9 @@ impl AbiRepresentation for CanonicalCborRef<'_> {
 }
 
 impl<E> AbiEncodeAs<wire::CanonicalCbor, E> for CanonicalCbor {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.raw_cbor(self.as_canonical_ref())
             .map_err(AbiEncodeError::Encode)
@@ -463,9 +494,9 @@ impl<E> AbiEncodeAs<wire::CanonicalCbor, E> for CanonicalCbor {
 }
 
 impl<E> AbiEncodeAs<wire::CanonicalCbor, E> for CanonicalCborRef<'_> {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.raw_cbor(*self).map_err(AbiEncodeError::Encode)
     }
@@ -492,13 +523,14 @@ where
     W: AbiWireType,
     T: AbiEncodeAs<W, E>,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.array_with_caller_error(self.len(), |array| {
             for value in self {
                 array.encode_with_caller_error(|enc| value.abi_encode_as(enc))?;
+                array.checkpoint().map_err(AbiEncodeError::Encode)?;
             }
             Ok(())
         })
@@ -510,9 +542,9 @@ where
     W: AbiWireType,
     T: AbiEncodeAs<W, E>,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         self.as_slice().abi_encode_as(enc)
     }
@@ -541,14 +573,15 @@ where
     F: Fn(usize) -> Result<T, E>,
     T: AbiEncodeAs<W, E>,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         enc.array_with_caller_error(self.len, |array| {
             for index in 0..self.len {
                 let value = (self.project)(index).map_err(AbiEncodeError::Projection)?;
                 array.encode_with_caller_error(|enc| value.abi_encode_as(enc))?;
+                array.checkpoint().map_err(AbiEncodeError::Encode)?;
             }
             Ok(())
         })
@@ -589,15 +622,16 @@ where
     P: ExactIndexProjection,
     P::Item: AbiEncodeAs<W, P::Error>,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, P::Error>> {
         let len = self.0.len();
         enc.array_with_caller_error(len, |array| {
             for index in 0..len {
                 let value = self.0.project(index).map_err(AbiEncodeError::Projection)?;
                 array.encode_with_caller_error(|enc| value.abi_encode_as(enc))?;
+                array.checkpoint().map_err(AbiEncodeError::Encode)?;
             }
             Ok(())
         })
@@ -617,9 +651,9 @@ pub trait SequenceProjection<W: AbiWireType> {
     fn declared_len(&self) -> Result<usize, Self::Error>;
 
     /// Emit items in wire order.
-    fn project<S: ByteSink>(
+    fn project<S: ByteSink, O: WorkObserver>(
         &self,
-        emitter: &mut SequenceEmitter<'_, '_, S, W, Self::Error>,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, W, Self::Error>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>>;
 }
 
@@ -637,9 +671,9 @@ where
     W: AbiWireType,
     P: SequenceProjection<W>,
 {
-    fn abi_encode_as<S: ByteSink>(
+    fn abi_encode_as<S: ByteSink, O: WorkObserver>(
         &self,
-        enc: &mut ValueEncoder<'_, S>,
+        enc: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, P::Error>> {
         let declared = self.0.declared_len().map_err(AbiEncodeError::Projection)?;
         enc.array_with_caller_error(declared, |array| {
@@ -662,14 +696,14 @@ where
 }
 
 /// Count-checking emitter passed to a source-driven projection.
-pub struct SequenceEmitter<'a, 'e, S: ByteSink, W: AbiWireType, E> {
-    array: &'a mut ArrayEncoder<'e, S>,
+pub struct SequenceEmitter<'a, 'e, S: ByteSink, O: WorkObserver, W: AbiWireType, E> {
+    array: &'a mut ArrayEncoder<'e, S, O>,
     declared: usize,
     emitted: usize,
     wire: PhantomData<fn() -> (W, E)>,
 }
 
-impl<S: ByteSink, W: AbiWireType, E> SequenceEmitter<'_, '_, S, W, E> {
+impl<S: ByteSink, O: WorkObserver, W: AbiWireType, E> SequenceEmitter<'_, '_, S, O, W, E> {
     /// Emit one item and advance the observed count only after successful encoding.
     pub fn emit<T: AbiEncodeAs<W, E> + ?Sized>(
         &mut self,
@@ -686,6 +720,7 @@ impl<S: ByteSink, W: AbiWireType, E> SequenceEmitter<'_, '_, S, W, E> {
         self.array
             .encode_with_caller_error(|enc| value.abi_encode_as(enc))?;
         self.emitted = attempted;
+        self.array.checkpoint().map_err(AbiEncodeError::Encode)?;
         Ok(())
     }
 
@@ -703,8 +738,8 @@ impl<S: ByteSink, W: AbiWireType, E> SequenceEmitter<'_, '_, S, W, E> {
 }
 
 /// Encode preserved unknown fields lower than `before_id`.
-pub(crate) fn encode_unknown_fields_before<S: ByteSink, E>(
-    array: &mut ArrayEncoder<'_, S>,
+pub(crate) fn encode_unknown_fields_before<S: ByteSink, O: WorkObserver, E>(
+    array: &mut ArrayEncoder<'_, S, O>,
     unknown: &UnknownFields,
     cursor: &mut usize,
     before_id: u32,
@@ -718,6 +753,7 @@ pub(crate) fn encode_unknown_fields_before<S: ByteSink, E>(
             .raw_cbor(fields[*cursor].value.as_canonical_ref())
             .map_err(AbiEncodeError::Encode)?;
         *cursor += 1;
+        array.checkpoint().map_err(AbiEncodeError::Encode)?;
     }
     if *cursor < fields.len() && fields[*cursor].id == before_id {
         return Err(AbiEncodeError::Encode(EncodeError::Cbor(CborError::new(
@@ -729,8 +765,8 @@ pub(crate) fn encode_unknown_fields_before<S: ByteSink, E>(
 }
 
 /// Encode remaining preserved unknown fields.
-pub(crate) fn encode_remaining_unknown_fields<S: ByteSink, E>(
-    array: &mut ArrayEncoder<'_, S>,
+pub(crate) fn encode_remaining_unknown_fields<S: ByteSink, O: WorkObserver, E>(
+    array: &mut ArrayEncoder<'_, S, O>,
     unknown: &UnknownFields,
     cursor: &mut usize,
 ) -> Result<(), AbiEncodeError<S::Error, E>> {
@@ -743,6 +779,7 @@ pub(crate) fn encode_remaining_unknown_fields<S: ByteSink, E>(
             .raw_cbor(fields[*cursor].value.as_canonical_ref())
             .map_err(AbiEncodeError::Encode)?;
         *cursor += 1;
+        array.checkpoint().map_err(AbiEncodeError::Encode)?;
     }
     Ok(())
 }

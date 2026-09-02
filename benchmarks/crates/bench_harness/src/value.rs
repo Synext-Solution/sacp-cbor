@@ -1,7 +1,9 @@
 use sacp_cbor::bytes::{Bytes, BytesRef};
 use sacp_cbor::collections::MapEntries;
 use sacp_cbor::query::CborKind;
-use sacp_cbor::{ByteSink, CborDecode, CborEncode, CborError, Decoder, EncodeResult, ValueEncoder};
+use sacp_cbor::{
+    ByteSink, CborDecode, CborEncode, CborError, Decoder, EncodeResult, ValueEncoder, WorkObserver,
+};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
@@ -209,7 +211,10 @@ pub enum BenchValueBorrowed<'a> {
 }
 
 impl CborEncode for BenchValueNative {
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         match self {
             Self::Null => enc.null(),
             Self::Bool(v) => enc.bool(*v),
@@ -233,7 +238,9 @@ impl CborEncode for BenchValueNative {
 }
 
 impl<'de> CborDecode<'de> for BenchValueNative {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         match decoder.peek_kind()? {
             CborKind::Null => {
                 let _: () = CborDecode::decode(decoder)?;
@@ -257,7 +264,10 @@ impl<'de> CborDecode<'de> for BenchValueNative {
 }
 
 impl CborEncode for BenchValueBorrowed<'_> {
-    fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+    fn encode<S: ByteSink, O: WorkObserver>(
+        &self,
+        enc: &mut ValueEncoder<'_, S, O>,
+    ) -> EncodeResult<(), S> {
         match self {
             Self::Null => enc.null(),
             Self::Bool(v) => enc.bool(*v),
@@ -281,7 +291,9 @@ impl CborEncode for BenchValueBorrowed<'_> {
 }
 
 impl<'de> CborDecode<'de> for BenchValueBorrowed<'de> {
-    fn decode<const CHECKED: bool>(decoder: &mut Decoder<'de, CHECKED>) -> Result<Self, CborError> {
+    fn decode<const CHECKED: bool, O: WorkObserver>(
+        decoder: &mut Decoder<'de, CHECKED, O>,
+    ) -> Result<Self, CborError> {
         match decoder.peek_kind()? {
             CborKind::Null => {
                 let _: () = CborDecode::decode(decoder)?;

@@ -10,7 +10,7 @@ use crate::alloc_util;
 use crate::encode::{major_uint_header, ByteSink, EncodeError, Encoder, VecSink};
 use crate::profile::cmp_text_keys_canonical;
 use crate::scalar::F64Bits;
-use crate::{CborError, EncodeLimits, ErrorCode};
+use crate::{CborError, EncodeLimits, ErrorCode, WorkObserver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapKeyMode {
@@ -101,14 +101,15 @@ impl SerdeOptions {
     /// # Errors
     ///
     /// Returns the first canonical-profile, serde, allocation, or owned sink error.
-    pub fn encode<T, S>(
+    pub fn encode<T, S, O>(
         self,
         value: &T,
-        encoder: &mut Encoder<S>,
+        encoder: &mut Encoder<S, O>,
     ) -> Result<(), SerdeEncodeError<S::Error>>
     where
         T: Serialize + ?Sized,
         S: ByteSink,
+        O: WorkObserver,
         S::Error: fmt::Debug + fmt::Display,
     {
         serialize_nested(value, encoder, self.map_key_mode)
@@ -150,8 +151,8 @@ fn code_error<E>(code: ErrorCode) -> SerdeEncodeError<E> {
     CborError::new(code, 0).into()
 }
 
-fn reject<S: ByteSink, T>(
-    encoder: &mut Encoder<S>,
+fn reject<S: ByteSink, O: WorkObserver, T>(
+    encoder: &mut Encoder<S, O>,
     code: ErrorCode,
 ) -> Result<T, SerdeEncodeError<S::Error>> {
     let offset = encoder.len();
@@ -159,45 +160,48 @@ fn reject<S: ByteSink, T>(
     Err(CborError::new(code, offset).into())
 }
 
-fn ensure_healthy<S>(encoder: &Encoder<S>) -> Result<(), SerdeEncodeError<S::Error>>
+fn ensure_healthy<S, O>(encoder: &Encoder<S, O>) -> Result<(), SerdeEncodeError<S::Error>>
 where
     S: ByteSink,
+    O: WorkObserver,
 {
     encoder.ensure_healthy().map_err(SerdeEncodeError::from)
 }
 
-fn serialize_nested<T, S>(
+fn serialize_nested<T, S, O>(
     value: &T,
-    encoder: &mut Encoder<S>,
+    encoder: &mut Encoder<S, O>,
     mode: MapKeyMode,
 ) -> Result<(), SerdeEncodeError<S::Error>>
 where
     T: Serialize + ?Sized,
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     encoder.guarded_value(|encoder| value.serialize(Serializer { encoder, mode }))
 }
 
-struct Serializer<'a, S: ByteSink> {
-    encoder: &'a mut Encoder<S>,
+struct Serializer<'a, S: ByteSink, O: WorkObserver> {
+    encoder: &'a mut Encoder<S, O>,
     mode: MapKeyMode,
 }
 
-impl<'a, S> ser::Serializer for Serializer<'a, S>
+impl<'a, S, O> ser::Serializer for Serializer<'a, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
     type Error = SerdeEncodeError<S::Error>;
-    type SerializeSeq = Sequence<'a, S>;
-    type SerializeTuple = Sequence<'a, S>;
-    type SerializeTupleStruct = Sequence<'a, S>;
-    type SerializeTupleVariant = Sequence<'a, S>;
-    type SerializeMap = MapSerializer<'a, S>;
-    type SerializeStruct = StructSerializer<'a, S>;
-    type SerializeStructVariant = StructSerializer<'a, S>;
+    type SerializeSeq = Sequence<'a, S, O>;
+    type SerializeTuple = Sequence<'a, S, O>;
+    type SerializeTupleStruct = Sequence<'a, S, O>;
+    type SerializeTupleVariant = Sequence<'a, S, O>;
+    type SerializeMap = MapSerializer<'a, S, O>;
+    type SerializeStruct = StructSerializer<'a, S, O>;
+    type SerializeStructVariant = StructSerializer<'a, S, O>;
 
     fn serialize_bool(self, value: bool) -> Result<(), Self::Error> {
         self.encoder.bool(value).map_err(Into::into)
@@ -358,17 +362,17 @@ where
     }
 }
 
-struct Sequence<'a, S: ByteSink> {
-    encoder: &'a mut Encoder<S>,
+struct Sequence<'a, S: ByteSink, O: WorkObserver> {
+    encoder: &'a mut Encoder<S, O>,
     remaining: usize,
     containers: usize,
     mode: MapKeyMode,
     finished: bool,
 }
 
-impl<'a, S: ByteSink> Sequence<'a, S> {
+impl<'a, S: ByteSink, O: WorkObserver> Sequence<'a, S, O> {
     const fn new(
-        encoder: &'a mut Encoder<S>,
+        encoder: &'a mut Encoder<S, O>,
         remaining: usize,
         containers: usize,
         mode: MapKeyMode,
@@ -383,9 +387,10 @@ impl<'a, S: ByteSink> Sequence<'a, S> {
     }
 }
 
-impl<S> SerializeSeq for Sequence<'_, S>
+impl<S, O> SerializeSeq for Sequence<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -414,9 +419,10 @@ where
     }
 }
 
-impl<S> ser::SerializeTuple for Sequence<'_, S>
+impl<S, O> ser::SerializeTuple for Sequence<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -429,9 +435,10 @@ where
     }
 }
 
-impl<S> ser::SerializeTupleStruct for Sequence<'_, S>
+impl<S, O> ser::SerializeTupleStruct for Sequence<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -444,9 +451,10 @@ where
     }
 }
 
-impl<S> ser::SerializeTupleVariant for Sequence<'_, S>
+impl<S, O> ser::SerializeTupleVariant for Sequence<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -459,7 +467,7 @@ where
     }
 }
 
-impl<S: ByteSink> Drop for Sequence<'_, S> {
+impl<S: ByteSink, O: WorkObserver> Drop for Sequence<'_, S, O> {
     fn drop(&mut self) {
         if !self.finished {
             self.encoder.poison();
@@ -494,8 +502,8 @@ fn encoded_text_len(len: usize) -> Result<usize, CborError> {
 }
 
 impl BufferedBudget {
-    fn new<S: ByteSink>(
-        encoder: &Encoder<S>,
+    fn new<S: ByteSink, O: WorkObserver>(
+        encoder: &Encoder<S, O>,
         len: usize,
     ) -> Result<Self, SerdeEncodeError<S::Error>> {
         let (header_len, items_after_header) = encoder.preflight_buffered_map(len)?;
@@ -569,8 +577,8 @@ impl BufferedBudget {
 }
 
 impl EntryBuffer {
-    fn new<S: ByteSink>(
-        encoder: &mut Encoder<S>,
+    fn new<S: ByteSink, O: WorkObserver>(
+        encoder: &mut Encoder<S, O>,
         remaining: usize,
     ) -> Result<Self, SerdeEncodeError<S::Error>> {
         let budget = match BufferedBudget::new(encoder, remaining) {
@@ -594,9 +602,9 @@ impl EntryBuffer {
         })
     }
 
-    fn push<T, S>(
+    fn push<T, S, O>(
         &mut self,
-        outer: &mut Encoder<S>,
+        outer: &mut Encoder<S, O>,
         key: String,
         value: &T,
         mode: MapKeyMode,
@@ -604,6 +612,7 @@ impl EntryBuffer {
     where
         T: Serialize + ?Sized,
         S: ByteSink,
+        O: WorkObserver,
         S::Error: fmt::Debug + fmt::Display,
     {
         if self.remaining == 0 {
@@ -634,9 +643,10 @@ impl EntryBuffer {
         Ok(())
     }
 
-    fn emit<S>(&mut self, encoder: &mut Encoder<S>) -> Result<(), SerdeEncodeError<S::Error>>
+    fn emit<S, O>(&mut self, encoder: &mut Encoder<S, O>) -> Result<(), SerdeEncodeError<S::Error>>
     where
         S: ByteSink,
+        O: WorkObserver,
         S::Error: fmt::Debug + fmt::Display,
     {
         if self.remaining != 0 {
@@ -670,17 +680,17 @@ enum MapStorage {
     },
 }
 
-struct MapSerializer<'a, S: ByteSink> {
-    encoder: &'a mut Encoder<S>,
+struct MapSerializer<'a, S: ByteSink, O: WorkObserver> {
+    encoder: &'a mut Encoder<S, O>,
     remaining: usize,
     mode: MapKeyMode,
     storage: MapStorage,
     finished: bool,
 }
 
-impl<'a, S: ByteSink> MapSerializer<'a, S> {
+impl<'a, S: ByteSink, O: WorkObserver> MapSerializer<'a, S, O> {
     fn new(
-        encoder: &'a mut Encoder<S>,
+        encoder: &'a mut Encoder<S, O>,
         remaining: usize,
         mode: MapKeyMode,
     ) -> Result<Self, SerdeEncodeError<S::Error>> {
@@ -736,9 +746,10 @@ impl<'a, S: ByteSink> MapSerializer<'a, S> {
     }
 }
 
-impl<S> SerializeMap for MapSerializer<'_, S>
+impl<S, O> SerializeMap for MapSerializer<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -869,7 +880,7 @@ where
     }
 }
 
-impl<S: ByteSink> Drop for MapSerializer<'_, S> {
+impl<S: ByteSink, O: WorkObserver> Drop for MapSerializer<'_, S, O> {
     fn drop(&mut self) {
         if !self.finished {
             self.encoder.poison();
@@ -885,21 +896,22 @@ enum StructStorage {
     Sorted(EntryBuffer),
 }
 
-struct StructSerializer<'a, S: ByteSink> {
-    encoder: &'a mut Encoder<S>,
+struct StructSerializer<'a, S: ByteSink, O: WorkObserver> {
+    encoder: &'a mut Encoder<S, O>,
     storage: StructStorage,
     outer_maps: usize,
     mode: MapKeyMode,
     finished: bool,
 }
 
-impl<'a, S> StructSerializer<'a, S>
+impl<'a, S, O> StructSerializer<'a, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     fn new(
-        encoder: &'a mut Encoder<S>,
+        encoder: &'a mut Encoder<S, O>,
         len: usize,
         outer_maps: usize,
         variant: Option<&'static str>,
@@ -1004,9 +1016,10 @@ where
     }
 }
 
-impl<S> ser::SerializeStruct for StructSerializer<'_, S>
+impl<S, O> ser::SerializeStruct for StructSerializer<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -1023,9 +1036,10 @@ where
     }
 }
 
-impl<S> ser::SerializeStructVariant for StructSerializer<'_, S>
+impl<S, O> ser::SerializeStructVariant for StructSerializer<'_, S, O>
 where
     S: ByteSink,
+    O: WorkObserver,
     S::Error: fmt::Debug + fmt::Display,
 {
     type Ok = ();
@@ -1042,7 +1056,7 @@ where
     }
 }
 
-impl<S: ByteSink> Drop for StructSerializer<'_, S> {
+impl<S: ByteSink, O: WorkObserver> Drop for StructSerializer<'_, S, O> {
     fn drop(&mut self) {
         if !self.finished {
             self.encoder.poison();

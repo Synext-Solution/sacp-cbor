@@ -8,7 +8,7 @@ use core::fmt;
 
 use sacp_cbor::{
     ByteSink, CanonicalCbor, CborError, DecodeLimits, DigestSink, EncodeError, EncodeLimits,
-    EncodeResult, Encoder, ValueEncoder, VecSink,
+    EncodeResult, Encoder, ValueEncoder, VecSink, WorkObserver,
 };
 use sha2::Sha256;
 
@@ -587,10 +587,10 @@ pub fn schema_hash(
     Ok(SchemaHash(out))
 }
 
-fn encode_schema<S: ByteSink>(
+fn encode_schema<S: ByteSink, O: WorkObserver>(
     schema: &Schema,
     kind: SchemaHashKind,
-    enc: &mut ValueEncoder<'_, S>,
+    enc: &mut ValueEncoder<'_, S, O>,
 ) -> EncodeResult<(), S> {
     match kind {
         SchemaHashKind::Wire => enc.array(3, |array| {
@@ -609,10 +609,10 @@ fn encode_schema<S: ByteSink>(
     }
 }
 
-fn encode_type_def<S: ByteSink>(
+fn encode_type_def<S: ByteSink, O: WorkObserver>(
     def: TypeDef,
     kind: SchemaHashKind,
-    enc: &mut ValueEncoder<'_, S>,
+    enc: &mut ValueEncoder<'_, S, O>,
 ) -> EncodeResult<(), S> {
     match def {
         TypeDef::Struct(fields) => enc.array(2, |array| {
@@ -646,10 +646,10 @@ fn encode_type_def<S: ByteSink>(
     }
 }
 
-fn encode_field_set<S: ByteSink>(
+fn encode_field_set<S: ByteSink, O: WorkObserver>(
     fields: FieldSetDef,
     kind: SchemaHashKind,
-    enc: &mut ValueEncoder<'_, S>,
+    enc: &mut ValueEncoder<'_, S, O>,
 ) -> EncodeResult<(), S> {
     enc.array(2, |array| {
         array.value(&fields.unknown_fields.as_str())?;
@@ -665,10 +665,10 @@ fn encode_field_set<S: ByteSink>(
     })
 }
 
-fn encode_field<S: ByteSink>(
+fn encode_field<S: ByteSink, O: WorkObserver>(
     field: FieldDef,
     kind: SchemaHashKind,
-    enc: &mut ValueEncoder<'_, S>,
+    enc: &mut ValueEncoder<'_, S, O>,
 ) -> EncodeResult<(), S> {
     match kind {
         SchemaHashKind::Wire => enc.array(3, |array| {
@@ -687,10 +687,10 @@ fn encode_field<S: ByteSink>(
     }
 }
 
-fn encode_variant<S: ByteSink>(
+fn encode_variant<S: ByteSink, O: WorkObserver>(
     variant: VariantDef,
     kind: SchemaHashKind,
-    enc: &mut ValueEncoder<'_, S>,
+    enc: &mut ValueEncoder<'_, S, O>,
 ) -> EncodeResult<(), S> {
     let len = if matches!(kind, SchemaHashKind::Full) {
         3
@@ -716,7 +716,10 @@ fn encode_variant<S: ByteSink>(
     })
 }
 
-fn encode_type_ref<S: ByteSink>(ty: TypeRef, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+fn encode_type_ref<S: ByteSink, O: WorkObserver>(
+    ty: TypeRef,
+    enc: &mut ValueEncoder<'_, S, O>,
+) -> EncodeResult<(), S> {
     if let Some(item) = ty.sequence_item() {
         return enc.array(2, |array| {
             array.value(&"sequence")?;

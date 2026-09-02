@@ -4,7 +4,9 @@ use crate::{
     SequenceContractError, SequenceEmitter, SequenceProjection, TypeAtom, TypeRef,
 };
 use core::convert::Infallible;
-use sacp_cbor::{ByteSink, CborError, CountingSink, EncodeLimits, ErrorCode, ValueEncoder};
+use sacp_cbor::{
+    ByteSink, CborError, CountingSink, EncodeLimits, ErrorCode, ValueEncoder, WorkObserver,
+};
 
 fn assert_err<T>(actual: Result<T, CborError>, expected: ErrorCode) {
     match actual {
@@ -94,9 +96,9 @@ impl SequenceProjection<wire::U8> for BoundedSequenceSource {
         Ok(self.declared)
     }
 
-    fn project<S: ByteSink>(
+    fn project<S: ByteSink, O: WorkObserver>(
         &self,
-        emitter: &mut SequenceEmitter<'_, '_, S, wire::U8, Self::Error>,
+        emitter: &mut SequenceEmitter<'_, '_, S, O, wire::U8, Self::Error>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         let mut emitted = 0;
         while emitted < self.actual {
@@ -115,9 +117,9 @@ struct BoundedSequenceRoot(BoundedSequenceSource);
 impl AbiEncode for BoundedSequenceRoot {
     type Error = Infallible;
 
-    fn abi_encode<S: ByteSink>(
+    fn abi_encode<S: ByteSink, O: WorkObserver>(
         &self,
-        encoder: &mut ValueEncoder<'_, S>,
+        encoder: &mut ValueEncoder<'_, S, O>,
     ) -> Result<(), AbiEncodeError<S::Error, Self::Error>> {
         projected_sequence(self.0).abi_encode_as(encoder)
     }

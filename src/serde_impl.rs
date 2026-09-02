@@ -10,7 +10,7 @@ use crate::canonical::{CanonicalCbor, CanonicalCborRef};
 use crate::codec::CborDecode;
 use crate::decode::{ArrayDecoder, Decoder, MapDecoder};
 use crate::query::{CborKind, CborValueRef};
-use crate::{CborError, DecodeLimits, ErrorCode};
+use crate::{CborError, DecodeLimits, ErrorCode, WorkObserver};
 
 const RAW_VALUE_MARKER: &str = "$__sacp_cbor_raw_value";
 
@@ -81,11 +81,13 @@ impl From<CborError> for DeError {
     }
 }
 
-struct ArrayAccess<'a, 'de, const CHECKED: bool> {
-    array: ArrayDecoder<'a, 'de, CHECKED>,
+struct ArrayAccess<'a, 'de, const CHECKED: bool, O: WorkObserver> {
+    array: ArrayDecoder<'a, 'de, CHECKED, O>,
 }
 
-impl<'de, const CHECKED: bool> SeqAccess<'de> for ArrayAccess<'_, 'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> SeqAccess<'de>
+    for ArrayAccess<'_, 'de, CHECKED, O>
+{
     type Error = DeError;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, DeError>
@@ -102,11 +104,13 @@ impl<'de, const CHECKED: bool> SeqAccess<'de> for ArrayAccess<'_, 'de, CHECKED> 
     }
 }
 
-struct MapAccessImpl<'a, 'de, const CHECKED: bool> {
-    map: MapDecoder<'a, 'de, CHECKED>,
+struct MapAccessImpl<'a, 'de, const CHECKED: bool, O: WorkObserver> {
+    map: MapDecoder<'a, 'de, CHECKED, O>,
 }
 
-impl<'de, const CHECKED: bool> MapAccess<'de> for MapAccessImpl<'_, 'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> MapAccess<'de>
+    for MapAccessImpl<'_, 'de, CHECKED, O>
+{
     type Error = DeError;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, DeError>
@@ -134,21 +138,23 @@ impl<'de, const CHECKED: bool> MapAccess<'de> for MapAccessImpl<'_, 'de, CHECKED
     }
 }
 
-enum EnumPayload<'a, 'de, const CHECKED: bool> {
+enum EnumPayload<'a, 'de, const CHECKED: bool, O: WorkObserver> {
     Unit,
-    Map(MapDecoder<'a, 'de, CHECKED>),
+    Map(MapDecoder<'a, 'de, CHECKED, O>),
 }
 
-struct EnumAccessImpl<'a, 'de, const CHECKED: bool> {
+struct EnumAccessImpl<'a, 'de, const CHECKED: bool, O: WorkObserver> {
     key: &'de str,
-    payload: EnumPayload<'a, 'de, CHECKED>,
+    payload: EnumPayload<'a, 'de, CHECKED, O>,
     offset: usize,
 }
 
 #[allow(clippy::elidable_lifetime_names)]
-impl<'a, 'de, const CHECKED: bool> EnumAccess<'de> for EnumAccessImpl<'a, 'de, CHECKED> {
+impl<'a, 'de, const CHECKED: bool, O: WorkObserver> EnumAccess<'de>
+    for EnumAccessImpl<'a, 'de, CHECKED, O>
+{
     type Error = DeError;
-    type Variant = VariantAccessImpl<'a, 'de, CHECKED>;
+    type Variant = VariantAccessImpl<'a, 'de, CHECKED, O>;
 
     fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), DeError>
     where
@@ -167,12 +173,14 @@ impl<'a, 'de, const CHECKED: bool> EnumAccess<'de> for EnumAccessImpl<'a, 'de, C
     }
 }
 
-struct VariantAccessImpl<'a, 'de, const CHECKED: bool> {
-    payload: EnumPayload<'a, 'de, CHECKED>,
+struct VariantAccessImpl<'a, 'de, const CHECKED: bool, O: WorkObserver> {
+    payload: EnumPayload<'a, 'de, CHECKED, O>,
     offset: usize,
 }
 
-impl<'de, const CHECKED: bool> VariantAccess<'de> for VariantAccessImpl<'_, 'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> VariantAccess<'de>
+    for VariantAccessImpl<'_, 'de, CHECKED, O>
+{
     type Error = DeError;
 
     fn unit_variant(self) -> Result<(), DeError> {
@@ -236,7 +244,9 @@ impl<'de, const CHECKED: bool> VariantAccess<'de> for VariantAccessImpl<'_, 'de,
     }
 }
 
-impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECKED> {
+impl<'de, const CHECKED: bool, O: WorkObserver> de::Deserializer<'de>
+    for &mut Decoder<'de, CHECKED, O>
+{
     type Error = DeError;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, DeError>
@@ -550,7 +560,7 @@ impl<'de, const CHECKED: bool> de::Deserializer<'de> for &mut Decoder<'de, CHECK
             let key: &'de str = CborDecode::decode(self).map_err(DeError::from)?;
             return visitor.visit_enum(EnumAccessImpl {
                 key,
-                payload: EnumPayload::<CHECKED>::Unit,
+                payload: EnumPayload::<CHECKED, O>::Unit,
                 offset: off,
             });
         }

@@ -6,10 +6,11 @@ use crate::alloc_util::try_reserve;
 #[cfg(not(feature = "alloc"))]
 use crate::limits::DEFAULT_MAX_DEPTH;
 use crate::profile::{
-    check_encoded_key_order, is_minimal_uint_ai, validate_bignum_bytes, validate_f64_bits,
-    MAX_SAFE_INTEGER,
+    check_encoded_key_order, cmp_encoded_key_bytes_observed, is_minimal_uint_ai,
+    validate_bignum_bytes, validate_f64_bits, MAX_SAFE_INTEGER,
 };
 use crate::utf8;
+use crate::work::{NoopWorkObserver, WorkMeter, WorkObserver, WorkSession};
 use crate::{CborError, DecodeLimits, ErrorCode, ValidationOptions};
 
 /// Resource limits plus grammar-restriction options for one walk of a value.
@@ -56,6 +57,12 @@ impl<'a> Cursor<'a> {
     #[inline]
     pub const fn data(&self) -> &'a [u8] {
         self.data
+    }
+
+    #[inline]
+    pub(crate) const fn set_position(&mut self, position: usize) {
+        debug_assert!(position <= self.data.len());
+        self.pos = position;
     }
 
     #[inline]
@@ -267,14 +274,24 @@ pub fn read_text_trusted<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a str,
     utf8::trusted(bytes).map_err(|()| CborError::new(ErrorCode::MalformedCanonical, off))
 }
 
-pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
+fn value_end_trusted_inner<O: WorkObserver>(
+    data: &[u8],
+    start: usize,
+    observer: &mut O,
+) -> Result<usize, CborError> {
     let mut cursor = Cursor::with_pos(data, start);
     let mut items_seen = 0;
     let mut pending = 1usize;
+    let mut noop_meter = WorkMeter::new(NoopWorkObserver);
+    if O::ENABLED {
+        observer
+            .checkpoint(0)
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cursor.position()))?;
+    }
     while pending != 0 {
         let off = cursor.position();
         let initial = cursor.read_u8()?;
-        let frame = skip_primitive::<false>(
+        let frame = skip_primitive::<false, _>(
             &mut cursor,
             WalkPolicy::trusted(),
             &mut items_seen,
@@ -282,6 +299,7 @@ pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> 
             off,
             initial >> 5,
             initial & 0x1f,
+            &mut noop_meter,
         )?;
         pending -= 1;
         let children = match frame {
@@ -296,16 +314,46 @@ pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> 
         pending = pending
             .checked_add(children)
             .ok_or_else(|| CborError::new(ErrorCode::LengthOverflow, off))?;
+        if O::ENABLED {
+            observer
+                .checkpoint(1)
+                .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cursor.position()))?;
+        }
     }
     Ok(cursor.position())
 }
 
+pub fn value_end_trusted(data: &[u8], start: usize) -> Result<usize, CborError> {
+    value_end_trusted_inner(data, start, &mut NoopWorkObserver)
+}
+
+pub fn value_end_trusted_with_session<O: WorkObserver>(
+    data: &[u8],
+    start: usize,
+    session: &mut WorkSession<O>,
+) -> Result<usize, CborError> {
+    value_end_trusted_inner(data, start, &mut session.observer())
+}
+
 #[inline]
+#[allow(dead_code)]
 pub fn parse_text_from_header<'a, const CHECKED: bool>(
     cursor: &mut Cursor<'a>,
     limits: Option<&DecodeLimits>,
     off: usize,
     ai: u8,
+) -> Result<&'a str, CborError> {
+    let mut meter = WorkMeter::new(NoopWorkObserver);
+    parse_text_from_header_observed::<CHECKED, _>(cursor, limits, off, ai, &mut meter)
+}
+
+#[inline]
+pub fn parse_text_from_header_observed<'a, const CHECKED: bool, O: WorkObserver>(
+    cursor: &mut Cursor<'a>,
+    limits: Option<&DecodeLimits>,
+    off: usize,
+    ai: u8,
+    meter: &mut WorkMeter<O>,
 ) -> Result<&'a str, CborError> {
     let len = read_len::<CHECKED>(cursor, ai, off)?;
     if let Some(limits) = limits {
@@ -313,13 +361,56 @@ pub fn parse_text_from_header<'a, const CHECKED: bool>(
             return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
         }
     }
+    let payload_start = cursor.position();
     let bytes = cursor.read_exact(len)?;
     let s = if CHECKED {
-        utf8::validate_utf8(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?
+        match utf8::validate_utf8_as_str_observed(bytes, meter) {
+            Ok(text) => text,
+            Err(utf8::ObservedUtf8Error::Invalid) => {
+                return Err(CborError::new(ErrorCode::Utf8Invalid, off));
+            }
+            Err(utf8::ObservedUtf8Error::Cancelled(completed)) => {
+                let position = payload_start + completed;
+                cursor.set_position(position);
+                return Err(CborError::new(ErrorCode::WorkCancelled, position));
+            }
+        }
     } else {
         utf8::trusted(bytes).map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?
     };
     Ok(s)
+}
+
+#[inline]
+fn consume_text_from_header_observed<const CHECKED: bool, O: WorkObserver>(
+    cursor: &mut Cursor<'_>,
+    limits: Option<&DecodeLimits>,
+    off: usize,
+    ai: u8,
+    meter: &mut WorkMeter<O>,
+) -> Result<(), CborError> {
+    let len = read_len::<CHECKED>(cursor, ai, off)?;
+    if let Some(limits) = limits {
+        if len > limits.max_text_len {
+            return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
+        }
+    }
+    let payload_start = cursor.position();
+    let bytes = cursor.read_exact(len)?;
+    if CHECKED {
+        match utf8::validate_utf8_observed(bytes, meter) {
+            Ok(()) => {}
+            Err(utf8::ObservedUtf8Error::Invalid) => {
+                return Err(CborError::new(ErrorCode::Utf8Invalid, off));
+            }
+            Err(utf8::ObservedUtf8Error::Cancelled(completed)) => {
+                let position = payload_start + completed;
+                cursor.set_position(position);
+                return Err(CborError::new(ErrorCode::WorkCancelled, position));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -370,6 +461,37 @@ pub fn check_map_key_order(
         let prev = &data[ps..pe];
         let curr = &data[key_start..key_end];
         if let Err(code) = check_encoded_key_order(prev, curr) {
+            return Err(CborError::new(code, key_start));
+        }
+    }
+    *prev_key_range = Some((key_start, key_end));
+    Ok(())
+}
+
+#[inline]
+pub fn check_map_key_order_observed<O: WorkObserver>(
+    data: &[u8],
+    prev_key_range: &mut Option<(usize, usize)>,
+    key_start: usize,
+    key_end: usize,
+    meter: &mut WorkMeter<O>,
+    cancel_offset: usize,
+) -> Result<(), CborError> {
+    if !O::ENABLED {
+        return check_map_key_order(data, prev_key_range, key_start, key_end);
+    }
+
+    if let Some((previous_start, previous_end)) = *prev_key_range {
+        let previous = &data[previous_start..previous_end];
+        let current = &data[key_start..key_end];
+        let order = cmp_encoded_key_bytes_observed(previous, current, meter)
+            .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cancel_offset))?;
+        let code = match order {
+            core::cmp::Ordering::Less => None,
+            core::cmp::Ordering::Equal => Some(ErrorCode::DuplicateMapKey),
+            core::cmp::Ordering::Greater => Some(ErrorCode::NonCanonicalMapOrder),
+        };
+        if let Some(code) = code {
             return Err(CborError::new(code, key_start));
         }
     }
@@ -504,12 +626,12 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[inline]
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
     }
 
     #[inline]
-    fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
+    const fn push(&mut self, frame: Frame, off: usize) -> Result<(), CborError> {
         if self.len < N {
             self.inline[self.len] = Some(frame);
             self.len += 1;
@@ -520,7 +642,7 @@ impl<const N: usize> FrameStack<N> {
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<Frame> {
+    const fn pop(&mut self) -> Option<Frame> {
         if self.len == 0 {
             return None;
         }
@@ -631,8 +753,9 @@ fn consume_value(frame: &mut Frame, off: usize) -> Result<(), CborError> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 #[inline]
-fn skip_primitive<const CHECKED: bool>(
+fn skip_primitive<const CHECKED: bool, O: WorkObserver>(
     cursor: &mut Cursor<'_>,
     policy: WalkPolicy<'_>,
     items_seen: &mut usize,
@@ -640,6 +763,7 @@ fn skip_primitive<const CHECKED: bool>(
     off: usize,
     major: u8,
     ai: u8,
+    meter: &mut WorkMeter<O>,
 ) -> Result<Option<Frame>, CborError> {
     let limits = policy.limits;
     match major {
@@ -668,17 +792,7 @@ fn skip_primitive<const CHECKED: bool>(
             Ok(None)
         }
         3 => {
-            let len = read_len::<CHECKED>(cursor, ai, off)?;
-            if let Some(limits) = limits {
-                if len > limits.max_text_len {
-                    return Err(CborError::new(ErrorCode::TextLenLimitExceeded, off));
-                }
-            }
-            let bytes = cursor.read_exact(len)?;
-            if CHECKED {
-                utf8::validate_utf8(bytes)
-                    .map_err(|()| CborError::new(ErrorCode::Utf8Invalid, off))?;
-            }
+            consume_text_from_header_observed::<CHECKED, _>(cursor, limits, off, ai, meter)?;
             Ok(None)
         }
         4 => {
@@ -754,12 +868,23 @@ fn skip_primitive<const CHECKED: bool>(
     }
 }
 
-fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
+#[inline]
+fn complete_structural_work<O: WorkObserver>(
+    meter: &mut WorkMeter<O>,
+    cursor: &Cursor<'_>,
+) -> Result<(), CborError> {
+    meter
+        .complete(1)
+        .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cursor.position()))
+}
+
+fn skip_one_value_inner<const CHECKED: bool, S: StackOps, O: WorkObserver>(
     cursor: &mut Cursor<'_>,
     policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     base_depth: usize,
     stack: &mut S,
+    meter: &mut WorkMeter<O>,
 ) -> Result<(), CborError> {
     let limits = policy.limits;
     // The innermost open container lives in `cur`; the spill stack is touched
@@ -773,6 +898,7 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
         if let Some(frame) = &mut cur {
             if frame.is_done() {
                 open_depth -= 1;
+                complete_structural_work(meter, cursor)?;
                 match stack.pop() {
                     Some(parent) => {
                         cur = Some(parent);
@@ -797,7 +923,9 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
                         return Err(CborError::new(ErrorCode::MapKeyMustBeText, key_start));
                     }
                     if CHECKED {
-                        let _ = parse_text_from_header::<CHECKED>(cursor, limits, key_start, ai)?;
+                        consume_text_from_header_observed::<CHECKED, _>(
+                            cursor, limits, key_start, ai, meter,
+                        )?;
                     } else {
                         let len = read_len::<CHECKED>(cursor, ai, key_start)?;
                         if let Some(limits) = limits {
@@ -813,10 +941,18 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
                     let key_end = cursor.position();
 
                     if CHECKED {
-                        check_map_key_order(cursor.data(), prev_key_range, key_start, key_end)?;
+                        check_map_key_order_observed(
+                            cursor.data(),
+                            prev_key_range,
+                            key_start,
+                            key_end,
+                            meter,
+                            key_end,
+                        )?;
                     }
 
                     *expecting_key = false;
+                    complete_structural_work(meter, cursor)?;
                 }
             }
         }
@@ -827,43 +963,84 @@ fn skip_one_value_inner<const CHECKED: bool, S: StackOps>(
         let ai = ib & 0x1f;
 
         let next_depth = base_depth + open_depth + 1;
-        let new_frame =
-            skip_primitive::<CHECKED>(cursor, policy, items_seen, next_depth, off, major, ai)?;
+        let new_frame = skip_primitive::<CHECKED, _>(
+            cursor, policy, items_seen, next_depth, off, major, ai, meter,
+        )?;
 
         if let Some(frame) = &mut cur {
             consume_value(frame, off)?;
         }
 
-        match new_frame {
-            Some(frame) => {
-                if let Some(parent) = cur.take() {
-                    stack.push(parent, off)?;
-                }
-                cur = Some(frame);
-                open_depth += 1;
+        let root_value_complete = new_frame.is_none() && cur.is_none();
+        let closed_empty_container = new_frame.is_none() && matches!(major, 4 | 5);
+        if let Some(frame) = new_frame {
+            if let Some(parent) = cur.take() {
+                stack.push(parent, off)?;
             }
-            None => {
-                if cur.is_none() {
-                    return Ok(());
-                }
-            }
+            cur = Some(frame);
+            open_depth += 1;
+        }
+        complete_structural_work(meter, cursor)?;
+        if closed_empty_container {
+            complete_structural_work(meter, cursor)?;
+        }
+        if root_value_complete {
+            return Ok(());
         }
     }
 }
 
+pub fn skip_one_value_observed<const CHECKED: bool, O: WorkObserver>(
+    cursor: &mut Cursor<'_>,
+    policy: WalkPolicy<'_>,
+    items_seen: &mut usize,
+    base_depth: usize,
+    meter: &mut WorkMeter<O>,
+) -> Result<(), CborError> {
+    meter
+        .start()
+        .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cursor.position()))?;
+    #[cfg(feature = "alloc")]
+    let mut stack = FrameStack::new();
+    #[cfg(not(feature = "alloc"))]
+    let mut stack = FrameStack::<INLINE_STACK>::new();
+    skip_one_value_inner::<CHECKED, _, _>(cursor, policy, items_seen, base_depth, &mut stack, meter)
+}
+
+#[allow(dead_code)]
 pub fn skip_one_value<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
     policy: WalkPolicy<'_>,
     items_seen: &mut usize,
     base_depth: usize,
 ) -> Result<(), CborError> {
-    #[cfg(feature = "alloc")]
-    let mut stack = FrameStack::new();
-    #[cfg(not(feature = "alloc"))]
-    let mut stack = FrameStack::<INLINE_STACK>::new();
-    skip_one_value_inner::<CHECKED, _>(cursor, policy, items_seen, base_depth, &mut stack)
+    let mut meter = WorkMeter::new(NoopWorkObserver);
+    skip_one_value_observed::<CHECKED, _>(cursor, policy, items_seen, base_depth, &mut meter)
 }
 
+pub fn skip_one_value_with_scratch_observed<const CHECKED: bool, O: WorkObserver>(
+    cursor: &mut Cursor<'_>,
+    policy: WalkPolicy<'_>,
+    items_seen: &mut usize,
+    base_depth: usize,
+    scratch: &mut SkipScratch,
+    meter: &mut WorkMeter<O>,
+) -> Result<(), CborError> {
+    meter
+        .start()
+        .map_err(|_| CborError::new(ErrorCode::WorkCancelled, cursor.position()))?;
+    scratch.stack.clear();
+    skip_one_value_inner::<CHECKED, _, _>(
+        cursor,
+        policy,
+        items_seen,
+        base_depth,
+        &mut scratch.stack,
+        meter,
+    )
+}
+
+#[allow(dead_code)]
 pub fn skip_one_value_with_scratch<const CHECKED: bool>(
     cursor: &mut Cursor<'_>,
     policy: WalkPolicy<'_>,
@@ -871,6 +1048,8 @@ pub fn skip_one_value_with_scratch<const CHECKED: bool>(
     base_depth: usize,
     scratch: &mut SkipScratch,
 ) -> Result<(), CborError> {
-    scratch.stack.clear();
-    skip_one_value_inner::<CHECKED, _>(cursor, policy, items_seen, base_depth, &mut scratch.stack)
+    let mut meter = WorkMeter::new(NoopWorkObserver);
+    skip_one_value_with_scratch_observed::<CHECKED, _>(
+        cursor, policy, items_seen, base_depth, scratch, &mut meter,
+    )
 }

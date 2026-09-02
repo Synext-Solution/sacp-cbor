@@ -577,8 +577,11 @@ fn derive_struct(
         where
             __C: #abi_path::AbiDecodeContext + ?Sized,
         {
-            fn abi_decode<const CHECKED: bool>(
-                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            fn abi_decode<
+                const CHECKED: bool,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED, __O>,
                 context: &mut __C,
                 _location: #abi_path::AbiDecodeLocation,
             ) -> ::core::result::Result<Self, __C::Error> {
@@ -635,8 +638,11 @@ fn derive_transparent_struct(
         where
             __C: #abi_path::AbiDecodeContext + ?Sized,
         {
-            fn abi_decode<const CHECKED: bool>(
-                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            fn abi_decode<
+                const CHECKED: bool,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED, __O>,
                 context: &mut __C,
                 location: #abi_path::AbiDecodeLocation,
             ) -> ::core::result::Result<Self, __C::Error> {
@@ -756,8 +762,11 @@ fn derive_enum(
         where
             __C: #abi_path::AbiDecodeContext + ?Sized,
         {
-            fn abi_decode<const CHECKED: bool>(
-                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED>,
+            fn abi_decode<
+                const CHECKED: bool,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
+                decoder: &mut #cbor_path::Decoder<'__sacp_abi, CHECKED, __O>,
                 context: &mut __C,
                 _location: #abi_path::AbiDecodeLocation,
             ) -> ::core::result::Result<Self, __C::Error> {
@@ -1405,9 +1414,14 @@ fn transparent_projection_tokens(
             }
         }
 
-        fn #driver<#(#lifetimes,)* __P: ?Sized, __S: #cbor_path::ByteSink>(
+        fn #driver<
+            #(#lifetimes,)*
+            __P: ?Sized,
+            __S: #cbor_path::ByteSink,
+            __O: #abi_path::__private::sacp_cbor::WorkObserver,
+        >(
             projection: &__P,
-            enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
         ) -> ::core::result::Result<
             (),
             #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -1431,9 +1445,12 @@ fn transparent_projection_tokens(
         {
             type Error = __P::Error;
 
-            fn abi_encode<__S: #cbor_path::ByteSink>(
+            fn abi_encode<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, Self::Error>,
@@ -1448,9 +1465,12 @@ fn transparent_projection_tokens(
         where
             __P: #projection_trait #ty_generics,
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -1463,9 +1483,12 @@ fn transparent_projection_tokens(
             #abi_path::AbiEncodeAs<#name #ty_generics, __E>
             for #name #ty_generics #where_clause
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __E>,
@@ -1843,19 +1866,21 @@ fn enum_projection_tokens(
             }
         }
 
-        struct #encoder_visitor<'__abi_borrow, '__abi_encoder, __S, __E>
+        struct #encoder_visitor<'__abi_borrow, '__abi_encoder, __S, __O, __E>
         where
             __S: #cbor_path::ByteSink,
+            __O: #abi_path::__private::sacp_cbor::WorkObserver,
         {
-            enc: &'__abi_borrow mut #cbor_path::ValueEncoder<'__abi_encoder, __S>,
+            enc: &'__abi_borrow mut #cbor_path::ValueEncoder<'__abi_encoder, __S, __O>,
             error: ::core::marker::PhantomData<fn() -> __E>,
         }
 
-        impl<'__abi_borrow, '__abi_encoder, #(#lifetimes,)* __S, __E>
+        impl<'__abi_borrow, '__abi_encoder, #(#lifetimes,)* __S, __O, __E>
             #visitor_trait<#(#lifetimes,)* __E>
-            for #encoder_visitor<'__abi_borrow, '__abi_encoder, __S, __E>
+            for #encoder_visitor<'__abi_borrow, '__abi_encoder, __S, __O, __E>
         where
             __S: #cbor_path::ByteSink,
+            __O: #abi_path::__private::sacp_cbor::WorkObserver,
         {
             type Output = ::core::result::Result<
                 (),
@@ -1870,9 +1895,14 @@ fn enum_projection_tokens(
             #unknown_encoder_method
         }
 
-        fn #driver<#(#lifetimes,)* __P: ?Sized, __S: #cbor_path::ByteSink>(
+        fn #driver<
+            #(#lifetimes,)*
+            __P: ?Sized,
+            __S: #cbor_path::ByteSink,
+            __O: #abi_path::__private::sacp_cbor::WorkObserver,
+        >(
             projection: &__P,
-            enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
         ) -> ::core::result::Result<
             (),
             #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -1893,9 +1923,12 @@ fn enum_projection_tokens(
         {
             type Error = __P::Error;
 
-            fn abi_encode<__S: #cbor_path::ByteSink>(
+            fn abi_encode<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, Self::Error>,
@@ -1910,9 +1943,12 @@ fn enum_projection_tokens(
         where
             __P: #projection_trait #ty_generics,
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -1925,9 +1961,12 @@ fn enum_projection_tokens(
             #abi_path::AbiEncodeAs<#name #ty_generics, __E>
             for #name #ty_generics #where_clause
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __E>,
@@ -2196,9 +2235,14 @@ fn struct_projection_tokens(
             #owned_unknown
         }
 
-        fn #driver<#(#lifetimes,)* __P: ?Sized, __S: #cbor_path::ByteSink>(
+        fn #driver<
+            #(#lifetimes,)*
+            __P: ?Sized,
+            __S: #cbor_path::ByteSink,
+            __O: #abi_path::__private::sacp_cbor::WorkObserver,
+        >(
             projection: &__P,
-            enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+            enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
         ) -> ::core::result::Result<
             (),
             #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -2229,9 +2273,12 @@ fn struct_projection_tokens(
         {
             type Error = __P::Error;
 
-            fn abi_encode<__S: #cbor_path::ByteSink>(
+            fn abi_encode<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, Self::Error>,
@@ -2246,9 +2293,12 @@ fn struct_projection_tokens(
         where
             __P: #projection_trait #ty_generics,
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __P::Error>,
@@ -2261,9 +2311,12 @@ fn struct_projection_tokens(
             #abi_path::AbiEncodeAs<#name #ty_generics, __E>
             for #name #ty_generics #where_clause
         {
-            fn abi_encode_as<__S: #cbor_path::ByteSink>(
+            fn abi_encode_as<
+                __S: #cbor_path::ByteSink,
+                __O: #abi_path::__private::sacp_cbor::WorkObserver,
+            >(
                 &self,
-                enc: &mut #cbor_path::ValueEncoder<'_, __S>,
+                enc: &mut #cbor_path::ValueEncoder<'_, __S, __O>,
             ) -> ::core::result::Result<
                 (),
                 #abi_path::AbiEncodeError<__S::Error, __E>,

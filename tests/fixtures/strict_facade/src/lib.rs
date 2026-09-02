@@ -7,30 +7,34 @@ pub mod codec {
         use alloc::string::String;
         use alloc::vec::Vec;
 
-        pub use private_cbor::{
-            ByteSink, CanonicalCbor, CanonicalCborRef, CborError, DecodeLimits, Decoder,
-            EncodeResult, Encoder, ErrorCode, ValueEncoder, encode_with_to_canonical,
-        };
         pub use private_cbor::encode::ArrayEncoder;
+        pub use private_cbor::{
+            encode_with_to_canonical, ByteSink, CanonicalCbor, CanonicalCborRef, CborError,
+            DecodeLimits, Decoder, EncodeResult, Encoder, ErrorCode, NoopWorkObserver,
+            ValueEncoder, WorkObserver,
+        };
 
         pub mod query {
             pub use private_cbor::query::{CborKind, CborValueRef};
         }
 
         pub trait CborEncode {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S>;
-
-            fn encode_array_item<S: ByteSink>(
+            fn encode<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S>;
+
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
+                &self,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| self.encode(enc))
             }
         }
 
         pub trait CborDecode<'de>: Sized {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError>;
         }
 
@@ -38,24 +42,24 @@ pub mod codec {
             ($($ty:ty),* $(,)?) => {
                 $(
                     impl CborEncode for $ty {
-                        fn encode<S: ByteSink>(
+                        fn encode<S: ByteSink, O: WorkObserver>(
                             &self,
-                            enc: &mut ValueEncoder<'_, S>,
+                            enc: &mut ValueEncoder<'_, S, O>,
                         ) -> EncodeResult<(), S> {
                             private_cbor::CborEncode::encode(self, enc)
                         }
 
-                        fn encode_array_item<S: ByteSink>(
+                        fn encode_array_item<S: ByteSink, O: WorkObserver>(
                             &self,
-                            array: &mut ArrayEncoder<'_, S>,
+                            array: &mut ArrayEncoder<'_, S, O>,
                         ) -> EncodeResult<(), S> {
                             array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
                         }
                     }
 
                     impl<'de> CborDecode<'de> for $ty {
-                        fn decode<const CHECKED: bool>(
-                            decoder: &mut Decoder<'de, CHECKED>,
+                        fn decode<const CHECKED: bool, O: WorkObserver>(
+                            decoder: &mut Decoder<'de, CHECKED, O>,
                         ) -> Result<Self, CborError> {
                             private_cbor::CborDecode::decode(decoder)
                         }
@@ -67,91 +71,106 @@ pub mod codec {
         passthrough!((), bool, u8, u16, u32, u64, i8, i16, i32, i64, String);
 
         impl CborEncode for &str {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
         impl<'de> CborDecode<'de> for &'de str {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 private_cbor::CborDecode::decode(decoder)
             }
         }
 
         impl CborEncode for CanonicalCbor {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
         impl CborEncode for CanonicalCborRef<'_> {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
         impl<'de> CborDecode<'de> for CanonicalCbor {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 private_cbor::CborDecode::decode(decoder)
             }
         }
 
         impl<'de> CborDecode<'de> for CanonicalCborRef<'de> {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 private_cbor::CborDecode::decode(decoder)
             }
         }
 
         impl CborEncode for query::CborValueRef<'_> {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 private_cbor::CborEncode::encode(self, enc)
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| private_cbor::CborEncode::encode(self, enc))
             }
         }
 
         impl<'de> CborDecode<'de> for query::CborValueRef<'de> {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 private_cbor::CborDecode::decode(decoder)
             }
         }
 
         impl<T: CborEncode> CborEncode for Option<T> {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 enc.map(1, |map| match self {
                     None => map.entry("none", Encoder::null),
                     Some(value) => map.entry("some", |enc| {
@@ -160,17 +179,17 @@ pub mod codec {
                 })
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| self.encode(enc))
             }
         }
 
         impl<'de, T: CborDecode<'de>> CborDecode<'de> for Option<T> {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 let map_off = decoder.position();
                 let mut map = decoder.map()?;
@@ -192,7 +211,10 @@ pub mod codec {
         }
 
         impl<T: CborEncode> CborEncode for Vec<T> {
-            fn encode<S: ByteSink>(&self, enc: &mut ValueEncoder<'_, S>) -> EncodeResult<(), S> {
+            fn encode<S: ByteSink, O: WorkObserver>(
+                &self,
+                enc: &mut ValueEncoder<'_, S, O>,
+            ) -> EncodeResult<(), S> {
                 enc.array(self.len(), |array| {
                     for value in self {
                         CborEncode::encode_array_item(value, array)?;
@@ -201,17 +223,17 @@ pub mod codec {
                 })
             }
 
-            fn encode_array_item<S: ByteSink>(
+            fn encode_array_item<S: ByteSink, O: WorkObserver>(
                 &self,
-                array: &mut ArrayEncoder<'_, S>,
+                array: &mut ArrayEncoder<'_, S, O>,
             ) -> EncodeResult<(), S> {
                 array.encode_with(|enc| self.encode(enc))
             }
         }
 
         impl<'de, T: CborDecode<'de>> CborDecode<'de> for Vec<T> {
-            fn decode<const CHECKED: bool>(
-                decoder: &mut Decoder<'de, CHECKED>,
+            fn decode<const CHECKED: bool, O: WorkObserver>(
+                decoder: &mut Decoder<'de, CHECKED, O>,
             ) -> Result<Self, CborError> {
                 let mut array = decoder.array()?;
                 let mut out = Vec::new();
@@ -231,8 +253,9 @@ pub mod codec {
 
         fn collapse(error: private_cbor::EncodeError<CborError>) -> CborError {
             match error {
-                private_cbor::EncodeError::Cbor(error)
-                | private_cbor::EncodeError::Sink(error) => error,
+                private_cbor::EncodeError::Cbor(error) | private_cbor::EncodeError::Sink(error) => {
+                    error
+                }
                 private_cbor::EncodeError::Poisoned => {
                     CborError::new(ErrorCode::EncoderPoisoned, 0)
                 }
@@ -323,8 +346,8 @@ mod tests {
 
     #[test]
     fn strict_facade_roundtrips_nested_shapes() {
-        let payload = private_cbor::cbor_bytes!(crate = crate::codec::cbor; [nested(9), 3])
-            .unwrap();
+        let payload =
+            private_cbor::cbor_bytes!(crate = crate::codec::cbor; [nested(9), 3]).unwrap();
         let value = Named {
             nested: nested(1),
             values: vec![nested(2), nested(3)],
@@ -338,7 +361,10 @@ mod tests {
     #[test]
     fn strict_facade_roundtrips_external_enums() {
         assert_eq!(roundtrip(External::Unit), External::Unit);
-        assert_eq!(roundtrip(External::One(nested(1))), External::One(nested(1)));
+        assert_eq!(
+            roundtrip(External::One(nested(1))),
+            External::One(nested(1))
+        );
         assert_eq!(
             roundtrip(External::Pair(nested(2), 4)),
             External::Pair(nested(2), 4)
@@ -363,7 +389,10 @@ mod tests {
         );
         assert_eq!(roundtrip(Internal::Done), Internal::Done);
         assert_eq!(roundtrip(Adjacent::Unit), Adjacent::Unit);
-        assert_eq!(roundtrip(Adjacent::One(nested(8))), Adjacent::One(nested(8)));
+        assert_eq!(
+            roundtrip(Adjacent::One(nested(8))),
+            Adjacent::One(nested(8))
+        );
         assert_eq!(
             roundtrip(Adjacent::Pair(nested(9), 10)),
             Adjacent::Pair(nested(9), 10)

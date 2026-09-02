@@ -25,14 +25,16 @@ mod view;
 mod proofs;
 
 pub use decode_abi::{
-    decode, decode_canonical, AbiDecode, AbiDecodeContext, AbiDecodeLocation, AbiDecodeValue,
-    UnknownField, UnknownFields, UnknownVariant,
+    decode, decode_canonical, decode_canonical_with_observer, decode_with_observer, AbiDecode,
+    AbiDecodeContext, AbiDecodeLocation, AbiDecodeValue, UnknownField, UnknownFields,
+    UnknownVariant,
 };
 pub use edit::{AbiDeleteMode, AbiFieldSetEditor, AbiPatchValue, AbiSetMode};
 pub use encode_abi::{
-    encode_to_canonical, encode_to_sink, encode_to_vec, exact_indexed_sequence, indexed_sequence,
-    projected_sequence, wire, AbiEncode, AbiEncodeAs, AbiEncodeError, AbiRepresentation,
-    AbiWireType, ExactIndexProjection, ExactIndexedSequence, IndexedSequence, ProjectedSequence,
+    encode_to_canonical, encode_to_sink, encode_to_sink_with_observer, encode_to_vec,
+    encode_to_vec_with_observer, exact_indexed_sequence, indexed_sequence, projected_sequence,
+    wire, AbiEncode, AbiEncodeAs, AbiEncodeError, AbiRepresentation, AbiWireType,
+    ExactIndexProjection, ExactIndexedSequence, IndexedSequence, ProjectedSequence,
     SequenceContractError, SequenceEmitter, SequenceProjection,
 };
 pub use runtime::{
@@ -50,8 +52,8 @@ pub use schema::{
     VariantDef, VariantPayloadDef, ABI_PROFILE,
 };
 pub use view::{
-    AbiArrayView, AbiFieldEntryRef, AbiFieldSetRef, AbiView, AbiViewField, UnknownFieldRef,
-    UnknownVariantRef,
+    AbiArrayView, AbiArrayViewCursor, AbiFieldEntryRef, AbiFieldSetRef, AbiView, AbiViewField,
+    UnknownFieldRef, UnknownVariantRef,
 };
 
 /// The one static schema owner for a public ABI declaration.
@@ -90,16 +92,16 @@ pub mod __private {
     }
 
     /// Encode one schema-owned numeric ID.
-    pub fn encode_field_id<S: sacp_cbor::ByteSink, E>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    pub fn encode_field_id<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver, E>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         id: u32,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {
         array.value(&id).map_err(AbiEncodeError::Encode)
     }
 
     /// Encode preserved unknown fields whose IDs are lower than `before_id`.
-    pub fn encode_unknown_fields_before<S: sacp_cbor::ByteSink, E>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    pub fn encode_unknown_fields_before<S: sacp_cbor::ByteSink, O: sacp_cbor::WorkObserver, E>(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         unknown: &UnknownFields,
         cursor: &mut usize,
         before_id: u32,
@@ -108,8 +110,12 @@ pub mod __private {
     }
 
     /// Encode all remaining preserved unknown fields.
-    pub fn encode_remaining_unknown_fields<S: sacp_cbor::ByteSink, E>(
-        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S>,
+    pub fn encode_remaining_unknown_fields<
+        S: sacp_cbor::ByteSink,
+        O: sacp_cbor::WorkObserver,
+        E,
+    >(
+        array: &mut sacp_cbor::encode::ArrayEncoder<'_, S, O>,
         unknown: &UnknownFields,
         cursor: &mut usize,
     ) -> Result<(), AbiEncodeError<S::Error, E>> {

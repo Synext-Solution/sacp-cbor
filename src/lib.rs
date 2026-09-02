@@ -70,6 +70,15 @@
 //! null term. Use [`validate_canonical_with`] to validate under explicit options;
 //! [`validate_canonical`] accepts the full grammar.
 //!
+//! **Cooperative work observation**
+//!
+//! Long-running encode, decode, and canonical-walk entry points can be parameterized by a
+//! [`WorkObserver`]. Enabled operations checkpoint at the public
+//! [`WORK_CHECKPOINT_INTERVAL`] cadence and report only completed work. Cancellation is terminal:
+//! encoders retain already-confirmed sink output and decoders retain a sticky
+//! [`ErrorCode::WorkCancelled`] error. Ordinary entry points use the zero-sized
+//! [`NoopWorkObserver`], whose metering path is compiled out.
+//!
 //! **Text identity**
 //!
 //! Text strings are validated as UTF-8 and compared as encoded bytes. The profile applies no
@@ -143,6 +152,7 @@ mod serde_encode;
 mod serde_impl;
 pub(crate) mod utf8;
 mod wire;
+mod work;
 
 #[cfg(feature = "cde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cde")))]
@@ -155,14 +165,20 @@ mod int;
 pub use crate::canonical::CanonicalCborRef;
 pub use crate::codec::CborDecode;
 pub use crate::decode::{
-    decode, decode_canonical, ArrayDecoder, ContainerHeader, Decoder, EncodedValueHeader,
-    MapDecoder, MapKey, PayloadHeader, ScalarKind,
+    decode, decode_canonical, decode_canonical_with_observer, decode_with_observer, ArrayDecoder,
+    ContainerHeader, Decoder, EncodedValueHeader, MapDecoder, MapKey, PayloadHeader, ScalarKind,
 };
 #[cfg(feature = "alloc")]
 pub use crate::decode::{TraversalSession, TraversalWorkspace};
 pub use crate::error::{CborError, ErrorCode};
 pub use crate::limits::{DecodeLimits, EncodeLimits, ValidationOptions};
-pub use crate::parse::{validate_canonical, validate_canonical_with};
+pub use crate::parse::{
+    validate_canonical, validate_canonical_observed, validate_canonical_with,
+    validate_canonical_with_observer,
+};
+pub use crate::work::{
+    NoopWorkObserver, WorkCancelled, WorkObserver, WorkSession, WORK_CHECKPOINT_INTERVAL,
+};
 
 #[cfg(feature = "alloc")]
 pub mod encode;
@@ -173,7 +189,10 @@ pub use crate::canonical::CanonicalCbor;
 #[cfg(feature = "alloc")]
 pub use crate::codec::CborEncode;
 #[cfg(feature = "alloc")]
-pub use crate::codec_impls::{encode_to_canonical, encode_to_vec, encode_with_to_canonical};
+pub use crate::codec_impls::{
+    encode_to_canonical, encode_to_canonical_with_observer, encode_to_vec,
+    encode_to_vec_with_observer, encode_with_to_canonical,
+};
 #[cfg(all(feature = "alloc", feature = "sha2"))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "alloc", feature = "sha2"))))]
 pub use crate::encode::DigestSink;
